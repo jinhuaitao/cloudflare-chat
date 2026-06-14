@@ -54,7 +54,8 @@ function getChannelConfig(env) {
   // 3. 回退到旧版单一环境变量 (完全兼容旧版不改变任何功能)
   const fallbackUrl = env.API_URL || "";
   const fallbackKeys = (env.API_KEY || "").split(',').map(k => k.trim()).filter(k => k);
-  const fallbackModelStr = env.MODEL || "meta/llama3-70b-instruct:Llama 3 70B,deepseek-ai/DeepSeek-R1:深度思考 R1";
+  // 将硬编码的模型删除，只保留 env.MODEL，如果未配置则为空
+  const fallbackModelStr = env.MODEL || "";
   
   addModels(fallbackModelStr, fallbackUrl, fallbackKeys);
 
