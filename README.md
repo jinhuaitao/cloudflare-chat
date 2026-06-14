@@ -47,4 +47,5 @@ API_URL_2 = https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
 API_KEY_2 = sk-yyyyyy
 
 MODEL_2 = qwen-plus:通义千问 Plus, qwen-max:通义千问 Max
-(注：如果你还想启用 Telegram 机器人功能，请添加 TG_BOT_TOKEN 环境变量)
+
+# (注：如果你还想启用 Telegram 机器人功能，请添加 TG_BOT_TOKEN 环境变量)
