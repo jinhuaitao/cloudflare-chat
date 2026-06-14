@@ -27,10 +27,15 @@
 根据你的代码逻辑，你需要添加以下配置（选择其中一种方式即可）：
 ### 多模型/多通道配置（你在代码中新增的功能）
 
-变量名 API_URL_1 / 变量值：通道 1 的 API 地址
+变量名 API_URL_1 = 变量值：通道 1 的 API 地址
 
-变量名 API_KEY_1 / 变量值：通道 1 的密钥
+变量名 API_KEY_1 = 变量值：通道 1 的密钥
 
-变量名 MODEL_1 / 变量值：gpt-4o:GPT-4o, gpt-3.5-turbo:GPT-3.5
+变量名 MODEL_1 = 变量值：gpt-4o:GPT-4o, gpt-3.5-turbo:GPT-3.5
 
+变量名 API_URL_2 = https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+
+变量名 API_KEY_2 = sk-yyyyyy
+
+变量名 MODEL_2 = qwen-plus:通义千问 Plus, qwen-max:通义千问 Max
 (注：如果你还想启用 Telegram 机器人功能，请添加 TG_BOT_TOKEN 环境变量)
