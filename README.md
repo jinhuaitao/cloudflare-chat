@@ -11,7 +11,7 @@
 
 按照提示授权绑定你的 GitHub 账号。
 
-在仓库列表中，选择你刚刚创建的 ai-proxy-worker 仓库。
+在仓库列表中，选择你刚刚创建的 cloudflare-chat 仓库。
 
 默认的构建设置会被 wrangler.toml 自动接管，直接点击 "保存并部署" (Save and deploy)。
 
