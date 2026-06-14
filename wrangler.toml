@@ -1,0 +1,5 @@
+name = "ai-assistant-pro"
+main = "index.js"
+compatibility_date = "2024-03-20"
+
+# 如果你使用的是不同的文件名，请将上面的 main 修改为对应的文件名
