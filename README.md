@@ -50,4 +50,6 @@ API_KEY_2 = sk-yyyyyy
 
 MODEL_2 = qwen-plus:通义千问 Plus, qwen-max:通义千问 Max
 
+### 添加完所需的环境变量后，必须重新部署一次，新的模型列表就会出现在前端的下拉框里了。
+
 # (注：如果你还想启用 Telegram 机器人功能，请添加 TG_BOT_TOKEN 环境变量)
