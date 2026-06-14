@@ -31,11 +31,20 @@
 
 变量名 API_KEY_1 = 变量值：通道 1 的密钥
 
-变量名 MODEL_1 = 变量值：gpt-4o:GPT-4o, gpt-3.5-turbo:GPT-3.5
+变量名 MODEL_1 = 变量值：模型:自定义模型名,模型:自定义模型名
 
-变量名 API_URL_2 = https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+#### 通道 1 (例如对接 OpenAI):
+API_URL_1 = https://api.openai.com/v1/chat/completions
 
-变量名 API_KEY_2 = sk-yyyyyy
+API_KEY_1 = sk-xxxxxx
 
-变量名 MODEL_2 = qwen-plus:通义千问 Plus, qwen-max:通义千问 Max
+MODEL_1 = gpt-4o:GPT-4o, gpt-4o-mini:GPT 4o Mini
+
+#### 通道 2 (例如对接 阿里通义千问):
+
+API_URL_2 = https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+
+API_KEY_2 = sk-yyyyyy
+
+MODEL_2 = qwen-plus:通义千问 Plus, qwen-max:通义千问 Max
 (注：如果你还想启用 Telegram 机器人功能，请添加 TG_BOT_TOKEN 环境变量)
