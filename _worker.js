@@ -10,7 +10,7 @@ function getChannelConfig(env) {
     const arr = (modelStr || "").split(',').map(m => m.trim()).filter(m => m);
     arr.forEach(m => {
       let id = m.trim(), name = m.trim();
-      const colonIdx = m.indexOf(':');
+      const colonIdx = m.lastIndexOf(':');
       if (colonIdx > 0) {
         id = m.substring(0, colonIdx).trim();
         name = m.substring(colonIdx + 1).trim();
