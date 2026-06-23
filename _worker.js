@@ -54,8 +54,7 @@ function getChannelConfig(env) {
   // 3. 回退到旧版单一环境变量 (完全兼容旧版不改变任何功能)
   const fallbackUrl = env.API_URL || "";
   const fallbackKeys = (env.API_KEY || "").split(',').map(k => k.trim()).filter(k => k);
-  // 将硬编码的模型删除，只保留 env.MODEL，如果未配置则为空
-  const fallbackModelStr = env.MODEL || "";
+  const fallbackModelStr = env.MODEL || "meta/llama3-70b-instruct:Llama 3 70B,deepseek-ai/DeepSeek-R1:深度思考 R1";
   
   addModels(fallbackModelStr, fallbackUrl, fallbackKeys);
 
@@ -109,12 +108,27 @@ export default {
         const apiUrl = channel.url;
         // =====================================
 
-        const payload = {
-          model: selectedModel,
-          messages: body.messages,
-          stream: true,
-          max_tokens: 4096, 
-        };
+        // ======= 核心修改：智能识别生图接口 =======
+        const isImageAPI = apiUrl.includes('images/generations') || selectedModel.toLowerCase().includes('image');
+
+        let payload = {};
+        if (isImageAPI) {
+          // 生图接口：提取用户对话的最后一句话作为 prompt，禁用流式
+          const lastMessage = body.messages[body.messages.length - 1].content;
+          payload = {
+            model: selectedModel,
+            prompt: lastMessage,
+            n: 1
+          };
+        } else {
+          // 文本接口：保持流式传输和多轮对话 messages 格式
+          payload = {
+            model: selectedModel,
+            messages: body.messages,
+            stream: true,
+            max_tokens: 4096, 
+          };
+        }
 
         const nvidiaResponse = await fetch(apiUrl, {
           method: 'POST',
@@ -133,14 +147,49 @@ export default {
           });
         }
 
-        return new Response(nvidiaResponse.body, {
-          headers: {
-            'Content-Type': 'text/event-stream',
-            'Access-Control-Allow-Origin': '*',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-          },
-        });
+        // ======= 核心修改：分流处理返回结果 =======
+        if (!isImageAPI) {
+          // 1. 普通文本模型：直接透传由服务器发来的 SSE 流
+          return new Response(nvidiaResponse.body, {
+            headers: {
+              'Content-Type': 'text/event-stream',
+              'Access-Control-Allow-Origin': '*',
+              'Cache-Control': 'no-cache',
+              'Connection': 'keep-alive',
+            },
+          });
+        } else {
+          // 2. 生图模型：等待图片生成完毕，提取 URL 并伪装成流发给前端
+          const responseData = await nvidiaResponse.json();
+          let imageUrlOrText = "图片生成失败或未返回格式";
+          
+          if (responseData.data && responseData.data[0]?.url) {
+            // 将 URL 包装成 Markdown 图片语法
+            imageUrlOrText = `![生成结果](${responseData.data[0].url})`;
+          } else if (responseData.choices && responseData.choices[0]?.message) {
+            imageUrlOrText = responseData.choices[0].message.content;
+          }
+
+          // 伪装成前端代码能够解析的打字机 (SSE) 数据包
+          const encoder = new TextEncoder();
+          const stream = new ReadableStream({
+            start(controller) {
+              const fakeChunk = JSON.stringify({ choices: [{ delta: { content: imageUrlOrText + "\n\n" } }] });
+              controller.enqueue(encoder.encode(`data: ${fakeChunk}\n\n`));
+              controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+              controller.close();
+            }
+          });
+
+          return new Response(stream, {
+            headers: {
+              'Content-Type': 'text/event-stream',
+              'Access-Control-Allow-Origin': '*',
+              'Cache-Control': 'no-cache',
+              'Connection': 'keep-alive',
+            },
+          });
+        }
       } catch (error) {
         return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: corsHeaders() });
       }
@@ -270,34 +319,47 @@ export default {
                 return;
               }
 
+              // ======= 新增：智能识别生图接口 =======
+              const isImageAPI = apiUrl.includes('images/generations') || targetModelId.toLowerCase().includes('image');
+              
+              const payload = isImageAPI ? {
+                model: targetModelId,
+                prompt: userText, // 生图接口用 prompt 参数
+                n: 1
+              } : {
+                model: targetModelId,
+                messages: [{ role: "user", content: userText }], // 文本接口用 messages
+                stream: false, 
+                max_tokens: 4096
+              };
+
               const aiResponse = await fetch(apiUrl, {
                 method: 'POST',
                 headers: {
                   'Authorization': `Bearer ${currentApiKey}`, 
                   'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({
-                  model: targetModelId,
-                  messages: [{ role: "user", content: userText }],
-                  stream: false, 
-                  max_tokens: 4096
-                }),
+                body: JSON.stringify(payload),
               });
 
               if (pendingMsgId) {
                 await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/deleteMessage`, {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    chat_id: chatId,
-                    message_id: pendingMsgId
-                  })
+                  body: JSON.stringify({ chat_id: chatId, message_id: pendingMsgId })
                 });
               }
 
               if (aiResponse.ok) {
                 const aiData = await aiResponse.json();
-                const replyText = aiData.choices?.[0]?.message?.content || "AI 没有返回有效内容。";
+                let replyText = "AI 没有返回有效内容。";
+                
+                // ======= 新增：兼容两种不同的返回格式 =======
+                if (aiData.choices && aiData.choices[0]?.message) {
+                  replyText = aiData.choices[0].message.content; // 文本回复
+                } else if (aiData.data && aiData.data[0]?.url) {
+                  replyText = `[🖼️ 点击查看生成的图片](${aiData.data[0].url})`; // 生图回复包装为 Markdown 链接
+                }
 
                 const maxLength = 4000; 
                 for (let i = 0; i < replyText.length; i += maxLength) {
@@ -515,6 +577,8 @@ const HTML_CONTENT = `<!DOCTYPE html>
     .error-msg .message-bubble { color: #ef4444; }
 
     /* ========== Markdown 内容样式 ========== */
+    .markdown-body img { max-width: 100%; border-radius: 8px; margin-top: 10px; }
+    
     .markdown-body {
       font-size: 16px;
       line-height: 1.7;
