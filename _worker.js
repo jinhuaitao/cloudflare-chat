@@ -22,7 +22,6 @@ function getChannelConfig(env) {
     });
   };
 
-  // 1. 优先尝试 JSON 配置: API_CONFIG
   if (env.API_CONFIG) {
     try {
       const channels = JSON.parse(env.API_CONFIG);
@@ -38,7 +37,6 @@ function getChannelConfig(env) {
     }
   }
 
-  // 2. 尝试多组变量映射: API_URL_1, API_KEY_1, MODEL_1 ...
   let hasIndexed = false;
   for (let i = 1; i <= 20; i++) {
     if (env[`API_URL_${i}`] && env[`MODEL_${i}`]) {
@@ -51,10 +49,9 @@ function getChannelConfig(env) {
   }
   if (hasIndexed && models.length > 0) return { models, modelMap };
 
-  // 3. 回退到旧版单一环境变量 (完全兼容旧版不改变任何功能)
   const fallbackUrl = env.API_URL || "";
   const fallbackKeys = (env.API_KEY || "").split(',').map(k => k.trim()).filter(k => k);
-  const fallbackModelStr = env.MODEL || "meta/llama3-70b-instruct:Llama 3 70B,deepseek-ai/DeepSeek-R1:深度思考 R1";
+  const fallbackModelStr = env.MODEL || "meta/llama3-70b-instruct:Llama 3 70B,deepseek-ai/DeepSeek-R1:深度思考 R1,agnes-video-v20:Agnes 视频生成";
   
   addModels(fallbackModelStr, fallbackUrl, fallbackKeys);
 
@@ -66,15 +63,11 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // ==========================================
-    // 微信站长认证专用路由
-    // ==========================================
     if (request.method === 'GET' && url.pathname === '/a9a015a0f6e7c9ca09f4cdce4479deb3.txt') {
       return new Response('b7aa7e3069358c2c18f7908a7d5815788bafd020', {
         headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
       });
     }
-    // ==========================================
 
     if (request.method === 'OPTIONS') {
       return new Response(null, {
@@ -95,7 +88,6 @@ export default {
           return new Response(JSON.stringify({ error: "无效的请求格式" }), { status: 400, headers: corsHeaders() });
         }
 
-        // ======= 获取对应的 URL 和 KEY =======
         const { models, modelMap } = getChannelConfig(env);
         const selectedModel = body.model || (models.length > 0 ? models[0].id : "");
         const channel = modelMap.get(selectedModel) || modelMap.values().next().value;
@@ -106,22 +98,25 @@ export default {
 
         const currentApiKey = channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
         const apiUrl = channel.url;
-        // =====================================
 
-        // ======= 核心修改：智能识别生图接口 =======
-        const isImageAPI = apiUrl.includes('images/generations') || selectedModel.toLowerCase().includes('image');
+        // ======= 修改：扩展为多媒体(图片/视频)识别 =======
+        const selectedModelLower = selectedModel.toLowerCase();
+        const isImageAPI = apiUrl.includes('images/generations') || selectedModelLower.includes('image') || selectedModelLower.includes('dall-e');
+        const isVideoAPI = apiUrl.includes('videos/generations') || selectedModelLower.includes('video');
+        const isMediaAPI = isImageAPI || isVideoAPI;
 
         let payload = {};
-        if (isImageAPI) {
-          // 生图接口：提取用户对话的最后一句话作为 prompt，禁用流式
+        if (isMediaAPI) {
+          // 媒体生图/视频接口：提取最后一句 prompt，禁用流式
           const lastMessage = body.messages[body.messages.length - 1].content;
           payload = {
             model: selectedModel,
-            prompt: lastMessage,
-            n: 1
+            prompt: lastMessage
           };
+          // 仅生图接口通常需要 n 参数，视频接口一般不需要
+          if (isImageAPI) payload.n = 1;
         } else {
-          // 文本接口：保持流式传输和多轮对话 messages 格式
+          // 文本接口：保持流式传输和多轮对话
           payload = {
             model: selectedModel,
             messages: body.messages,
@@ -130,7 +125,7 @@ export default {
           };
         }
 
-        const nvidiaResponse = await fetch(apiUrl, {
+        const fetchResponse = await fetch(apiUrl, {
           method: 'POST',
           headers: {
             'Authorization': `Bearer ${currentApiKey}`, 
@@ -139,18 +134,17 @@ export default {
           body: JSON.stringify(payload),
         });
 
-        if (!nvidiaResponse.ok) {
-          const errText = await nvidiaResponse.text();
-          return new Response(JSON.stringify({ error: `API 报错 (${nvidiaResponse.status}): ${errText}` }), {
-            status: nvidiaResponse.status,
+        if (!fetchResponse.ok) {
+          const errText = await fetchResponse.text();
+          return new Response(JSON.stringify({ error: `API 报错 (${fetchResponse.status}): ${errText}` }), {
+            status: fetchResponse.status,
             headers: corsHeaders(),
           });
         }
 
-        // ======= 核心修改：分流处理返回结果 =======
-        if (!isImageAPI) {
-          // 1. 普通文本模型：直接透传由服务器发来的 SSE 流
-          return new Response(nvidiaResponse.body, {
+        // ======= 修改：根据多媒体类型分流处理结果 =======
+        if (!isMediaAPI) {
+          return new Response(fetchResponse.body, {
             headers: {
               'Content-Type': 'text/event-stream',
               'Access-Control-Allow-Origin': '*',
@@ -159,22 +153,26 @@ export default {
             },
           });
         } else {
-          // 2. 生图模型：等待图片生成完毕，提取 URL 并伪装成流发给前端
-          const responseData = await nvidiaResponse.json();
-          let imageUrlOrText = "图片生成失败或未返回格式";
+          const responseData = await fetchResponse.json();
+          let mediaResultText = "媒体内容生成失败或未返回格式";
           
           if (responseData.data && responseData.data[0]?.url) {
-            // 将 URL 包装成 Markdown 图片语法
-            imageUrlOrText = `![生成结果](${responseData.data[0].url})`;
+            const mediaUrl = responseData.data[0].url;
+            if (isVideoAPI) {
+              // 返回 HTML video 标签，实现直接在网页对话框内播放
+              mediaResultText = `<video controls width="100%" style="border-radius: 8px; margin-top: 10px; background: #000;" src="${mediaUrl}"></video>\n\n[🔗 点击此处在浏览器中打开/下载视频](${mediaUrl})`;
+            } else {
+              mediaResultText = `![生成结果](${mediaUrl})`;
+            }
           } else if (responseData.choices && responseData.choices[0]?.message) {
-            imageUrlOrText = responseData.choices[0].message.content;
+            // 兼容某些将 URL 包装在 chat completion 里的代理接口
+            mediaResultText = responseData.choices[0].message.content;
           }
 
-          // 伪装成前端代码能够解析的打字机 (SSE) 数据包
           const encoder = new TextEncoder();
           const stream = new ReadableStream({
             start(controller) {
-              const fakeChunk = JSON.stringify({ choices: [{ delta: { content: imageUrlOrText + "\n\n" } }] });
+              const fakeChunk = JSON.stringify({ choices: [{ delta: { content: mediaResultText + "\n\n" } }] });
               controller.enqueue(encoder.encode(`data: ${fakeChunk}\n\n`));
               controller.enqueue(encoder.encode('data: [DONE]\n\n'));
               controller.close();
@@ -214,9 +212,6 @@ export default {
       });
     }
 
-    // ==========================================
-    // Telegram Bot Webhook 专用路由 
-    // ==========================================
     if (request.method === 'POST' && url.pathname === '/tg-webhook') {
       try {
         const update = await request.json();
@@ -228,6 +223,7 @@ export default {
             if (modelObjList.length === 0) return;
 
             if (update.callback_query) {
+              // [TG Callback 处理逻辑不变...]
               const cb = update.callback_query;
               const chatId = cb.message.chat.id;
               const data = cb.data;
@@ -280,13 +276,10 @@ export default {
                 return;
               }
 
-              // ======= 获取对应的 URL 和 KEY =======
               const targetModelId = tgUserModels.get(chatId) || modelObjList[0].id;
               const channel = modelMap.get(targetModelId) || modelMap.values().next().value;
-              
               const currentApiKey = channel && channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
               const apiUrl = channel ? channel.url : "";
-              // =====================================
 
               let pendingMsgId = null;
               try {
@@ -301,7 +294,7 @@ export default {
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({
                     chat_id: chatId,
-                    text: "⏳ _正在深度思考并生成内容，请稍候..._",
+                    text: "⏳ _正在生成内容，请稍候..._",
                     parse_mode: "Markdown"
                   })
                 });
@@ -319,19 +312,24 @@ export default {
                 return;
               }
 
-              // ======= 新增：智能识别生图接口 =======
-              const isImageAPI = apiUrl.includes('images/generations') || targetModelId.toLowerCase().includes('image');
+              // ======= 修改：TG 机器人的多媒体判断与 Payload 适配 =======
+              const targetModelLower = targetModelId.toLowerCase();
+              const isImageAPI = apiUrl.includes('images/generations') || targetModelLower.includes('image') || targetModelLower.includes('dall-e');
+              const isVideoAPI = apiUrl.includes('videos/generations') || targetModelLower.includes('video');
+              const isMediaAPI = isImageAPI || isVideoAPI;
               
-              const payload = isImageAPI ? {
-                model: targetModelId,
-                prompt: userText, // 生图接口用 prompt 参数
-                n: 1
-              } : {
-                model: targetModelId,
-                messages: [{ role: "user", content: userText }], // 文本接口用 messages
-                stream: false, 
-                max_tokens: 4096
-              };
+              let payload = {};
+              if (isMediaAPI) {
+                payload = { model: targetModelId, prompt: userText };
+                if (isImageAPI) payload.n = 1;
+              } else {
+                payload = {
+                  model: targetModelId,
+                  messages: [{ role: "user", content: userText }], 
+                  stream: false, 
+                  max_tokens: 4096
+                };
+              }
 
               const aiResponse = await fetch(apiUrl, {
                 method: 'POST',
@@ -354,11 +352,15 @@ export default {
                 const aiData = await aiResponse.json();
                 let replyText = "AI 没有返回有效内容。";
                 
-                // ======= 新增：兼容两种不同的返回格式 =======
+                // ======= 修改：TG 端适配视频返回文本 =======
                 if (aiData.choices && aiData.choices[0]?.message) {
-                  replyText = aiData.choices[0].message.content; // 文本回复
+                  replyText = aiData.choices[0].message.content; 
                 } else if (aiData.data && aiData.data[0]?.url) {
-                  replyText = `[🖼️ 点击查看生成的图片](${aiData.data[0].url})`; // 生图回复包装为 Markdown 链接
+                  if (isVideoAPI) {
+                    replyText = `[🎬 视频生成成功，点击浏览器打开或下载](${aiData.data[0].url})`;
+                  } else {
+                    replyText = `[🖼️ 点击查看生成的图片](${aiData.data[0].url})`;
+                  }
                 }
 
                 const maxLength = 4000; 
@@ -404,7 +406,6 @@ export default {
         return new Response('Error', { status: 500 });
       }
     }
-    // ==========================================
 
     return new Response('Not Found', { status: 404 });
   }
