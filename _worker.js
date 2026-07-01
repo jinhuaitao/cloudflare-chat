@@ -109,18 +109,20 @@ export default {
         // =====================================
 
         // ======= 核心修改：智能识别多媒体(生图/视频)接口 =======
-        const isImageAPI = apiUrl.includes('images/generations') || selectedModel.toLowerCase().includes('image');
-        const isVideoAPI = apiUrl.includes('videos/completions') || selectedModel.toLowerCase().includes('video');
+        const isMediaAPI = apiUrl.includes('images/generations') || apiUrl.includes('videos/completions') || selectedModel.toLowerCase().includes('image') || selectedModel.toLowerCase().includes('video');
 
         let payload = {};
-        if (isImageAPI || isVideoAPI) {
-          // 视频和图片生成：提取用户最后一句话作为 prompt 参数，不能用 messages
+        if (!isMediaAPI) {
+          // 视频和图片生成：提取用户最后一句话作为 prompt 参数，不能用 messages，禁用流式
           const lastMessage = body.messages[body.messages.length - 1].content;
           payload = {
             model: selectedModel,
             prompt: lastMessage
           };
-          if (isImageAPI) payload.n = 1;
+          // 如果是标准生图接口，带上 n=1 参数
+          if (apiUrl.includes('images/generations') || selectedModel.toLowerCase().includes('image')) {
+            payload.n = 1;
+          }
         } else {
           // 文本接口：保持流式传输和多轮对话 messages 格式
           payload = {
@@ -321,12 +323,11 @@ export default {
               }
 
               // ======= 新增：智能识别多媒体(生图/视频)接口 =======
-              const isImageAPI = apiUrl.includes('images/generations') || targetModelId.toLowerCase().includes('image');
-              const isVideoAPI = apiUrl.includes('videos/completions') || targetModelId.toLowerCase().includes('video');
+              const isMediaAPI = apiUrl.includes('images/generations') || apiUrl.includes('videos/completions') || targetModelId.toLowerCase().includes('image') || targetModelId.toLowerCase().includes('video');
               
-              const payload = (isImageAPI || isVideoAPI) ? {
+              const payload = isMediaAPI ? {
                 model: targetModelId,
-                prompt: userText // 视频和图片统一使用 prompt 参数
+                prompt: userText // 视频和图片统一使用 prompt 参数，且不使用 stream
               } : {
                 model: targetModelId,
                 messages: [{ role: "user", content: userText }], // 文本接口用 messages
