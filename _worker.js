@@ -389,10 +389,16 @@ export default {
                   }
                 }
               } else {
+                 // 把真实的报错详情抓出来
+                 const errText = await aiResponse.text();
                  await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ chat_id: chatId, text: "⚠️ AI 接口请求失败，请稍后再试。" })
+                    body: JSON.stringify({ 
+                      chat_id: chatId, 
+                      text: `⚠️ API 请求失败 (${aiResponse.status}):\n\`${errText}\``,
+                      parse_mode: "Markdown"
+                    })
                   });
               }
             }
