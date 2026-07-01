@@ -108,25 +108,25 @@ export default {
         const apiUrl = channel.url;
         // =====================================
 
-        // ======= 核心修改：智能识别生图/视频接口 =======
+        // ======= 核心修改：智能识别多媒体(生图/视频)接口 =======
         const isImageAPI = apiUrl.includes('images/generations') || selectedModel.toLowerCase().includes('image');
-        const isVideoModel = selectedModel.toLowerCase().includes('video'); // 新增：识别视频模型
+        const isVideoAPI = apiUrl.includes('videos/completions') || selectedModel.toLowerCase().includes('video');
 
         let payload = {};
-        if (isImageAPI) {
-          // 生图接口：提取用户对话的最后一句话作为 prompt，禁用流式
+        if (isImageAPI || isVideoAPI) {
+          // 视频和图片生成：提取用户最后一句话作为 prompt 参数，不能用 messages
           const lastMessage = body.messages[body.messages.length - 1].content;
           payload = {
             model: selectedModel,
-            prompt: lastMessage,
-            n: 1
+            prompt: lastMessage
           };
+          if (isImageAPI) payload.n = 1;
         } else {
-          // 文本接口 / 视频接口：保持多轮对话 messages 格式
+          // 文本接口：保持流式传输和多轮对话 messages 格式
           payload = {
             model: selectedModel,
             messages: body.messages,
-            stream: !isVideoModel, // 视频模型强制关闭流式
+            stream: true,
             max_tokens: 4096, 
           };
         }
@@ -149,7 +149,7 @@ export default {
         }
 
         // ======= 核心修改：分流处理返回结果 =======
-        if (!isImageAPI && !isVideoModel) {
+        if (!isImageAPI && !isVideoAPI) {
           // 1. 普通文本模型：直接透传由服务器发来的 SSE 流
           return new Response(nvidiaResponse.body, {
             headers: {
@@ -320,13 +320,13 @@ export default {
                 return;
               }
 
-              // ======= 新增：智能识别生图接口 =======
+              // ======= 新增：智能识别多媒体(生图/视频)接口 =======
               const isImageAPI = apiUrl.includes('images/generations') || targetModelId.toLowerCase().includes('image');
+              const isVideoAPI = apiUrl.includes('videos/completions') || targetModelId.toLowerCase().includes('video');
               
-              const payload = isImageAPI ? {
+              const payload = (isImageAPI || isVideoAPI) ? {
                 model: targetModelId,
-                prompt: userText, // 生图接口用 prompt 参数
-                n: 1
+                prompt: userText // 视频和图片统一使用 prompt 参数
               } : {
                 model: targetModelId,
                 messages: [{ role: "user", content: userText }], // 文本接口用 messages
