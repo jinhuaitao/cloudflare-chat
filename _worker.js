@@ -179,36 +179,24 @@ export default {
                  const pollUrl = `${baseUrl}/agnesapi?video_id=${videoId}`;
                  
                  let isFinished = false;
-                  for (let i = 0; i < 36; i++) {
-                     await new Promise(r => setTimeout(r, 5000));
-                     try {
-                        const pollRes = await fetch(pollUrl, { headers: { 'Authorization': `Bearer ${currentApiKey}` } });
-                        const rawText = await pollRes.text(); // 抓取原始返回文本
-
-                        // ⚠️ 调试雷达：只在第一次轮询时，把上游真实情况打印到 TG 给你看
-                        if (i === 0) {
-                           await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
-                              method: 'POST',
-                              headers: { 'Content-Type': 'application/json' },
-                              body: JSON.stringify({ chat_id: chatId, text: `🛠 **[调试雷达] 第1次查询上游返回 (HTTP ${pollRes.status})**:\n\n\`${rawText.substring(0, 300)}\``, parse_mode: "Markdown" })
-                           });
-                        }
-
-                        if (pollRes.ok) {
-                          const pollData = JSON.parse(rawText);
-                          if (pollData.status === 'success' || pollData.status === 'succeeded' || pollData.status === 'finished') {
-                              mediaUrl = pollData.video_url || pollData.url || (pollData.data && pollData.data[0]?.url) || (pollData.data && pollData.data.video_url);
-                              isFinished = true;
-                              break;
-                          } else if (pollData.status === 'failed' || pollData.status === 'error') {
-                              replyText = `⚠️ 视频生成失败 (状态: ${pollData.status})`;
-                              break;
-                          }
-                        }
-                     } catch(e) {
-                        console.log("轮询解析异常:", e);
-                     }
-                  }
+                 // 最多轮询 36 次 (约 3 分钟)
+                 for (let i = 0; i < 36; i++) {
+                    await new Promise(r => setTimeout(r, 5000));
+                    try {
+                       const pollRes = await fetch(pollUrl, { headers: { 'Authorization': `Bearer ${currentApiKey}` } });
+                       if (pollRes.ok) {
+                         const pollData = await pollRes.json();
+                         if (pollData.status === 'success' || pollData.status === 'succeeded' || pollData.status === 'finished') {
+                             mediaUrl = pollData.video_url || pollData.url || (pollData.data && pollData.data[0]?.url) || (pollData.data && pollData.data.video_url);
+                             isFinished = true;
+                             break;
+                         } else if (pollData.status === 'failed' || pollData.status === 'error') {
+                             mediaResultText = `⚠️ 视频生成失败 (上游状态返回: ${pollData.status})。`;
+                             break;
+                         }
+                       }
+                    } catch(e) {}
+                 }
                  if (!isFinished && !mediaUrl) {
                     mediaResultText = `⚠️ 视频生成已达等待上限，仍在云端排队或处理中。任务 ID: \`${videoId}\``;
                  }
@@ -499,7 +487,7 @@ function corsHeaders() {
   return { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
 }
 
-// ================= UI 代码 (未做任何改动) =================
+// ================= UI 代码 (已含代码高亮及 Markdown 解析) =================
 const HTML_CONTENT = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -520,9 +508,9 @@ const HTML_CONTENT = `<!DOCTYPE html>
       
       --text-main: #1f1f1f;
       --text-secondary: #444746;
-      --brand-color: #0b57d0; /* Gemini Blue */
+      --brand-color: #0b57d0; 
       
-      --user-msg: #f0f4f9; /* Gemini light gray */
+      --user-msg: #f0f4f9; 
       --user-text: #1f1f1f;
       
       --input-bg: rgba(255, 255, 255, 0.9);
@@ -632,7 +620,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
     .message-row { display: flex; width: 100%; animation: fadeIn 0.4s ease forwards; }
     @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
     
-    /* ========== Gemini 风格气泡调整 ========== */
     .message-row.user { justify-content: flex-end; }
     
     .message-bubble { 
@@ -649,7 +636,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
       white-space: pre-wrap; 
     }
     
-    /* AI 气泡去背，全宽平铺 */
     .message-row.ai .message-bubble { 
       background: transparent; 
       border: none; 
@@ -661,7 +647,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
     
     .error-msg .message-bubble { color: #ef4444; }
 
-    /* ========== Markdown 内容样式 ========== */
     .markdown-body img { max-width: 100%; border-radius: 8px; margin-top: 10px; }
     
     .markdown-body {
@@ -698,9 +683,8 @@ const HTML_CONTENT = `<!DOCTYPE html>
       color: var(--text-main);
     }
     
-    /* ========== Gemini 级代码块包裹 ========== */
     .code-wrapper {
-      background: #1e1e1e; /* 纯深色代码底 */
+      background: #1e1e1e;
       border-radius: 12px;
       overflow: hidden;
       margin: 16px 0;
@@ -738,7 +722,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
       font-size: 14px;
       line-height: 1.5;
     }
-    /* ==================================== */
 
     .reasoning-box {
       font-size: 14px;
