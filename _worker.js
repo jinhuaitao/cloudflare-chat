@@ -108,8 +108,9 @@ export default {
         const apiUrl = channel.url;
         // =====================================
 
-        // ======= 核心修改：智能识别生图接口 =======
+        // ======= 核心修改：智能识别生图/视频接口 =======
         const isImageAPI = apiUrl.includes('images/generations') || selectedModel.toLowerCase().includes('image');
+        const isVideoModel = selectedModel.toLowerCase().includes('video'); // 新增：识别视频模型
 
         let payload = {};
         if (isImageAPI) {
@@ -121,11 +122,11 @@ export default {
             n: 1
           };
         } else {
-          // 文本接口：保持流式传输和多轮对话 messages 格式
+          // 文本接口 / 视频接口：保持多轮对话 messages 格式
           payload = {
             model: selectedModel,
             messages: body.messages,
-            stream: true,
+            stream: !isVideoModel, // 视频模型强制关闭流式
             max_tokens: 4096, 
           };
         }
@@ -148,7 +149,7 @@ export default {
         }
 
         // ======= 核心修改：分流处理返回结果 =======
-        if (!isImageAPI) {
+        if (!isImageAPI && !isVideoModel) {
           // 1. 普通文本模型：直接透传由服务器发来的 SSE 流
           return new Response(nvidiaResponse.body, {
             headers: {
@@ -836,23 +837,27 @@ const HTML_CONTENT = `<!DOCTYPE html>
 <script>
   const renderer = new marked.Renderer();
   renderer.code = function(code, language) {
-    const validLang = !!(language && hljs.getLanguage(language));
-    const highlighted = validLang ? hljs.highlight(code, { language }).value : hljs.highlightAuto(code).value;
-    const displayLang = language ? language : 'text';
-    
-    return \`
-      <div class="code-wrapper">
-        <div class="code-header">
-          <span>\${displayLang}</span>
-          <button class="copy-btn" data-code="\${encodeURIComponent(code)}">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-            <span>复制代码</span>
-          </button>
-        </div>
-        <pre><code class="hljs \${language}">\${highlighted}</code></pre>
+    // ... 原本的代码保持不动 ...
       </div>
     \`;
   };
+
+  // ++++++++ 新增：处理视频链接/图片的拦截渲染 ++++++++
+  renderer.link = function(href, title, text) {
+    if (href.match(/\.(mp4|webm|ogg|mov)(\?.*)?$/i)) {
+      return `<video controls style="width: 100%; border-radius: 12px; margin: 12px 0; box-shadow: 0 4px 12px rgba(0,0,0,0.1);"><source src="${href}">您的浏览器不支持播放视频。</video>`;
+    }
+    return `<a href="${href}" target="_blank" rel="noopener noreferrer">${text}</a>`;
+  };
+
+  renderer.image = function(href, title, text) {
+    // 防止 AI 用 ![video](url) 格式返回视频时出现死图
+    if (href.match(/\.(mp4|webm|ogg|mov)(\?.*)?$/i)) {
+      return `<video controls style="width: 100%; border-radius: 12px; margin: 12px 0; box-shadow: 0 4px 12px rgba(0,0,0,0.1);"><source src="${href}">您的浏览器不支持播放视频。</video>`;
+    }
+    return `<img src="${href}" alt="${text}" title="${title || ''}" style="max-width: 100%; border-radius: 8px; margin: 8px 0;">`;
+  };
+  // +++++++++++++++++++++++++++++++++++++++++++++++
 
   marked.setOptions({
     breaks: true, 
