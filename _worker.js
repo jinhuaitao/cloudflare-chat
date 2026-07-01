@@ -1,7 +1,7 @@
 // 在全局作用域声明一个 Map，用于在 Worker 实例存活期间记录 TG 用户的模型选择
 const tgUserModels = new Map();
 
-// ======= 新增：统一解析通道配置（支持多组 API_URL, API_KEY, MODEL 映射） =======
+// ======= 统一解析通道配置（支持多组 API_URL, API_KEY, MODEL 映射） =======
 function getChannelConfig(env) {
   let models = [];
   let modelMap = new Map();
@@ -22,6 +22,7 @@ function getChannelConfig(env) {
     });
   };
 
+  // 1. 优先尝试 JSON 配置: API_CONFIG
   if (env.API_CONFIG) {
     try {
       const channels = JSON.parse(env.API_CONFIG);
@@ -37,6 +38,7 @@ function getChannelConfig(env) {
     }
   }
 
+  // 2. 尝试多组变量映射: API_URL_1, API_KEY_1, MODEL_1 ...
   let hasIndexed = false;
   for (let i = 1; i <= 20; i++) {
     if (env[`API_URL_${i}`] && env[`MODEL_${i}`]) {
@@ -49,6 +51,7 @@ function getChannelConfig(env) {
   }
   if (hasIndexed && models.length > 0) return { models, modelMap };
 
+  // 3. 回退到旧版单一环境变量
   const fallbackUrl = env.API_URL || "";
   const fallbackKeys = (env.API_KEY || "").split(',').map(k => k.trim()).filter(k => k);
   const fallbackModelStr = env.MODEL || "meta/llama3-70b-instruct:Llama 3 70B,deepseek-ai/DeepSeek-R1:深度思考 R1,agnes-video-v20:Agnes 视频生成";
@@ -57,12 +60,14 @@ function getChannelConfig(env) {
 
   return { models, modelMap };
 }
-// ==============================================================================
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
+    // ==========================================
+    // 微信站长认证专用路由
+    // ==========================================
     if (request.method === 'GET' && url.pathname === '/a9a015a0f6e7c9ca09f4cdce4479deb3.txt') {
       return new Response('b7aa7e3069358c2c18f7908a7d5815788bafd020', {
         headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
@@ -79,6 +84,9 @@ export default {
       });
     }
 
+    // ==========================================
+    // Web UI 聊天接口
+    // ==========================================
     if (request.method === 'POST' && url.pathname === '/api/chat') {
       try {
         let body;
@@ -99,24 +107,18 @@ export default {
         const currentApiKey = channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
         const apiUrl = channel.url;
 
-        // ======= 修改：扩展为多媒体(图片/视频)识别 =======
+        // 智能识别多媒体接口
         const selectedModelLower = selectedModel.toLowerCase();
         const isImageAPI = apiUrl.includes('images/generations') || selectedModelLower.includes('image') || selectedModelLower.includes('dall-e');
-        const isVideoAPI = apiUrl.includes('videos/generations') || selectedModelLower.includes('video');
+        const isVideoAPI = apiUrl.includes('/videos') || selectedModelLower.includes('video');
         const isMediaAPI = isImageAPI || isVideoAPI;
 
         let payload = {};
         if (isMediaAPI) {
-          // 媒体生图/视频接口：提取最后一句 prompt，禁用流式
           const lastMessage = body.messages[body.messages.length - 1].content;
-          payload = {
-            model: selectedModel,
-            prompt: lastMessage
-          };
-          // 仅生图接口通常需要 n 参数，视频接口一般不需要
+          payload = { model: selectedModel, prompt: lastMessage };
           if (isImageAPI) payload.n = 1;
         } else {
-          // 文本接口：保持流式传输和多轮对话
           payload = {
             model: selectedModel,
             messages: body.messages,
@@ -142,8 +144,9 @@ export default {
           });
         }
 
-        // ======= 修改：根据多媒体类型分流处理结果 =======
+        // 分流处理结果，加入异步轮询
         if (!isMediaAPI) {
+          // 普通文本，直接透传 SSE 流
           return new Response(fetchResponse.body, {
             headers: {
               'Content-Type': 'text/event-stream',
@@ -154,38 +157,72 @@ export default {
           });
         } else {
           const responseData = await fetchResponse.json();
-          let mediaResultText = "媒体内容生成失败或未返回格式";
-          
-          if (responseData.data && responseData.data[0]?.url) {
-            const mediaUrl = responseData.data[0].url;
-            if (isVideoAPI) {
-              // 返回 HTML video 标签，实现直接在网页对话框内播放
-              mediaResultText = `<video controls width="100%" style="border-radius: 8px; margin-top: 10px; background: #000;" src="${mediaUrl}"></video>\n\n[🔗 点击此处在浏览器中打开/下载视频](${mediaUrl})`;
-            } else {
-              mediaResultText = `![生成结果](${mediaUrl})`;
-            }
-          } else if (responseData.choices && responseData.choices[0]?.message) {
-            // 兼容某些将 URL 包装在 chat completion 里的代理接口
-            mediaResultText = responseData.choices[0].message.content;
-          }
-
           const encoder = new TextEncoder();
+          
           const stream = new ReadableStream({
-            start(controller) {
-              const fakeChunk = JSON.stringify({ choices: [{ delta: { content: mediaResultText + "\n\n" } }] });
-              controller.enqueue(encoder.encode(`data: ${fakeChunk}\n\n`));
+            async start(controller) {
+              let mediaResultText = "媒体内容生成失败或未返回有效格式";
+              let mediaUrl = null;
+
+              if (responseData.data && responseData.data[0]?.url) {
+                // 直接返回了 URL
+                mediaUrl = responseData.data[0].url;
+              } 
+              else if (isVideoAPI && (responseData.video_id || responseData.task_id || (responseData.data && responseData.data.video_id))) {
+                 // 异步返回了任务 ID (Agnes Video)
+                 const videoId = responseData.video_id || responseData.task_id || responseData.data.video_id;
+                 
+                 const loadingMsg = `⏳ **视频渲染中...**\n\n云端已接收任务 (ID: \`${videoId}\`)，渲染通常需要 1~3 分钟，请耐心等待。\n\n`;
+                 controller.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: loadingMsg } }] })}\n\n`));
+
+                 const baseUrl = apiUrl.split('/v1')[0]; 
+                 const pollUrl = `${baseUrl}/agnesapi?video_id=${videoId}`;
+                 
+                 let isFinished = false;
+                 // 最多轮询 36 次 (约 3 分钟)
+                 for (let i = 0; i < 36; i++) {
+                    await new Promise(r => setTimeout(r, 5000));
+                    try {
+                       const pollRes = await fetch(pollUrl, { headers: { 'Authorization': `Bearer ${currentApiKey}` } });
+                       if (pollRes.ok) {
+                         const pollData = await pollRes.json();
+                         if (pollData.status === 'success' || pollData.status === 'succeeded' || pollData.status === 'finished') {
+                             mediaUrl = pollData.video_url || pollData.url || (pollData.data && pollData.data[0]?.url) || (pollData.data && pollData.data.video_url);
+                             isFinished = true;
+                             break;
+                         } else if (pollData.status === 'failed' || pollData.status === 'error') {
+                             mediaResultText = `⚠️ 视频生成失败 (上游状态返回: ${pollData.status})。`;
+                             break;
+                         }
+                       }
+                    } catch(e) {}
+                 }
+                 if (!isFinished && !mediaUrl) {
+                    mediaResultText = `⚠️ 视频生成已达等待上限，仍在云端排队或处理中。任务 ID: \`${videoId}\``;
+                 }
+              }
+              else if (responseData.choices && responseData.choices[0]?.message) {
+                // 代理接口包装成了 Markdown
+                mediaResultText = responseData.choices[0].message.content;
+              }
+
+              if (mediaUrl) {
+                if (isVideoAPI) {
+                  mediaResultText = `\n\n<video controls width="100%" style="border-radius: 8px; margin: 10px 0; background: #000;" src="${mediaUrl}"></video>\n\n[🔗 点击此处在浏览器中打开/下载视频](${mediaUrl})`;
+                } else {
+                  mediaResultText = `![生成结果](${mediaUrl})`;
+                }
+              }
+
+              // 推送最终结果
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: mediaResultText } }] })}\n\n`));
               controller.enqueue(encoder.encode('data: [DONE]\n\n'));
               controller.close();
             }
           });
 
           return new Response(stream, {
-            headers: {
-              'Content-Type': 'text/event-stream',
-              'Access-Control-Allow-Origin': '*',
-              'Cache-Control': 'no-cache',
-              'Connection': 'keep-alive',
-            },
+            headers: { 'Content-Type': 'text/event-stream', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' },
           });
         }
       } catch (error) {
@@ -193,6 +230,9 @@ export default {
       }
     }
 
+    // ==========================================
+    // 渲染 Web UI 页面
+    // ==========================================
     if (request.method === 'GET' && url.pathname === '/') {
       const { models } = getChannelConfig(env);
       
@@ -212,6 +252,9 @@ export default {
       });
     }
 
+    // ==========================================
+    // Telegram Bot Webhook 路由 
+    // ==========================================
     if (request.method === 'POST' && url.pathname === '/tg-webhook') {
       try {
         const update = await request.json();
@@ -222,8 +265,8 @@ export default {
             const { models: modelObjList, modelMap } = getChannelConfig(env);
             if (modelObjList.length === 0) return;
 
+            // 处理菜单按钮回调
             if (update.callback_query) {
-              // [TG Callback 处理逻辑不变...]
               const cb = update.callback_query;
               const chatId = cb.message.chat.id;
               const data = cb.data;
@@ -254,6 +297,7 @@ export default {
               return;
             }
 
+            // 处理文本消息
             if (update.message && update.message.text) {
               const chatId = update.message.chat.id;
               const userText = update.message.text;
@@ -278,6 +322,7 @@ export default {
 
               const targetModelId = tgUserModels.get(chatId) || modelObjList[0].id;
               const channel = modelMap.get(targetModelId) || modelMap.values().next().value;
+              
               const currentApiKey = channel && channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
               const apiUrl = channel ? channel.url : "";
 
@@ -294,7 +339,7 @@ export default {
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({
                     chat_id: chatId,
-                    text: "⏳ _正在生成内容，请稍候..._",
+                    text: "⏳ _正在请求云端，请稍候..._",
                     parse_mode: "Markdown"
                   })
                 });
@@ -312,10 +357,10 @@ export default {
                 return;
               }
 
-              // ======= 修改：TG 机器人的多媒体判断与 Payload 适配 =======
+              // TG 机器人多媒体判断与 Payload 适配
               const targetModelLower = targetModelId.toLowerCase();
               const isImageAPI = apiUrl.includes('images/generations') || targetModelLower.includes('image') || targetModelLower.includes('dall-e');
-              const isVideoAPI = apiUrl.includes('videos/generations') || targetModelLower.includes('video');
+              const isVideoAPI = apiUrl.includes('/videos') || targetModelLower.includes('video');
               const isMediaAPI = isImageAPI || isVideoAPI;
               
               let payload = {};
@@ -351,16 +396,50 @@ export default {
               if (aiResponse.ok) {
                 const aiData = await aiResponse.json();
                 let replyText = "AI 没有返回有效内容。";
+                let mediaUrl = null;
                 
-                // ======= 修改：TG 端适配视频返回文本 =======
+                // TG 端支持异步视频轮询
                 if (aiData.choices && aiData.choices[0]?.message) {
                   replyText = aiData.choices[0].message.content; 
                 } else if (aiData.data && aiData.data[0]?.url) {
-                  if (isVideoAPI) {
-                    replyText = `[🎬 视频生成成功，点击浏览器打开或下载](${aiData.data[0].url})`;
-                  } else {
-                    replyText = `[🖼️ 点击查看生成的图片](${aiData.data[0].url})`;
+                  mediaUrl = aiData.data[0].url;
+                } else if (isMediaAPI && (aiData.video_id || aiData.task_id || (aiData.data && aiData.data.video_id))) {
+                  const videoId = aiData.video_id || aiData.task_id || aiData.data.video_id;
+                  
+                  await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ chat_id: chatId, text: `⏳ 视频任务已提交 (ID: \`${videoId}\`)，云端正在渲染，通常需要 1~3 分钟，请耐心等待...`, parse_mode: "Markdown" })
+                  });
+
+                  const baseUrl = apiUrl.split('/v1')[0];
+                  const pollUrl = `${baseUrl}/agnesapi?video_id=${videoId}`;
+                  
+                  let isFinished = false;
+                  for (let i = 0; i < 36; i++) {
+                     await new Promise(r => setTimeout(r, 5000));
+                     try {
+                        const pollRes = await fetch(pollUrl, { headers: { 'Authorization': `Bearer ${currentApiKey}` } });
+                        if (pollRes.ok) {
+                          const pollData = await pollRes.json();
+                          if (pollData.status === 'success' || pollData.status === 'succeeded' || pollData.status === 'finished') {
+                              mediaUrl = pollData.video_url || pollData.url || (pollData.data && pollData.data[0]?.url) || (pollData.data && pollData.data.video_url);
+                              isFinished = true;
+                              break;
+                          } else if (pollData.status === 'failed' || pollData.status === 'error') {
+                              replyText = `⚠️ 视频生成失败 (状态: ${pollData.status})`;
+                              break;
+                          }
+                        }
+                     } catch(e) {}
                   }
+                  if (!isFinished && !mediaUrl) {
+                     replyText = `⚠️ 视频生成超时，渲染仍在排队中。ID: \`${videoId}\``;
+                  }
+                }
+
+                if (mediaUrl) {
+                  replyText = isVideoAPI ? `[🎬 视频渲染完成，点击此处打开或下载](${mediaUrl})` : `[🖼️ 点击查看生成的图片](${mediaUrl})`;
                 }
 
                 const maxLength = 4000; 
@@ -370,34 +449,22 @@ export default {
                   const tgRes = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                      chat_id: chatId,
-                      text: chunk,
-                      parse_mode: "Markdown"
-                    })
+                    body: JSON.stringify({ chat_id: chatId, text: chunk, parse_mode: "Markdown" })
                   });
-
                   if (!tgRes.ok) {
                     await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({
-                        chat_id: chatId,
-                        text: chunk
-                      })
+                      body: JSON.stringify({ chat_id: chatId, text: chunk })
                     });
                   }
                 }
               } else {
-                 const errText = await aiResponse.text(); // 获取上游真实的报错文本
+                 const errText = await aiResponse.text();
                  await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ 
-                      chat_id: chatId, 
-                      text: `⚠️ AI 接口请求失败 (HTTP ${aiResponse.status})。\n\n**上游返回的原始报错:**\n\`${errText.substring(0, 300)}\``,
-                      parse_mode: "Markdown"
-                    })
+                    body: JSON.stringify({ chat_id: chatId, text: `⚠️ 接口报错 HTTP ${aiResponse.status}。\n\n**上游错误信息:**\n\`${errText.substring(0, 300)}\``, parse_mode: "Markdown" })
                   });
               }
             }
