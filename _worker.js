@@ -179,24 +179,36 @@ export default {
                  const pollUrl = `${baseUrl}/agnesapi?video_id=${videoId}`;
                  
                  let isFinished = false;
-                 // 最多轮询 36 次 (约 3 分钟)
-                 for (let i = 0; i < 36; i++) {
-                    await new Promise(r => setTimeout(r, 5000));
-                    try {
-                       const pollRes = await fetch(pollUrl, { headers: { 'Authorization': `Bearer ${currentApiKey}` } });
-                       if (pollRes.ok) {
-                         const pollData = await pollRes.json();
-                         if (pollData.status === 'success' || pollData.status === 'succeeded' || pollData.status === 'finished') {
-                             mediaUrl = pollData.video_url || pollData.url || (pollData.data && pollData.data[0]?.url) || (pollData.data && pollData.data.video_url);
-                             isFinished = true;
-                             break;
-                         } else if (pollData.status === 'failed' || pollData.status === 'error') {
-                             mediaResultText = `⚠️ 视频生成失败 (上游状态返回: ${pollData.status})。`;
-                             break;
-                         }
-                       }
-                    } catch(e) {}
-                 }
+                  for (let i = 0; i < 36; i++) {
+                     await new Promise(r => setTimeout(r, 5000));
+                     try {
+                        const pollRes = await fetch(pollUrl, { headers: { 'Authorization': `Bearer ${currentApiKey}` } });
+                        const rawText = await pollRes.text(); // 抓取原始返回文本
+
+                        // ⚠️ 调试雷达：只在第一次轮询时，把上游真实情况打印到 TG 给你看
+                        if (i === 0) {
+                           await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+                              method: 'POST',
+                              headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify({ chat_id: chatId, text: `🛠 **[调试雷达] 第1次查询上游返回 (HTTP ${pollRes.status})**:\n\n\`${rawText.substring(0, 300)}\``, parse_mode: "Markdown" })
+                           });
+                        }
+
+                        if (pollRes.ok) {
+                          const pollData = JSON.parse(rawText);
+                          if (pollData.status === 'success' || pollData.status === 'succeeded' || pollData.status === 'finished') {
+                              mediaUrl = pollData.video_url || pollData.url || (pollData.data && pollData.data[0]?.url) || (pollData.data && pollData.data.video_url);
+                              isFinished = true;
+                              break;
+                          } else if (pollData.status === 'failed' || pollData.status === 'error') {
+                              replyText = `⚠️ 视频生成失败 (状态: ${pollData.status})`;
+                              break;
+                          }
+                        }
+                     } catch(e) {
+                        console.log("轮询解析异常:", e);
+                     }
+                  }
                  if (!isFinished && !mediaUrl) {
                     mediaResultText = `⚠️ 视频生成已达等待上限，仍在云端排队或处理中。任务 ID: \`${videoId}\``;
                  }
