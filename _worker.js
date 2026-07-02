@@ -49,7 +49,10 @@ function getChannelConfig(env) {
       addModels(modelStr, url, keys);
     }
   }
-  if (hasIndexed && models.length > 0) return { models, modelMap };
+  if (hasIndexed && models.length > 0) {
+    applyDefaultModel(env, models);
+    return { models, modelMap };
+  }
 
   // 3. 回退到旧版单一环境变量 (完全兼容旧版不改变任何功能)
   const fallbackUrl = env.API_URL || "";
@@ -57,9 +60,23 @@ function getChannelConfig(env) {
   const fallbackModelStr = env.MODEL || "meta/llama3-70b-instruct:Llama 3 70B,deepseek-ai/DeepSeek-R1:深度思考 R1";
   
   addModels(fallbackModelStr, fallbackUrl, fallbackKeys);
+  
+  applyDefaultModel(env, models);
 
   return { models, modelMap };
 }
+
+// ======= 新增：处理默认模型设置 =======
+function applyDefaultModel(env, models) {
+  if (env.DEFAULT_MODEL) {
+    const defaultIdx = models.findIndex(m => m.id === env.DEFAULT_MODEL);
+    if (defaultIdx > 0) { // 如果找到了且不在第一个位置，就把它移到第一位
+      const defaultModel = models.splice(defaultIdx, 1)[0];
+      models.unshift(defaultModel);
+    }
+  }
+}
+// =====================================
 // ==============================================================================
 
 export default {
@@ -1202,4 +1219,4 @@ const HTML_CONTENT = `<!DOCTYPE html>
   init();
 </script>
 </body>
-</html>`;
+</html>
