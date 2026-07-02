@@ -49,34 +49,25 @@ function getChannelConfig(env) {
       addModels(modelStr, url, keys);
     }
   }
-  if (hasIndexed && models.length > 0) {
-    applyDefaultModel(env, models);
-    return { models, modelMap };
-  }
+  if (hasIndexed && models.length > 0) return { models, modelMap };
 
   // 3. 回退到旧版单一环境变量 (完全兼容旧版不改变任何功能)
   const fallbackUrl = env.API_URL || "";
   const fallbackKeys = (env.API_KEY || "").split(',').map(k => k.trim()).filter(k => k);
-  const fallbackModelStr = env.MODEL || "meta/llama3-70b-instruct:Llama 3 70B,deepseek-ai/DeepSeek-R1:深度思考 R1";
   
+  // ==============================================================================
+  // 👇 修改点：设置默认模型 👇
+  // 在此处配置你的默认模型。格式为 "模型ID:显示名称"。
+  // 逗号分隔的列表中，第一个模型（排在最前面）将被系统强制作为默认选中的模型。
+  // 示例中将 DEFAULT-MODEL-ID 作为默认模型。
+  const defaultModels = "DEFAULT-MODEL-ID:默认 AI 助手,meta/llama3-70b-instruct:Llama 3 70B,deepseek-ai/DeepSeek-R1:深度思考 R1";
+  const fallbackModelStr = env.MODEL || defaultModels;
+  // ==============================================================================
+
   addModels(fallbackModelStr, fallbackUrl, fallbackKeys);
-  
-  applyDefaultModel(env, models);
 
   return { models, modelMap };
 }
-
-// ======= 新增：处理默认模型设置 =======
-function applyDefaultModel(env, models) {
-  if (env.DEFAULT_MODEL) {
-    const defaultIdx = models.findIndex(m => m.id === env.DEFAULT_MODEL);
-    if (defaultIdx > 0) { // 如果找到了且不在第一个位置，就把它移到第一位
-      const defaultModel = models.splice(defaultIdx, 1)[0];
-      models.unshift(defaultModel);
-    }
-  }
-}
-// =====================================
 // ==============================================================================
 
 export default {
