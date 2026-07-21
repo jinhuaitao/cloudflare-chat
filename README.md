@@ -16,6 +16,16 @@
 默认的构建设置会被 wrangler.toml 自动接管，直接点击 "保存并部署" (Save and deploy)。
 
 # 第二步：配置环境变量（关键）
+
+### 1
+
+打开 Cloudflare 控制台 -> KV Namespaces -> 创建一个叫 TG_KV 的命名空间。
+
+进入你的 Worker 脚本设置 -> Settings -> Variables -> KV Namespace Bindings。
+
+添加绑定：Variable name 填 KV，KV Namespace 选择刚创建的 TG_KV。
+
+### 2
 从你提供的代码逻辑来看，这个项目高度依赖环境变量来配置 API 和模型。部署成功后，必须在 Cloudflare 中填入这些变量，否则页面会提示 API 错误。
 
 在 Cloudflare 中进入刚部署好的 Worker 项目页面。
