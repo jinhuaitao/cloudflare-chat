@@ -1,6 +1,3 @@
-// 在全局作用域声明一个 Map，用于在 Worker 实例存活期间记录 TG 用户的模型选择
-const tgUserModels = new Map();
-
 // ======= 新增：统一解析通道配置（支持多组 API_URL, API_KEY, MODEL 映射） =======
 function getChannelConfig(env) {
   let models = [];
@@ -147,7 +144,7 @@ export default {
           });
         }
 
-        // ======= 核心修改：分流处理返回结果 =======
+        // ======= 分流处理返回结果 =======
         if (!isImageAPI) {
           // 1. 普通文本模型：直接透传由服务器发来的 SSE 流
           return new Response(nvidiaResponse.body, {
@@ -174,7 +171,7 @@ export default {
           const encoder = new TextEncoder();
           const stream = new ReadableStream({
             start(controller) {
-              const fakeChunk = JSON.stringify({ choices: [{ delta: { content: imageUrlOrText + "\n\n" } }] });
+              const fakeChunk = JSON.stringify({ choices: [{ delta: { content: imageUrlOrText + "\\n\\n" } }] });
               controller.enqueue(encoder.encode(`data: ${fakeChunk}\n\n`));
               controller.enqueue(encoder.encode('data: [DONE]\n\n'));
               controller.close();
@@ -236,7 +233,11 @@ export default {
                 const index = parseInt(data.substring(2));
                 if (modelObjList[index]) {
                   const selected = modelObjList[index];
-                  tgUserModels.set(chatId, selected.id);
+                  
+                  // ====== 修复：使用 KV 替代内存 Map 进行持久化存储 ======
+                  if (env.TG_KV) {
+                    await env.TG_KV.put(`CHAT_MODEL_${chatId}`, selected.id);
+                  }
                   
                   await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
                     method: 'POST',
@@ -272,7 +273,7 @@ export default {
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({
                     chat_id: chatId,
-                    text: "⚙️ **请选择对话要使用的 AI 模型:**\n*(注意: 采用内存驻留，节点重启时默认恢复首个模型)*",
+                    text: "⚙️ **请选择对话要使用的 AI 模型:**\n*(已启用 KV 持久化存储，重启不丢失)*",
                     parse_mode: "Markdown",
                     reply_markup: { inline_keyboard }
                   })
@@ -280,8 +281,14 @@ export default {
                 return;
               }
 
-              // ======= 获取对应的 URL 和 KEY =======
-              const targetModelId = tgUserModels.get(chatId) || modelObjList[0].id;
+              // ====== 修复：从 KV 读取用户的模型选择 ======
+              let targetModelId = modelObjList[0].id;
+              if (env.TG_KV) {
+                const savedModel = await env.TG_KV.get(`CHAT_MODEL_${chatId}`);
+                if (savedModel) {
+                  targetModelId = savedModel;
+                }
+              }
               const channel = modelMap.get(targetModelId) || modelMap.values().next().value;
               
               const currentApiKey = channel && channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
@@ -319,7 +326,7 @@ export default {
                 return;
               }
 
-              // ======= 新增：智能识别生图接口 =======
+              // ======= 智能识别生图接口 =======
               const isImageAPI = apiUrl.includes('images/generations') || targetModelId.toLowerCase().includes('image');
               
               const payload = isImageAPI ? {
@@ -354,7 +361,7 @@ export default {
                 const aiData = await aiResponse.json();
                 let replyText = "AI 没有返回有效内容。";
                 
-                // ======= 新增：兼容两种不同的返回格式 =======
+                // ======= 兼容两种不同的返回格式 =======
                 if (aiData.choices && aiData.choices[0]?.message) {
                   replyText = aiData.choices[0].message.content; // 文本回复
                 } else if (aiData.data && aiData.data[0]?.url) {
@@ -414,7 +421,7 @@ function corsHeaders() {
   return { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
 }
 
-// ================= UI 代码 (未做任何改动) =================
+// ================= UI 代码 =================
 const HTML_CONTENT = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -783,7 +790,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
       <button class="theme-toggle" id="themeToggle" title="切换主题">
         <svg id="themeIcon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
       </button>
-      <div style="font-size: 12px; color: var(--text-secondary); opacity: 0.6; font-weight: 500;">v4.0 Final Optimized</div>
+      <div style="font-size: 12px; color: var(--text-secondary); opacity: 0.6; font-weight: 500;">v4.0 Final KV Optimized</div>
     </div>
   </div>
 
@@ -1058,6 +1065,14 @@ const HTML_CONTENT = `<!DOCTYPE html>
     if (!text) return;
     
     const currentSession = sessions.find(s => s.id === currentSessionId);
+
+    // ======= 修复：发送前强制同步 DOM 中实时的模型选择，防止移动端 select blur 事件卡顿导致传错数据 =======
+    if (currentSession && modelSelect.value) {
+      currentSession.model = modelSelect.value;
+      updateHeaderDisplay();
+    }
+    // =========================================================================================
+
     if (currentSession.messages.length === 0) {
       currentSession.title = text.length > 14 ? text.substring(0, 14) + '...' : text;
       renderSessionList();
