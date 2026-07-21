@@ -23,7 +23,7 @@
 
 进入你的 Worker 脚本设置 -> Settings -> Variables -> KV Namespace Bindings。
 
-添加绑定：Variable name 填 KV，KV Namespace 选择刚创建的 TG_KV。
+添加绑定：Variable name 填 TG_KV，KV Namespace 选择刚创建的 TG_KV。
 
 ### 2
 从你提供的代码逻辑来看，这个项目高度依赖环境变量来配置 API 和模型。部署成功后，必须在 Cloudflare 中填入这些变量，否则页面会提示 API 错误。
