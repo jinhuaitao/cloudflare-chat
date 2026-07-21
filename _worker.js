@@ -204,6 +204,7 @@ export default {
     }
 
     // Telegram Bot Webhook
+    // Telegram Bot Webhook
     if (request.method === 'POST' && url.pathname === '/tg-webhook') {
       try {
         const update = await request.json();
@@ -223,7 +224,6 @@ export default {
                 const index = parseInt(data.substring(2));
                 if (modelObjList[index]) {
                   const selected = modelObjList[index];
-                  // 修复点：同时写入内存与 KV 存储
                   tgUserModels.set(chatId, selected.id);
                   if (env.KV) {
                     try { await env.KV.put(`tg_user_${chatId}`, selected.id); } catch(e){}
@@ -271,7 +271,6 @@ export default {
                 return;
               }
 
-              // 修复点：优先读内存，若无则读 KV 持久化数据
               let targetModelId = tgUserModels.get(chatId);
               if (!targetModelId && env.KV) {
                 try { targetModelId = await env.KV.get(`tg_user_${chatId}`); } catch(e){}
@@ -373,7 +372,6 @@ export default {
                     })
                   });
 
-                  // 降级保护：若 TG 无法抓取该图片外链，发送无 Markdown 转义的纯文本链接
                   if (!photoRes.ok) {
                     await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
                       method: 'POST',
@@ -414,7 +412,15 @@ export default {
                     });
                   }
                 }
-              } catch (err) {
+              } else {
+                await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ chat_id: chatId, text: "⚠️ AI 接口请求失败，请稍后再试。" })
+                });
+              }
+            }
+          } catch (err) {
             console.log("后台处理异常:", err);
           }
         })());
