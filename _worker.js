@@ -204,7 +204,6 @@ export default {
     }
 
     // Telegram Bot Webhook
-    // Telegram Bot Webhook
     if (request.method === 'POST' && url.pathname === '/tg-webhook') {
       try {
         const update = await request.json();
@@ -224,6 +223,7 @@ export default {
                 const index = parseInt(data.substring(2));
                 if (modelObjList[index]) {
                   const selected = modelObjList[index];
+                  // 修复点：同时写入内存与 KV 存储
                   tgUserModels.set(chatId, selected.id);
                   if (env.KV) {
                     try { await env.KV.put(`tg_user_${chatId}`, selected.id); } catch(e){}
@@ -271,6 +271,7 @@ export default {
                 return;
               }
 
+              // 修复点：优先读内存，若无则读 KV 持久化数据
               let targetModelId = tgUserModels.get(chatId);
               if (!targetModelId && env.KV) {
                 try { targetModelId = await env.KV.get(`tg_user_${chatId}`); } catch(e){}
@@ -346,49 +347,13 @@ export default {
 
               if (aiResponse.ok) {
                 const aiData = await aiResponse.json();
+                let replyText = "AI 没有返回有效内容。";
                 
-                // 1. 智能提取图片 URL
-                let imageUrl = null;
-                if (aiData.data && aiData.data[0]?.url) {
-                  imageUrl = aiData.data[0].url;
-                } else if (aiData.choices && aiData.choices[0]?.message?.content) {
-                  const content = aiData.choices[0].message.content;
-                  const match = content.match(/https?:\/\/[^\s\)\"]+/i);
-                  if (match && isImageAPI) {
-                    imageUrl = match[0];
-                  }
+                if (aiData.choices && aiData.choices[0]?.message) {
+                  replyText = aiData.choices[0].message.content;
+                } else if (aiData.data && aiData.data[0]?.url) {
+                  replyText = `[🖼️ 点击查看生成的图片](${aiData.data[0].url})`;
                 }
-
-                // 2. 生图模式：使用 sendPhoto 发送原生图片
-                if (isImageAPI && imageUrl) {
-                  const photoRes = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendPhoto`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                      chat_id: chatId,
-                      photo: imageUrl,
-                      caption: "🎨 **图片生成成功！**",
-                      parse_mode: "Markdown"
-                    })
-                  });
-
-                  if (!photoRes.ok) {
-                    await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({
-                        chat_id: chatId,
-                        text: `🖼️ 图片生成成功，请点击链接查看：\n${imageUrl}`
-                      })
-                    });
-                  }
-                  return;
-                }
-
-                // 3. 普通对话模式：发送文字
-                let replyText = aiData.choices && aiData.choices[0]?.message?.content 
-                  ? aiData.choices[0].message.content 
-                  : "AI 没有返回有效内容。";
 
                 const maxLength = 4000; 
                 for (let i = 0; i < replyText.length; i += maxLength) {
@@ -413,11 +378,11 @@ export default {
                   }
                 }
               } else {
-                await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ chat_id: chatId, text: "⚠️ AI 接口请求失败，请稍后再试。" })
-                });
+                 await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ chat_id: chatId, text: "⚠️ AI 接口请求失败，请稍后再试。" })
+                  });
               }
             }
           } catch (err) {
