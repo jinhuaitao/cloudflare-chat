@@ -326,79 +326,90 @@ export default {
                 return;
               }
 
-              // ======= 智能识别生图接口 =======
-              const isImageAPI = apiUrl.includes('images/generations') || targetModelId.toLowerCase().includes('image');
-              
-              const payload = isImageAPI ? {
-                model: targetModelId,
-                prompt: userText, // 生图接口用 prompt 参数
-                n: 1
-              } : {
-                model: targetModelId,
-                messages: [{ role: "user", content: userText }], // 文本接口用 messages
-                stream: false, 
-                max_tokens: 4096
-              };
-
-              const aiResponse = await fetch(apiUrl, {
-                method: 'POST',
-                headers: {
-                  'Authorization': `Bearer ${currentApiKey}`, 
-                  'Content-Type': 'application/json',
-                },
-                body: JSON.stringify(payload),
-              });
-
-              if (pendingMsgId) {
-                await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/deleteMessage`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ chat_id: chatId, message_id: pendingMsgId })
-                });
-              }
-
-              if (aiResponse.ok) {
-                const aiData = await aiResponse.json();
-                let replyText = "AI 没有返回有效内容。";
+              // ======= 核心优化：使用 try...finally 确保无论成功失败都会清理提示 =======
+              try {
+                const isImageAPI = apiUrl.includes('images/generations') || targetModelId.toLowerCase().includes('image');
                 
-                // ======= 兼容两种不同的返回格式 =======
-                if (aiData.choices && aiData.choices[0]?.message) {
-                  replyText = aiData.choices[0].message.content; // 文本回复
-                } else if (aiData.data && aiData.data[0]?.url) {
-                  replyText = `[🖼️ 点击查看生成的图片](${aiData.data[0].url})`; // 生图回复包装为 Markdown 链接
-                }
+                const payload = isImageAPI ? {
+                  model: targetModelId,
+                  prompt: userText,
+                  n: 1
+                } : {
+                  model: targetModelId,
+                  messages: [{ role: "user", content: userText }],
+                  stream: false, 
+                  max_tokens: 4096
+                };
 
-                const maxLength = 4000; 
-                for (let i = 0; i < replyText.length; i += maxLength) {
-                  const chunk = replyText.slice(i, i + maxLength);
+                const aiResponse = await fetch(apiUrl, {
+                  method: 'POST',
+                  headers: {
+                    'Authorization': `Bearer ${currentApiKey}`, 
+                    'Content-Type': 'application/json',
+                  },
+                  body: JSON.stringify(payload),
+                });
+
+                if (aiResponse.ok) {
+                  const aiData = await aiResponse.json();
+                  let replyText = "AI 没有返回有效内容。";
                   
-                  const tgRes = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                      chat_id: chatId,
-                      text: chunk,
-                      parse_mode: "Markdown"
-                    })
-                  });
+                  if (aiData.choices && aiData.choices[0]?.message) {
+                    replyText = aiData.choices[0].message.content;
+                  } else if (aiData.data && aiData.data[0]?.url) {
+                    replyText = `[🖼️ 点击查看生成的图片](${aiData.data[0].url})`;
+                  }
 
-                  if (!tgRes.ok) {
-                    await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+                  const maxLength = 4000; 
+                  for (let i = 0; i < replyText.length; i += maxLength) {
+                    const chunk = replyText.slice(i, i + maxLength);
+                    
+                    const tgRes = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json' },
                       body: JSON.stringify({
                         chat_id: chatId,
-                        text: chunk
+                        text: chunk,
+                        parse_mode: "Markdown"
                       })
                     });
+
+                    if (!tgRes.ok) {
+                      await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          chat_id: chatId,
+                          text: chunk
+                        })
+                      });
+                    }
                   }
+                } else {
+                   const errDetail = await aiResponse.text();
+                   await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ chat_id: chatId, text: `⚠️ AI 接口请求失败 (${aiResponse.status})` })
+                    });
                 }
-              } else {
+              } catch (err) {
                  await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ chat_id: chatId, text: "⚠️ AI 接口请求失败，请稍后再试。" })
+                    body: JSON.stringify({ chat_id: chatId, text: `⚠️ 请求异常或超时: ${err.message}` })
                   });
+              } finally {
+                // 无论上方成功还是抛出错误，都强制尝试删除“正在思考”的过渡消息
+                if (pendingMsgId) {
+                  try {
+                    await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/deleteMessage`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ chat_id: chatId, message_id: pendingMsgId })
+                    });
+                  } catch (e) {}
+                }
               }
             }
           } catch (err) {
