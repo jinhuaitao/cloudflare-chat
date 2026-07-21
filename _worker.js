@@ -1,3 +1,6 @@
+// 在全局作用域声明一个 Map，用于在 Worker 实例存活期间记录 TG 用户的模型选择
+const tgUserModels = new Map();
+
 // ======= 新增：统一解析通道配置（支持多组 API_URL, API_KEY, MODEL 映射） =======
 function getChannelConfig(env) {
   let models = [];
@@ -144,7 +147,7 @@ export default {
           });
         }
 
-        // ======= 分流处理返回结果 =======
+        // ======= 核心修改：分流处理返回结果 =======
         if (!isImageAPI) {
           // 1. 普通文本模型：直接透传由服务器发来的 SSE 流
           return new Response(nvidiaResponse.body, {
@@ -171,7 +174,7 @@ export default {
           const encoder = new TextEncoder();
           const stream = new ReadableStream({
             start(controller) {
-              const fakeChunk = JSON.stringify({ choices: [{ delta: { content: imageUrlOrText + "\\n\\n" } }] });
+              const fakeChunk = JSON.stringify({ choices: [{ delta: { content: imageUrlOrText + "\n\n" } }] });
               controller.enqueue(encoder.encode(`data: ${fakeChunk}\n\n`));
               controller.enqueue(encoder.encode('data: [DONE]\n\n'));
               controller.close();
@@ -233,11 +236,7 @@ export default {
                 const index = parseInt(data.substring(2));
                 if (modelObjList[index]) {
                   const selected = modelObjList[index];
-                  
-                  // ====== 修复：使用 KV 替代内存 Map 进行持久化存储 ======
-                  if (env.TG_KV) {
-                    await env.TG_KV.put(`CHAT_MODEL_${chatId}`, selected.id);
-                  }
+                  tgUserModels.set(chatId, selected.id);
                   
                   await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
                     method: 'POST',
@@ -273,7 +272,7 @@ export default {
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({
                     chat_id: chatId,
-                    text: "⚙️ **请选择对话要使用的 AI 模型:**\n*(已启用 KV 持久化存储，重启不丢失)*",
+                    text: "⚙️ **请选择对话要使用的 AI 模型:**\n*(注意: 采用内存驻留，节点重启时默认恢复首个模型)*",
                     parse_mode: "Markdown",
                     reply_markup: { inline_keyboard }
                   })
@@ -281,14 +280,8 @@ export default {
                 return;
               }
 
-              // ====== 修复：从 KV 读取用户的模型选择 ======
-              let targetModelId = modelObjList[0].id;
-              if (env.TG_KV) {
-                const savedModel = await env.TG_KV.get(`CHAT_MODEL_${chatId}`);
-                if (savedModel) {
-                  targetModelId = savedModel;
-                }
-              }
+              // ======= 获取对应的 URL 和 KEY =======
+              const targetModelId = tgUserModels.get(chatId) || modelObjList[0].id;
               const channel = modelMap.get(targetModelId) || modelMap.values().next().value;
               
               const currentApiKey = channel && channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
@@ -326,17 +319,16 @@ export default {
                 return;
               }
 
-              // ======= 核心优化：使用 try...finally 确保无论成功失败都会清理提示 =======
-              try {
-                const isImageAPI = apiUrl.includes('image') || apiUrl.includes('generation') || targetModelId.toLowerCase().includes('image') || targetModelId.toLowerCase().includes('flux') || targetModelId.toLowerCase().includes('dall') || targetModelId.toLowerCase().includes('sd');
+              // ======= 新增：智能识别生图接口 =======
+              const isImageAPI = apiUrl.includes('images/generations') || targetModelId.toLowerCase().includes('image');
               
               const payload = isImageAPI ? {
                 model: targetModelId,
-                prompt: userText,
+                prompt: userText, // 生图接口用 prompt 参数
                 n: 1
               } : {
                 model: targetModelId,
-                messages: [{ role: "user", content: userText }],
+                messages: [{ role: "user", content: userText }], // 文本接口用 messages
                 stream: false, 
                 max_tokens: 4096
               };
@@ -350,88 +342,56 @@ export default {
                 body: JSON.stringify(payload),
               });
 
+              if (pendingMsgId) {
+                await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/deleteMessage`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ chat_id: chatId, message_id: pendingMsgId })
+                });
+              }
+
               if (aiResponse.ok) {
                 const aiData = await aiResponse.json();
                 let replyText = "AI 没有返回有效内容。";
                 
-                // ======= 优化 2：兼容市面上几乎所有生图与文本 API 的返回格式 =======
+                // ======= 新增：兼容两种不同的返回格式 =======
                 if (aiData.choices && aiData.choices[0]?.message) {
-                  replyText = aiData.choices[0].message.content; // 标准文本
+                  replyText = aiData.choices[0].message.content; // 文本回复
                 } else if (aiData.data && aiData.data[0]?.url) {
-                  replyText = `[🖼️ 点击查看生成的图片](${aiData.data[0].url})`; // OpenAI / 多数代理标准
-                } else if (aiData.url) {
-                  replyText = `[🖼️ 点击查看生成的图片](${aiData.url})`; // 根节点 url
-                } else if (aiData.output) {
-                  const out = Array.isArray(aiData.output) ? aiData.output[0] : aiData.output;
-                  if (typeof out === 'string' && out.startsWith('http')) {
-                    replyText = `[🖼️ 点击查看生成的图片](${out})`;
-                  } else {
-                    replyText = `\`\`\`json\n${JSON.stringify(aiData, null, 2)}\n\`\`\``;
-                  }
-                } else if (aiData.images && aiData.images[0]) {
-                  const img = aiData.images[0];
-                  if (typeof img === 'string' && img.startsWith('http')) {
-                    replyText = `[🖼️ 点击查看生成的图片](${img})`;
-                  } else if (img.url) {
-                    replyText = `[🖼️ 点击查看生成的图片](${img.url})`;
-                  } else {
-                    replyText = "🖼️ 图片已生成（数据非直链）。";
-                  }
-                } else {
-                  // 【调试利器】如果都不匹配，直接把返回的 JSON 打印到 TG 聊天框，方便你查看其真实结构
-                  replyText = `⚠️ 成功连接 API，但未识别到图片字段。原始响应：\n\`\`\`json\n${JSON.stringify(aiData, null, 2).substring(0, 1000)}\n\`\`\``;
+                  replyText = `[🖼️ 点击查看生成的图片](${aiData.data[0].url})`; // 生图回复包装为 Markdown 链接
                 }
 
-                  const maxLength = 4000; 
-                  for (let i = 0; i < replyText.length; i += maxLength) {
-                    const chunk = replyText.slice(i, i + maxLength);
-                    
-                    const tgRes = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+                const maxLength = 4000; 
+                for (let i = 0; i < replyText.length; i += maxLength) {
+                  const chunk = replyText.slice(i, i + maxLength);
+                  
+                  const tgRes = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      chat_id: chatId,
+                      text: chunk,
+                      parse_mode: "Markdown"
+                    })
+                  });
+
+                  if (!tgRes.ok) {
+                    await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json' },
                       body: JSON.stringify({
                         chat_id: chatId,
-                        text: chunk,
-                        parse_mode: "Markdown"
+                        text: chunk
                       })
                     });
-
-                    if (!tgRes.ok) {
-                      await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                          chat_id: chatId,
-                          text: chunk
-                        })
-                      });
-                    }
                   }
-                } else {
-                   const errDetail = await aiResponse.text();
-                   await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ chat_id: chatId, text: `⚠️ AI 接口请求失败 (${aiResponse.status})` })
-                    });
                 }
-              } catch (err) {
+              } else {
                  await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ chat_id: chatId, text: `⚠️ 请求异常或超时: ${err.message}` })
+                    body: JSON.stringify({ chat_id: chatId, text: "⚠️ AI 接口请求失败，请稍后再试。" })
                   });
-              } finally {
-                // 无论上方成功还是抛出错误，都强制尝试删除“正在思考”的过渡消息
-                if (pendingMsgId) {
-                  try {
-                    await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/deleteMessage`, {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ chat_id: chatId, message_id: pendingMsgId })
-                    });
-                  } catch (e) {}
-                }
               }
             }
           } catch (err) {
@@ -454,7 +414,7 @@ function corsHeaders() {
   return { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
 }
 
-// ================= UI 代码 =================
+// ================= UI 代码 (未做任何改动) =================
 const HTML_CONTENT = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -823,7 +783,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
       <button class="theme-toggle" id="themeToggle" title="切换主题">
         <svg id="themeIcon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
       </button>
-      <div style="font-size: 12px; color: var(--text-secondary); opacity: 0.6; font-weight: 500;">v4.0 Final KV Optimized</div>
+      <div style="font-size: 12px; color: var(--text-secondary); opacity: 0.6; font-weight: 500;">v4.0 Final Optimized</div>
     </div>
   </div>
 
@@ -1098,14 +1058,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
     if (!text) return;
     
     const currentSession = sessions.find(s => s.id === currentSessionId);
-
-    // ======= 修复：发送前强制同步 DOM 中实时的模型选择，防止移动端 select blur 事件卡顿导致传错数据 =======
-    if (currentSession && modelSelect.value) {
-      currentSession.model = modelSelect.value;
-      updateHeaderDisplay();
-    }
-    // =========================================================================================
-
     if (currentSession.messages.length === 0) {
       currentSession.title = text.length > 14 ? text.substring(0, 14) + '...' : text;
       renderSessionList();
