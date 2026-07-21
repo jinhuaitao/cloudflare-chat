@@ -1,7 +1,7 @@
-// 全局内存缓存（L1 缓存）
+// 在全局作用域声明一个 Map，用于在 Worker 实例存活期间记录 TG 用户的模型选择
 const tgUserModels = new Map();
 
-// ======= 统一解析通道配置 =======
+// ======= 新增：统一解析通道配置（支持多组 API_URL, API_KEY, MODEL 映射） =======
 function getChannelConfig(env) {
   let models = [];
   let modelMap = new Map();
@@ -22,6 +22,7 @@ function getChannelConfig(env) {
     });
   };
 
+  // 1. 优先尝试 JSON 配置: API_CONFIG
   if (env.API_CONFIG) {
     try {
       const channels = JSON.parse(env.API_CONFIG);
@@ -37,6 +38,7 @@ function getChannelConfig(env) {
     }
   }
 
+  // 2. 尝试多组变量映射: API_URL_1, API_KEY_1, MODEL_1 ...
   let hasIndexed = false;
   for (let i = 1; i <= 20; i++) {
     if (env[`API_URL_${i}`] && env[`MODEL_${i}`]) {
@@ -49,6 +51,7 @@ function getChannelConfig(env) {
   }
   if (hasIndexed && models.length > 0) return { models, modelMap };
 
+  // 3. 回退到旧版单一环境变量 (完全兼容旧版不改变任何功能)
   const fallbackUrl = env.API_URL || "";
   const fallbackKeys = (env.API_KEY || "").split(',').map(k => k.trim()).filter(k => k);
   const fallbackModelStr = env.MODEL || "meta/llama3-70b-instruct:Llama 3 70B,deepseek-ai/DeepSeek-R1:深度思考 R1";
@@ -57,17 +60,21 @@ function getChannelConfig(env) {
 
   return { models, modelMap };
 }
+// ==============================================================================
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // 微信认证路由
+    // ==========================================
+    // 微信站长认证专用路由
+    // ==========================================
     if (request.method === 'GET' && url.pathname === '/a9a015a0f6e7c9ca09f4cdce4479deb3.txt') {
       return new Response('b7aa7e3069358c2c18f7908a7d5815788bafd020', {
         headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
       });
     }
+    // ==========================================
 
     if (request.method === 'OPTIONS') {
       return new Response(null, {
@@ -88,15 +95,10 @@ export default {
           return new Response(JSON.stringify({ error: "无效的请求格式" }), { status: 400, headers: corsHeaders() });
         }
 
+        // ======= 获取对应的 URL 和 KEY =======
         const { models, modelMap } = getChannelConfig(env);
-        let selectedModel = body.model || (models.length > 0 ? models[0].id : "");
-
-        // 修复点：如果前端传来的模型不存在（例如改过配置后旧缓存失效），重置为首个有效模型
-        if (!modelMap.has(selectedModel)) {
-          selectedModel = models.length > 0 ? models[0].id : "";
-        }
-
-        const channel = modelMap.get(selectedModel);
+        const selectedModel = body.model || (models.length > 0 ? models[0].id : "");
+        const channel = modelMap.get(selectedModel) || modelMap.values().next().value;
 
         if (!channel || !channel.url) {
           return new Response(JSON.stringify({ error: "该模型对应的 API_URL 未配置或异常" }), { status: 500, headers: corsHeaders() });
@@ -104,11 +106,14 @@ export default {
 
         const currentApiKey = channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
         const apiUrl = channel.url;
+        // =====================================
 
+        // ======= 核心修改：智能识别生图接口 =======
         const isImageAPI = apiUrl.includes('images/generations') || selectedModel.toLowerCase().includes('image');
 
         let payload = {};
         if (isImageAPI) {
+          // 生图接口：提取用户对话的最后一句话作为 prompt，禁用流式
           const lastMessage = body.messages[body.messages.length - 1].content;
           payload = {
             model: selectedModel,
@@ -116,6 +121,7 @@ export default {
             n: 1
           };
         } else {
+          // 文本接口：保持流式传输和多轮对话 messages 格式
           payload = {
             model: selectedModel,
             messages: body.messages,
@@ -141,7 +147,9 @@ export default {
           });
         }
 
+        // ======= 核心修改：分流处理返回结果 =======
         if (!isImageAPI) {
+          // 1. 普通文本模型：直接透传由服务器发来的 SSE 流
           return new Response(nvidiaResponse.body, {
             headers: {
               'Content-Type': 'text/event-stream',
@@ -151,15 +159,18 @@ export default {
             },
           });
         } else {
+          // 2. 生图模型：等待图片生成完毕，提取 URL 并伪装成流发给前端
           const responseData = await nvidiaResponse.json();
           let imageUrlOrText = "图片生成失败或未返回格式";
           
           if (responseData.data && responseData.data[0]?.url) {
+            // 将 URL 包装成 Markdown 图片语法
             imageUrlOrText = `![生成结果](${responseData.data[0].url})`;
           } else if (responseData.choices && responseData.choices[0]?.message) {
             imageUrlOrText = responseData.choices[0].message.content;
           }
 
+          // 伪装成前端代码能够解析的打字机 (SSE) 数据包
           const encoder = new TextEncoder();
           const stream = new ReadableStream({
             start(controller) {
@@ -203,7 +214,9 @@ export default {
       });
     }
 
-    // Telegram Bot Webhook
+    // ==========================================
+    // Telegram Bot Webhook 专用路由 
+    // ==========================================
     if (request.method === 'POST' && url.pathname === '/tg-webhook') {
       try {
         const update = await request.json();
@@ -223,11 +236,7 @@ export default {
                 const index = parseInt(data.substring(2));
                 if (modelObjList[index]) {
                   const selected = modelObjList[index];
-                  // 修复点：同时写入内存与 KV 存储
                   tgUserModels.set(chatId, selected.id);
-                  if (env.KV) {
-                    try { await env.KV.put(`tg_user_${chatId}`, selected.id); } catch(e){}
-                  }
                   
                   await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
                     method: 'POST',
@@ -263,7 +272,7 @@ export default {
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({
                     chat_id: chatId,
-                    text: "⚙️ **请选择对话要使用的 AI 模型:**",
+                    text: "⚙️ **请选择对话要使用的 AI 模型:**\n*(注意: 采用内存驻留，节点重启时默认恢复首个模型)*",
                     parse_mode: "Markdown",
                     reply_markup: { inline_keyboard }
                   })
@@ -271,18 +280,13 @@ export default {
                 return;
               }
 
-              // 修复点：优先读内存，若无则读 KV 持久化数据
-              let targetModelId = tgUserModels.get(chatId);
-              if (!targetModelId && env.KV) {
-                try { targetModelId = await env.KV.get(`tg_user_${chatId}`); } catch(e){}
-              }
-              if (!targetModelId || !modelMap.has(targetModelId)) {
-                targetModelId = modelObjList[0].id;
-              }
-
+              // ======= 获取对应的 URL 和 KEY =======
+              const targetModelId = tgUserModels.get(chatId) || modelObjList[0].id;
               const channel = modelMap.get(targetModelId) || modelMap.values().next().value;
+              
               const currentApiKey = channel && channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
               const apiUrl = channel ? channel.url : "";
+              // =====================================
 
               let pendingMsgId = null;
               try {
@@ -315,15 +319,16 @@ export default {
                 return;
               }
 
+              // ======= 新增：智能识别生图接口 =======
               const isImageAPI = apiUrl.includes('images/generations') || targetModelId.toLowerCase().includes('image');
               
               const payload = isImageAPI ? {
                 model: targetModelId,
-                prompt: userText,
+                prompt: userText, // 生图接口用 prompt 参数
                 n: 1
               } : {
                 model: targetModelId,
-                messages: [{ role: "user", content: userText }],
+                messages: [{ role: "user", content: userText }], // 文本接口用 messages
                 stream: false, 
                 max_tokens: 4096
               };
@@ -349,10 +354,11 @@ export default {
                 const aiData = await aiResponse.json();
                 let replyText = "AI 没有返回有效内容。";
                 
+                // ======= 新增：兼容两种不同的返回格式 =======
                 if (aiData.choices && aiData.choices[0]?.message) {
-                  replyText = aiData.choices[0].message.content;
+                  replyText = aiData.choices[0].message.content; // 文本回复
                 } else if (aiData.data && aiData.data[0]?.url) {
-                  replyText = `[🖼️ 点击查看生成的图片](${aiData.data[0].url})`;
+                  replyText = `[🖼️ 点击查看生成的图片](${aiData.data[0].url})`; // 生图回复包装为 Markdown 链接
                 }
 
                 const maxLength = 4000; 
@@ -373,7 +379,10 @@ export default {
                     await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ chat_id: chatId, text: chunk })
+                      body: JSON.stringify({
+                        chat_id: chatId,
+                        text: chunk
+                      })
                     });
                   }
                 }
@@ -395,6 +404,7 @@ export default {
         return new Response('Error', { status: 500 });
       }
     }
+    // ==========================================
 
     return new Response('Not Found', { status: 404 });
   }
@@ -404,7 +414,7 @@ function corsHeaders() {
   return { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
 }
 
-// ================= UI 代码 =================
+// ================= UI 代码 (未做任何改动) =================
 const HTML_CONTENT = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -422,11 +432,14 @@ const HTML_CONTENT = `<!DOCTYPE html>
       --glass-bg: rgba(255, 255, 255, 0.7);
       --glass-border: rgba(255, 255, 255, 0.6);
       --glass-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.05);
+      
       --text-main: #1f1f1f;
       --text-secondary: #444746;
-      --brand-color: #0b57d0;
-      --user-msg: #f0f4f9;
+      --brand-color: #0b57d0; /* Gemini Blue */
+      
+      --user-msg: #f0f4f9; /* Gemini light gray */
       --user-text: #1f1f1f;
+      
       --input-bg: rgba(255, 255, 255, 0.9);
       --hover-bg: rgba(0, 0, 0, 0.04);
       --aurora-1: #e0c3fc;
@@ -439,11 +452,14 @@ const HTML_CONTENT = `<!DOCTYPE html>
       --glass-bg: rgba(19, 19, 20, 0.65);
       --glass-border: rgba(255, 255, 255, 0.08);
       --glass-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
+      
       --text-main: #e3e3e3;
       --text-secondary: #c4c7c5;
       --brand-color: #a8c7fa; 
+      
       --user-msg: #1e1f20;
       --user-text: #e3e3e3;
+      
       --input-bg: rgba(30, 31, 32, 0.9);
       --hover-bg: rgba(255, 255, 255, 0.06);
       --aurora-1: #310e68;
@@ -531,17 +547,43 @@ const HTML_CONTENT = `<!DOCTYPE html>
     .message-row { display: flex; width: 100%; animation: fadeIn 0.4s ease forwards; }
     @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
     
+    /* ========== Gemini 风格气泡调整 ========== */
     .message-row.user { justify-content: flex-end; }
-    .message-bubble { line-height: 1.6; word-wrap: break-word; font-size: 16px; }
-    .message-row.user .message-bubble { 
-      background: var(--user-msg); color: var(--user-text); max-width: 85%;
-      padding: 12px 20px; border-radius: 24px; border-bottom-right-radius: 4px; white-space: pre-wrap; 
+    
+    .message-bubble { 
+      line-height: 1.6; word-wrap: break-word; font-size: 16px; 
     }
-    .message-row.ai .message-bubble { background: transparent; border: none; box-shadow: none; width: 100%; max-width: 100%; padding: 0; }
+    
+    .message-row.user .message-bubble { 
+      background: var(--user-msg); 
+      color: var(--user-text);
+      max-width: 85%;
+      padding: 12px 20px; 
+      border-radius: 24px; 
+      border-bottom-right-radius: 4px; 
+      white-space: pre-wrap; 
+    }
+    
+    /* AI 气泡去背，全宽平铺 */
+    .message-row.ai .message-bubble { 
+      background: transparent; 
+      border: none; 
+      box-shadow: none;
+      width: 100%;
+      max-width: 100%;
+      padding: 0;
+    }
+    
     .error-msg .message-bubble { color: #ef4444; }
 
+    /* ========== Markdown 内容样式 ========== */
     .markdown-body img { max-width: 100%; border-radius: 8px; margin-top: 10px; }
-    .markdown-body { font-size: 16px; line-height: 1.7; color: var(--text-main); }
+    
+    .markdown-body {
+      font-size: 16px;
+      line-height: 1.7;
+      color: var(--text-main);
+    }
     .markdown-body p { margin-top: 0; margin-bottom: 1.2em; }
     .markdown-body p:last-child { margin-bottom: 0; }
     .markdown-body a { color: var(--brand-color); text-decoration: none; }
@@ -549,9 +591,13 @@ const HTML_CONTENT = `<!DOCTYPE html>
     .markdown-body strong { font-weight: 600; }
     
     .markdown-body blockquote {
-      margin: 12px 0; padding: 12px 16px; color: var(--text-secondary);
-      border-left: 4px solid var(--brand-color); background: rgba(128,128,128,0.05); border-radius: 0 8px 8px 0;
+      margin: 12px 0; padding: 12px 16px;
+      color: var(--text-secondary);
+      border-left: 4px solid var(--brand-color);
+      background: rgba(128,128,128,0.05);
+      border-radius: 0 8px 8px 0;
     }
+    
     .markdown-body ul, .markdown-body ol { margin-top: 0; margin-bottom: 1.2em; padding-left: 24px; }
     .markdown-body li { margin-bottom: 0.4em; }
 
@@ -560,28 +606,67 @@ const HTML_CONTENT = `<!DOCTYPE html>
     .markdown-body th { background: rgba(128,128,128,0.05); font-weight: 600; text-align: left; }
 
     .markdown-body code {
-      background: rgba(128,128,128,0.1); padding: 2px 6px; border-radius: 6px;
+      background: rgba(128,128,128,0.1);
+      padding: 2px 6px; border-radius: 6px;
       font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
-      font-size: 0.9em; color: var(--text-main);
+      font-size: 0.9em;
+      color: var(--text-main);
     }
     
-    .code-wrapper { background: #1e1e1e; border-radius: 12px; overflow: hidden; margin: 16px 0; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+    /* ========== Gemini 级代码块包裹 ========== */
+    .code-wrapper {
+      background: #1e1e1e; /* 纯深色代码底 */
+      border-radius: 12px;
+      overflow: hidden;
+      margin: 16px 0;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+    }
     .code-header {
-      display: flex; justify-content: space-between; align-items: center; padding: 8px 16px;
-      background: #2d2d2d; color: #b4b4b4; font-size: 12px; font-family: ui-monospace, monospace; border-bottom: 1px solid rgba(255,255,255,0.05);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 16px;
+      background: #2d2d2d;
+      color: #b4b4b4;
+      font-size: 12px;
+      font-family: ui-monospace, monospace;
+      border-bottom: 1px solid rgba(255,255,255,0.05);
     }
     .copy-btn {
-      background: transparent; border: none; color: #b4b4b4; cursor: pointer; display: flex; align-items: center; gap: 6px;
+      background: transparent; border: none; color: #b4b4b4;
+      cursor: pointer; display: flex; align-items: center; gap: 6px;
       font-size: 12px; transition: color 0.2s; padding: 4px 8px; border-radius: 4px;
     }
     .copy-btn:hover { color: #ffffff; background: rgba(255,255,255,0.1); }
-    .code-wrapper pre { background: transparent !important; margin: 0 !important; padding: 16px; overflow-x: auto; border-radius: 0; box-shadow: none; }
-    .code-wrapper pre code { background: transparent; padding: 0; color: #e3e3e3; font-size: 14px; line-height: 1.5; }
+    .code-wrapper pre {
+      background: transparent !important;
+      margin: 0 !important;
+      padding: 16px;
+      overflow-x: auto;
+      border-radius: 0;
+      box-shadow: none;
+    }
+    .code-wrapper pre code {
+      background: transparent;
+      padding: 0;
+      color: #e3e3e3;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    /* ==================================== */
 
     .reasoning-box {
-      font-size: 14px; color: var(--text-secondary); background: rgba(128,128,128,0.05);
-      padding: 12px 16px; border-radius: 12px; border-left: 3px solid var(--brand-color);
-      margin-bottom: 16px; white-space: pre-wrap; line-height: 1.6; max-height: 150px; overflow-y: auto;
+      font-size: 14px;
+      color: var(--text-secondary);
+      background: rgba(128,128,128,0.05);
+      padding: 12px 16px;
+      border-radius: 12px;
+      border-left: 3px solid var(--brand-color);
+      margin-bottom: 16px;
+      white-space: pre-wrap;
+      line-height: 1.6;
+      max-height: 150px;
+      overflow-y: auto;
     }
     .reasoning-box::-webkit-scrollbar { width: 4px; }
     .reasoning-box::-webkit-scrollbar-thumb { background: rgba(128,128,128,0.3); border-radius: 4px; }
@@ -698,7 +783,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
       <button class="theme-toggle" id="themeToggle" title="切换主题">
         <svg id="themeIcon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
       </button>
-      <div style="font-size: 12px; color: var(--text-secondary); opacity: 0.6; font-weight: 500;">v4.1 Final Fixed</div>
+      <div style="font-size: 12px; color: var(--text-secondary); opacity: 0.6; font-weight: 500;">v4.0 Final Optimized</div>
     </div>
   </div>
 
@@ -769,11 +854,15 @@ const HTML_CONTENT = `<!DOCTYPE html>
     \`;
   };
 
-  marked.setOptions({ breaks: true, renderer: renderer });
+  marked.setOptions({
+    breaks: true, 
+    renderer: renderer
+  });
 
   document.addEventListener('click', function(e) {
     const copyBtn = e.target.closest('.copy-btn');
     if (!copyBtn) return;
+    
     const code = decodeURIComponent(copyBtn.getAttribute('data-code'));
     navigator.clipboard.writeText(code).then(() => {
       const span = copyBtn.querySelector('span');
@@ -863,17 +952,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
     currentSessionId = id;
     const currentSession = sessions.find(s => s.id === id);
     if (currentSession && currentSession.model) {
-      // 修复点：校验保存的模型在当前 select 里是否存在，不存在则重置为首个
-      const exists = Array.from(modelSelect.options).some(opt => opt.value === currentSession.model);
-      if (exists) {
-        modelSelect.value = currentSession.model;
-      } else {
-        modelSelect.selectedIndex = 0;
-        currentSession.model = modelSelect.value;
-        saveSessions();
-      }
-    } else if (modelSelect.options.length > 0) {
-      modelSelect.selectedIndex = 0;
+      modelSelect.value = currentSession.model;
     }
     updateHeaderDisplay();
     renderMessages();
@@ -881,17 +960,14 @@ const HTML_CONTENT = `<!DOCTYPE html>
     if(window.innerWidth <= 768) { sidebar.classList.remove('open'); sidebarOverlay.classList.remove('active'); userInput.blur(); }
   }
 
-  // 修复点：绑定 change 和 input 双重事件，保障移动端即时响应
-  function onModelChange() {
+  modelSelect.addEventListener('change', function() {
     const currentSession = sessions.find(s => s.id === currentSessionId);
     if(currentSession) {
-      currentSession.model = modelSelect.value;
+      currentSession.model = this.value;
       saveSessions();
     }
     updateHeaderDisplay();
-  }
-  modelSelect.addEventListener('change', onModelChange);
-  modelSelect.addEventListener('input', onModelChange);
+  });
 
   function deleteSession(e, id) {
     e.stopPropagation(); 
