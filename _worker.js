@@ -328,37 +328,59 @@ export default {
 
               // ======= 核心优化：使用 try...finally 确保无论成功失败都会清理提示 =======
               try {
-                const isImageAPI = apiUrl.includes('images/generations') || targetModelId.toLowerCase().includes('image');
+                const isImageAPI = apiUrl.includes('image') || apiUrl.includes('generation') || targetModelId.toLowerCase().includes('image') || targetModelId.toLowerCase().includes('flux') || targetModelId.toLowerCase().includes('dall') || targetModelId.toLowerCase().includes('sd');
+              
+              const payload = isImageAPI ? {
+                model: targetModelId,
+                prompt: userText,
+                n: 1
+              } : {
+                model: targetModelId,
+                messages: [{ role: "user", content: userText }],
+                stream: false, 
+                max_tokens: 4096
+              };
+
+              const aiResponse = await fetch(apiUrl, {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${currentApiKey}`, 
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(payload),
+              });
+
+              if (aiResponse.ok) {
+                const aiData = await aiResponse.json();
+                let replyText = "AI 没有返回有效内容。";
                 
-                const payload = isImageAPI ? {
-                  model: targetModelId,
-                  prompt: userText,
-                  n: 1
-                } : {
-                  model: targetModelId,
-                  messages: [{ role: "user", content: userText }],
-                  stream: false, 
-                  max_tokens: 4096
-                };
-
-                const aiResponse = await fetch(apiUrl, {
-                  method: 'POST',
-                  headers: {
-                    'Authorization': `Bearer ${currentApiKey}`, 
-                    'Content-Type': 'application/json',
-                  },
-                  body: JSON.stringify(payload),
-                });
-
-                if (aiResponse.ok) {
-                  const aiData = await aiResponse.json();
-                  let replyText = "AI 没有返回有效内容。";
-                  
-                  if (aiData.choices && aiData.choices[0]?.message) {
-                    replyText = aiData.choices[0].message.content;
-                  } else if (aiData.data && aiData.data[0]?.url) {
-                    replyText = `[🖼️ 点击查看生成的图片](${aiData.data[0].url})`;
+                // ======= 优化 2：兼容市面上几乎所有生图与文本 API 的返回格式 =======
+                if (aiData.choices && aiData.choices[0]?.message) {
+                  replyText = aiData.choices[0].message.content; // 标准文本
+                } else if (aiData.data && aiData.data[0]?.url) {
+                  replyText = `[🖼️ 点击查看生成的图片](${aiData.data[0].url})`; // OpenAI / 多数代理标准
+                } else if (aiData.url) {
+                  replyText = `[🖼️ 点击查看生成的图片](${aiData.url})`; // 根节点 url
+                } else if (aiData.output) {
+                  const out = Array.isArray(aiData.output) ? aiData.output[0] : aiData.output;
+                  if (typeof out === 'string' && out.startsWith('http')) {
+                    replyText = `[🖼️ 点击查看生成的图片](${out})`;
+                  } else {
+                    replyText = `\`\`\`json\n${JSON.stringify(aiData, null, 2)}\n\`\`\``;
                   }
+                } else if (aiData.images && aiData.images[0]) {
+                  const img = aiData.images[0];
+                  if (typeof img === 'string' && img.startsWith('http')) {
+                    replyText = `[🖼️ 点击查看生成的图片](${img})`;
+                  } else if (img.url) {
+                    replyText = `[🖼️ 点击查看生成的图片](${img.url})`;
+                  } else {
+                    replyText = "🖼️ 图片已生成（数据非直链）。";
+                  }
+                } else {
+                  // 【调试利器】如果都不匹配，直接把返回的 JSON 打印到 TG 聊天框，方便你查看其真实结构
+                  replyText = `⚠️ 成功连接 API，但未识别到图片字段。原始响应：\n\`\`\`json\n${JSON.stringify(aiData, null, 2).substring(0, 1000)}\n\`\`\``;
+                }
 
                   const maxLength = 4000; 
                   for (let i = 0; i < replyText.length; i += maxLength) {
