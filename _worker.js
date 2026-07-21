@@ -354,16 +354,14 @@ export default {
                   imageUrl = aiData.data[0].url;
                 } else if (aiData.choices && aiData.choices[0]?.message?.content) {
                   const content = aiData.choices[0].message.content;
-                  // 从返回文本中正则匹配图片的 http/https 链接
                   const match = content.match(/https?:\/\/[^\s\)\"]+/i);
                   if (match && isImageAPI) {
                     imageUrl = match[0];
                   }
                 }
 
-                // 2. 如果是生图接口且成功拿到了图片 URL
+                // 2. 生图模式：使用 sendPhoto 发送原生图片
                 if (isImageAPI && imageUrl) {
-                  // 调用 Telegram sendPhoto API 发送原生图片
                   const photoRes = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendPhoto`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -375,7 +373,7 @@ export default {
                     })
                   });
 
-                  // 如果 sendPhoto 失败（如 TG 无法直接访问该外链），降级发送纯文本链接（不加 parse_mode，防止 URL 下划线报错）
+                  // 降级保护：若 TG 无法抓取该图片外链，发送无 Markdown 转义的纯文本链接
                   if (!photoRes.ok) {
                     await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
                       method: 'POST',
@@ -389,7 +387,7 @@ export default {
                   return;
                 }
 
-                // 3. 普通文本对话处理
+                // 3. 普通对话模式：发送文字
                 let replyText = aiData.choices && aiData.choices[0]?.message?.content 
                   ? aiData.choices[0].message.content 
                   : "AI 没有返回有效内容。";
