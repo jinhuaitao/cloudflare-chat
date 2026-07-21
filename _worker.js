@@ -347,13 +347,52 @@ export default {
 
               if (aiResponse.ok) {
                 const aiData = await aiResponse.json();
-                let replyText = "AI 没有返回有效内容。";
                 
-                if (aiData.choices && aiData.choices[0]?.message) {
-                  replyText = aiData.choices[0].message.content;
-                } else if (aiData.data && aiData.data[0]?.url) {
-                  replyText = `[🖼️ 点击查看生成的图片](${aiData.data[0].url})`;
+                // 1. 智能提取图片 URL
+                let imageUrl = null;
+                if (aiData.data && aiData.data[0]?.url) {
+                  imageUrl = aiData.data[0].url;
+                } else if (aiData.choices && aiData.choices[0]?.message?.content) {
+                  const content = aiData.choices[0].message.content;
+                  // 从返回文本中正则匹配图片的 http/https 链接
+                  const match = content.match(/https?:\/\/[^\s\)\"]+/i);
+                  if (match && isImageAPI) {
+                    imageUrl = match[0];
+                  }
                 }
+
+                // 2. 如果是生图接口且成功拿到了图片 URL
+                if (isImageAPI && imageUrl) {
+                  // 调用 Telegram sendPhoto API 发送原生图片
+                  const photoRes = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendPhoto`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      chat_id: chatId,
+                      photo: imageUrl,
+                      caption: "🎨 **图片生成成功！**",
+                      parse_mode: "Markdown"
+                    })
+                  });
+
+                  // 如果 sendPhoto 失败（如 TG 无法直接访问该外链），降级发送纯文本链接（不加 parse_mode，防止 URL 下划线报错）
+                  if (!photoRes.ok) {
+                    await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        chat_id: chatId,
+                        text: `🖼️ 图片生成成功，请点击链接查看：\n${imageUrl}`
+                      })
+                    });
+                  }
+                  return;
+                }
+
+                // 3. 普通文本对话处理
+                let replyText = aiData.choices && aiData.choices[0]?.message?.content 
+                  ? aiData.choices[0].message.content 
+                  : "AI 没有返回有效内容。";
 
                 const maxLength = 4000; 
                 for (let i = 0; i < replyText.length; i += maxLength) {
@@ -377,15 +416,7 @@ export default {
                     });
                   }
                 }
-              } else {
-                 await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ chat_id: chatId, text: "⚠️ AI 接口请求失败，请稍后再试。" })
-                  });
-              }
-            }
-          } catch (err) {
+              } catch (err) {
             console.log("后台处理异常:", err);
           }
         })());
