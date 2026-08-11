@@ -1,25 +1,44 @@
 // 全局内存缓存（L1 缓存）
 const tgUserModels = new Map();
 
-// ======= 统一解析通道配置 =======
+// 配置全局缓存单例
+let cachedConfig = null;
+let cachedEnvRef = null;
+
+const CORS_HEADERS = {
+  'Content-Type': 'application/json',
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+};
+
+// ======= 统一解析通道配置（带内存缓存） =======
 function getChannelConfig(env) {
+  if (cachedConfig && cachedEnvRef === env) {
+    return cachedConfig;
+  }
+
   let models = [];
   let modelMap = new Map();
 
   const addModels = (modelStr, url, keys) => {
-    const arr = (modelStr || "").split(',').map(m => m.trim()).filter(m => m);
-    arr.forEach(m => {
-      let id = m.trim(), name = m.trim();
-      const colonIdx = m.lastIndexOf(':');
+    if (!modelStr) return;
+    const arr = modelStr.split(',');
+    for (let i = 0; i < arr.length; i++) {
+      const raw = arr[i].trim();
+      if (!raw) continue;
+      
+      let id = raw, name = raw;
+      const colonIdx = raw.lastIndexOf(':');
       if (colonIdx > 0) {
-        id = m.substring(0, colonIdx).trim();
-        name = m.substring(colonIdx + 1).trim();
+        id = raw.substring(0, colonIdx).trim();
+        name = raw.substring(colonIdx + 1).trim();
       }
       if (!modelMap.has(id)) {
-        models.push({ id, name, original: m });
+        models.push({ id, name, original: raw });
         modelMap.set(id, { url, keys });
       }
-    });
+    }
   };
 
   if (env.API_CONFIG) {
@@ -27,11 +46,15 @@ function getChannelConfig(env) {
       const channels = JSON.parse(env.API_CONFIG);
       channels.forEach(ch => {
         const url = ch.url;
-        const keys = Array.isArray(ch.keys) ? ch.keys : (ch.keys || "").split(',').map(k => k.trim()).filter(k => k);
+        const keys = Array.isArray(ch.keys) ? ch.keys : (ch.keys || "").split(',').map(k => k.trim()).filter(Boolean);
         const modelStr = Array.isArray(ch.models) ? ch.models.join(',') : ch.models;
         if (url && modelStr) addModels(modelStr, url, keys);
       });
-      if (models.length > 0) return { models, modelMap };
+      if (models.length > 0) {
+        cachedConfig = { models, modelMap };
+        cachedEnvRef = env;
+        return cachedConfig;
+      }
     } catch (e) {
       console.log("API_CONFIG 解析失败:", e);
     }
@@ -39,23 +62,29 @@ function getChannelConfig(env) {
 
   let hasIndexed = false;
   for (let i = 1; i <= 20; i++) {
-    if (env[`API_URL_${i}`] && env[`MODEL_${i}`]) {
+    const url = env[`API_URL_${i}`];
+    const modelStr = env[`MODEL_${i}`];
+    if (url && modelStr) {
       hasIndexed = true;
-      const url = env[`API_URL_${i}`];
-      const keys = (env[`API_KEY_${i}`] || "").split(',').map(k => k.trim()).filter(k => k);
-      const modelStr = env[`MODEL_${i}`];
+      const keys = (env[`API_KEY_${i}`] || "").split(',').map(k => k.trim()).filter(Boolean);
       addModels(modelStr, url, keys);
     }
   }
-  if (hasIndexed && models.length > 0) return { models, modelMap };
+  if (hasIndexed && models.length > 0) {
+    cachedConfig = { models, modelMap };
+    cachedEnvRef = env;
+    return cachedConfig;
+  }
 
   const fallbackUrl = env.API_URL || "";
-  const fallbackKeys = (env.API_KEY || "").split(',').map(k => k.trim()).filter(k => k);
+  const fallbackKeys = (env.API_KEY || "").split(',').map(k => k.trim()).filter(Boolean);
   const fallbackModelStr = env.MODEL || "meta/llama3-70b-instruct:Llama 3 70B,deepseek-ai/DeepSeek-R1:深度思考 R1";
   
   addModels(fallbackModelStr, fallbackUrl, fallbackKeys);
 
-  return { models, modelMap };
+  cachedConfig = { models, modelMap };
+  cachedEnvRef = env;
+  return cachedConfig;
 }
 
 export default {
@@ -70,13 +99,7 @@ export default {
     }
 
     if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-        },
-      });
+      return new Response(null, { headers: CORS_HEADERS });
     }
 
     if (request.method === 'POST' && url.pathname === '/api/chat') {
@@ -85,13 +108,12 @@ export default {
         try {
           body = await request.json();
         } catch (e) {
-          return new Response(JSON.stringify({ error: "无效的请求格式" }), { status: 400, headers: corsHeaders() });
+          return new Response(JSON.stringify({ error: "无效的请求格式" }), { status: 400, headers: CORS_HEADERS });
         }
 
         const { models, modelMap } = getChannelConfig(env);
         let selectedModel = body.model || (models.length > 0 ? models[0].id : "");
 
-        // 修复点：如果前端传来的模型不存在（例如改过配置后旧缓存失效），重置为首个有效模型
         if (!modelMap.has(selectedModel)) {
           selectedModel = models.length > 0 ? models[0].id : "";
         }
@@ -99,30 +121,23 @@ export default {
         const channel = modelMap.get(selectedModel);
 
         if (!channel || !channel.url) {
-          return new Response(JSON.stringify({ error: "该模型对应的 API_URL 未配置或异常" }), { status: 500, headers: corsHeaders() });
+          return new Response(JSON.stringify({ error: "该模型对应的 API_URL 未配置或异常" }), { status: 500, headers: CORS_HEADERS });
         }
 
         const currentApiKey = channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
         const apiUrl = channel.url;
-
         const isImageAPI = apiUrl.includes('images/generations') || selectedModel.toLowerCase().includes('image');
 
-        let payload = {};
-        if (isImageAPI) {
-          const lastMessage = body.messages[body.messages.length - 1].content;
-          payload = {
-            model: selectedModel,
-            prompt: lastMessage,
-            n: 1
-          };
-        } else {
-          payload = {
-            model: selectedModel,
-            messages: body.messages,
-            stream: true,
-            max_tokens: 4096, 
-          };
-        }
+        let payload = isImageAPI ? {
+          model: selectedModel,
+          prompt: body.messages[body.messages.length - 1].content,
+          n: 1
+        } : {
+          model: selectedModel,
+          messages: body.messages,
+          stream: true,
+          max_tokens: 4096, 
+        };
 
         const nvidiaResponse = await fetch(apiUrl, {
           method: 'POST',
@@ -137,7 +152,7 @@ export default {
           const errText = await nvidiaResponse.text();
           return new Response(JSON.stringify({ error: `API 报错 (${nvidiaResponse.status}): ${errText}` }), {
             status: nvidiaResponse.status,
-            headers: corsHeaders(),
+            headers: CORS_HEADERS,
           });
         }
 
@@ -180,7 +195,7 @@ export default {
           });
         }
       } catch (error) {
-        return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: corsHeaders() });
+        return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: CORS_HEADERS });
       }
     }
 
@@ -188,13 +203,14 @@ export default {
       const { models } = getChannelConfig(env);
       
       let optionsHtml = '';
-      models.forEach((item, index) => {
+      for (let i = 0; i < models.length; i++) {
+        const item = models[i];
         let displayName = item.name;
         if (!item.original.includes(':')) {
-            displayName = item.id.length > 24 ? item.id.substring(0, 22) + '...' : item.id;
+          displayName = item.id.length > 24 ? item.id.substring(0, 22) + '...' : item.id;
         }
-        optionsHtml += `<option value="${item.id}" ${index === 0 ? 'selected' : ''}>${displayName}</option>`;
-      });
+        optionsHtml += `<option value="${item.id}" ${i === 0 ? 'selected' : ''}>${displayName}</option>`;
+      }
 
       const html = HTML_CONTENT.replace('{{MODEL_OPTIONS}}', optionsHtml);
 
@@ -203,7 +219,7 @@ export default {
       });
     }
 
-    // Telegram Bot Webhook
+    // Telegram Bot Webhook (优化并发 RTT 延迟)
     if (request.method === 'POST' && url.pathname === '/tg-webhook') {
       try {
         const update = await request.json();
@@ -220,16 +236,15 @@ export default {
               const data = cb.data;
 
               if (data.startsWith('M:')) {
-                const index = parseInt(data.substring(2));
+                const index = parseInt(data.substring(2), 10);
                 if (modelObjList[index]) {
                   const selected = modelObjList[index];
-                  // 修复点：同时写入内存与 KV 存储
                   tgUserModels.set(chatId, selected.id);
                   if (env.KV) {
-                    try { await env.KV.put(`tg_user_${chatId}`, selected.id); } catch(e){}
+                    ctx.waitUntil(env.KV.put(`tg_user_${chatId}`, selected.id).catch(() => {}));
                   }
                   
-                  await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+                  fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -237,15 +252,15 @@ export default {
                       text: `✅ **已切换模型为:** \n\`${selected.name}\``,
                       parse_mode: "Markdown"
                     })
-                  });
+                  }).catch(() => {});
                 }
               }
 
-              await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/answerCallbackQuery`, {
+              fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/answerCallbackQuery`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ callback_query_id: cb.id })
-              });
+              }).catch(() => {});
               return;
             }
 
@@ -271,7 +286,6 @@ export default {
                 return;
               }
 
-              // 修复点：优先读内存，若无则读 KV 持久化数据
               let targetModelId = tgUserModels.get(chatId);
               if (!targetModelId && env.KV) {
                 try { targetModelId = await env.KV.get(`tg_user_${chatId}`); } catch(e){}
@@ -284,32 +298,38 @@ export default {
               const currentApiKey = channel && channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
               const apiUrl = channel ? channel.url : "";
 
+              // 并行触发 typing 和 pending 消息，降低等待瓶颈
               let pendingMsgId = null;
-              try {
-                await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendChatAction`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ chat_id: chatId, action: 'typing' })
-                });
+              const sendActionPromise = fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendChatAction`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ chat_id: chatId, action: 'typing' })
+              }).catch(() => {});
 
-                const pendingRes = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    chat_id: chatId,
-                    text: "⏳ _正在深度思考并生成内容，请稍候..._",
-                    parse_mode: "Markdown"
-                  })
-                });
-                if (pendingRes.ok) {
-                  const pendingData = await pendingRes.json();
-                  pendingMsgId = pendingData.result.message_id; 
+              const pendingMsgPromise = fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  chat_id: chatId,
+                  text: "⏳ _正在深度思考并生成内容，请稍候..._",
+                  parse_mode: "Markdown"
+                })
+              }).then(async res => {
+                if (res.ok) {
+                  const data = await res.json();
+                  return data.result?.message_id;
                 }
-              } catch(e) {}
+                return null;
+              }).catch(() => null);
+
+              const [, pMsgId] = await Promise.all([sendActionPromise, pendingMsgPromise]);
+              pendingMsgId = pMsgId;
 
               if (!apiUrl) {
                 if (pendingMsgId) {
-                  await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/deleteMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, message_id: pendingMsgId }) });
+                  fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/deleteMessage`, { 
+                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, message_id: pendingMsgId }) 
+                  }).catch(() => {});
                 }
                 await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: "⚠️ 此模型的 API 接口未配置。" }) });
                 return;
@@ -338,11 +358,11 @@ export default {
               });
 
               if (pendingMsgId) {
-                await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/deleteMessage`, {
+                ctx.waitUntil(fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/deleteMessage`, {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({ chat_id: chatId, message_id: pendingMsgId })
-                });
+                }).catch(() => {}));
               }
 
               if (aiResponse.ok) {
@@ -400,10 +420,6 @@ export default {
   }
 };
 
-function corsHeaders() {
-  return { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
-}
-
 // ================= UI 代码 =================
 const HTML_CONTENT = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -412,6 +428,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>AI Assistant Pro</title>
   
+  <link rel="preconnect" href="https://cdn.jsdelivr.net">
   <script src="https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js"></script>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/atom-one-dark.min.css">
   <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
@@ -698,7 +715,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
       <button class="theme-toggle" id="themeToggle" title="切换主题">
         <svg id="themeIcon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
       </button>
-      <div style="font-size: 12px; color: var(--text-secondary); opacity: 0.6; font-weight: 500;">v4.1 Final Fixed</div>
+      <div style="font-size: 12px; color: var(--text-secondary); opacity: 0.6; font-weight: 500;">v4.2 Optimized</div>
     </div>
   </div>
 
@@ -863,7 +880,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
     currentSessionId = id;
     const currentSession = sessions.find(s => s.id === id);
     if (currentSession && currentSession.model) {
-      // 修复点：校验保存的模型在当前 select 里是否存在，不存在则重置为首个
       const exists = Array.from(modelSelect.options).some(opt => opt.value === currentSession.model);
       if (exists) {
         modelSelect.value = currentSession.model;
@@ -881,7 +897,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
     if(window.innerWidth <= 768) { sidebar.classList.remove('open'); sidebarOverlay.classList.remove('active'); userInput.blur(); }
   }
 
-  // 修复点：绑定 change 和 input 双重事件，保障移动端即时响应
   function onModelChange() {
     const currentSession = sessions.find(s => s.id === currentSessionId);
     if(currentSession) {
@@ -1032,7 +1047,37 @@ const HTML_CONTENT = `<!DOCTYPE html>
       
       const rBox = bubble.querySelector('.reasoning-box');
       const tBox = bubble.querySelector('.message-text');
-      
+
+      // 使用 requestAnimationFrame 批处理渲染，规避频繁重绘导致的卡顿
+      let isRenderPending = false;
+      const cursorHtml = '<span style="display:inline-block; width:6px; height:18px; background:var(--brand-color); animation:typing 1s infinite; vertical-align:middle; margin-left:4px; border-radius:2px;"></span>';
+
+      function scheduleUpdateUI() {
+        if (isRenderPending) return;
+        isRenderPending = true;
+        
+        requestAnimationFrame(() => {
+          isRenderPending = false;
+          if (reasoningContent && rBox) {
+            if (rBox.style.display === 'none') rBox.style.display = 'block';
+            rBox.textContent = reasoningContent;
+            rBox.scrollTop = rBox.scrollHeight;
+          }
+
+          if (aiContent || !reasoningContent) {
+            tBox.innerHTML = marked.parse(aiContent) + cursorHtml;
+          } else if (reasoningContent && !aiContent) {
+            tBox.innerHTML = '<div style="color: var(--brand-color); font-size: 14px; font-weight: 500;">正在深度思考... ▍</div>';
+          }
+
+          // 仅在接近底部时自动滚动，增强用户查看历史内容的自由度
+          const distanceToBottom = scrollArea.scrollHeight - scrollArea.scrollTop - scrollArea.clientHeight;
+          if (distanceToBottom < 120) {
+            scrollArea.scrollTop = scrollArea.scrollHeight;
+          }
+        });
+      }
+
       while (true) {
         const { done, value } = await reader.read(); 
         if (done) break;
@@ -1046,7 +1091,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
           if (line.startsWith('data:') && line !== 'data: [DONE]') {
             try {
               const data = JSON.parse(line.slice(5).trim());
-              
               if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
 
               if (data.choices && data.choices[0].delta) {
@@ -1054,22 +1098,12 @@ const HTML_CONTENT = `<!DOCTYPE html>
                 
                 if (delta.reasoning_content) {
                   reasoningContent += delta.reasoning_content;
-                  if (rBox.style.display === 'none') rBox.style.display = 'block';
-                  rBox.textContent = reasoningContent;
-                  rBox.scrollTop = rBox.scrollHeight;
                 }
-
                 if (delta.content !== undefined && delta.content !== null) {
                   aiContent += delta.content; 
                 }
                 
-                if (aiContent || !reasoningContent) {
-                  tBox.innerHTML = marked.parse(aiContent) + '<span style="display:inline-block; width:6px; height:18px; background:var(--brand-color); animation:typing 1s infinite; vertical-align:middle; margin-left:4px; border-radius:2px;"></span>';
-                } else if (reasoningContent && !aiContent) {
-                  tBox.innerHTML = '<div style="color: var(--brand-color); font-size: 14px; font-weight: 500;">正在深度思考... ▍</div>';
-                }
-
-                scrollArea.scrollTop = scrollArea.scrollHeight;
+                scheduleUpdateUI();
               }
             } catch (e) {}
           }
