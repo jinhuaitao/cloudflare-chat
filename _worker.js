@@ -102,7 +102,6 @@ export default {
       return new Response(null, { headers: CORS_HEADERS });
     }
 
-    // Web 前端 API 对话路由
     if (request.method === 'POST' && url.pathname === '/api/chat') {
       try {
         let body;
@@ -200,7 +199,6 @@ export default {
       }
     }
 
-    // Web 前端 UI HTML
     if (request.method === 'GET' && url.pathname === '/') {
       const { models } = getChannelConfig(env);
       
@@ -221,7 +219,7 @@ export default {
       });
     }
 
-    // Telegram Bot Webhook (支持直接发送图片与优化并发)
+    // Telegram Bot Webhook (优化并发 RTT 延迟)
     if (request.method === 'POST' && url.pathname === '/tg-webhook') {
       try {
         const update = await request.json();
@@ -232,7 +230,6 @@ export default {
             const { models: modelObjList, modelMap } = getChannelConfig(env);
             if (modelObjList.length === 0) return;
 
-            // 处理按钮回调
             if (update.callback_query) {
               const cb = update.callback_query;
               const chatId = cb.message.chat.id;
@@ -267,7 +264,6 @@ export default {
               return;
             }
 
-            // 处理文本消息
             if (update.message && update.message.text) {
               const chatId = update.message.chat.id;
               const userText = update.message.text;
@@ -302,14 +298,12 @@ export default {
               const currentApiKey = channel && channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
               const apiUrl = channel ? channel.url : "";
 
-              const isImageAPI = apiUrl.includes('images/generations') || targetModelId.toLowerCase().includes('image');
-
-              // 并行触发 typing / upload_photo 状态以及 pending 提示
+              // 并行触发 typing 和 pending 消息，降低等待瓶颈
               let pendingMsgId = null;
               const sendActionPromise = fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendChatAction`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ chat_id: chatId, action: isImageAPI ? 'upload_photo' : 'typing' })
+                body: JSON.stringify({ chat_id: chatId, action: 'typing' })
               }).catch(() => {});
 
               const pendingMsgPromise = fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
@@ -317,7 +311,7 @@ export default {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                   chat_id: chatId,
-                  text: isImageAPI ? "🎨 _正在生成图片，请稍候..._" : "⏳ _正在深度思考并生成内容，请稍候..._",
+                  text: "⏳ _正在深度思考并生成内容，请稍候..._",
                   parse_mode: "Markdown"
                 })
               }).then(async res => {
@@ -341,6 +335,8 @@ export default {
                 return;
               }
 
+              const isImageAPI = apiUrl.includes('images/generations') || targetModelId.toLowerCase().includes('image');
+              
               const payload = isImageAPI ? {
                 model: targetModelId,
                 prompt: userText,
@@ -361,7 +357,6 @@ export default {
                 body: JSON.stringify(payload),
               });
 
-              // 删除等待中提示消息
               if (pendingMsgId) {
                 ctx.waitUntil(fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/deleteMessage`, {
                   method: 'POST',
@@ -372,52 +367,34 @@ export default {
 
               if (aiResponse.ok) {
                 const aiData = await aiResponse.json();
+                let replyText = "AI 没有返回有效内容。";
+                
+                if (aiData.choices && aiData.choices[0]?.message) {
+                  replyText = aiData.choices[0].message.content;
+                } else if (aiData.data && aiData.data[0]?.url) {
+                  replyText = `[🖼️ 点击查看生成的图片](${aiData.data[0].url})`;
+                }
 
-                if (isImageAPI) {
-                  // 图片接口：使用 sendPhoto 直接发送网络图片地址
-                  const imageUrl = aiData.data?.[0]?.url;
-                  if (imageUrl) {
-                    await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendPhoto`, {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({
-                        chat_id: chatId,
-                        photo: imageUrl,
-                        caption: `🖼️ **提示词:** ${userText.slice(0, 200)}`,
-                        parse_mode: "Markdown"
-                      })
-                    });
-                  } else {
+                const maxLength = 4000; 
+                for (let i = 0; i < replyText.length; i += maxLength) {
+                  const chunk = replyText.slice(i, i + maxLength);
+                  
+                  const tgRes = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      chat_id: chatId,
+                      text: chunk,
+                      parse_mode: "Markdown"
+                    })
+                  });
+
+                  if (!tgRes.ok) {
                     await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ chat_id: chatId, text: "⚠️ 未能获取到生成的图片地址。" })
+                      body: JSON.stringify({ chat_id: chatId, text: chunk })
                     });
-                  }
-                } else {
-                  // 文本接口：分段发送消息
-                  let replyText = aiData.choices?.[0]?.message?.content || "AI 没有返回有效内容。";
-                  const maxLength = 4000; 
-                  for (let i = 0; i < replyText.length; i += maxLength) {
-                    const chunk = replyText.slice(i, i + maxLength);
-                    
-                    const tgRes = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({
-                        chat_id: chatId,
-                        text: chunk,
-                        parse_mode: "Markdown"
-                      })
-                    });
-
-                    if (!tgRes.ok) {
-                      await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ chat_id: chatId, text: chunk })
-                      });
-                    }
                   }
                 }
               } else {
@@ -443,7 +420,7 @@ export default {
   }
 };
 
-// ================= UI 前端单文件 HTML/JS =================
+// ================= UI 代码 =================
 const HTML_CONTENT = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1071,6 +1048,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
       const rBox = bubble.querySelector('.reasoning-box');
       const tBox = bubble.querySelector('.message-text');
 
+      // 使用 requestAnimationFrame 批处理渲染，规避频繁重绘导致的卡顿
       let isRenderPending = false;
       const cursorHtml = '<span style="display:inline-block; width:6px; height:18px; background:var(--brand-color); animation:typing 1s infinite; vertical-align:middle; margin-left:4px; border-radius:2px;"></span>';
 
@@ -1092,6 +1070,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
             tBox.innerHTML = '<div style="color: var(--brand-color); font-size: 14px; font-weight: 500;">正在深度思考... ▍</div>';
           }
 
+          // 仅在接近底部时自动滚动，增强用户查看历史内容的自由度
           const distanceToBottom = scrollArea.scrollHeight - scrollArea.scrollTop - scrollArea.clientHeight;
           if (distanceToBottom < 120) {
             scrollArea.scrollTop = scrollArea.scrollHeight;
