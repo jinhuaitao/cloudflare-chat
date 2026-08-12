@@ -380,20 +380,39 @@ export default {
                   if (match) imageUrl = match[0];
                 }
 
-                // 2. 若识别到图片 URL，优先使用 sendPhoto 直接发送图片
+                // 2. 若识别到图片 URL，由 Worker 拉取文件二进制流后，通过 FormData 上传原图至 Telegram
                 if (imageUrl) {
-                  const photoRes = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendPhoto`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                      chat_id: chatId,
-                      photo: imageUrl,
-                      caption: "🎨 生成成功"
-                    })
-                  });
+                  let photoSent = false;
+                  try {
+                    const imgReq = await fetch(imageUrl, {
+                      headers: {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                      }
+                    });
 
-                  // 若 sendPhoto 报错（如防盗链或链接格式问题），退回发送文本链接
-                  if (!photoRes.ok) {
+                    if (imgReq.ok) {
+                      const imgBlob = await imgReq.blob();
+                      
+                      const formData = new FormData();
+                      formData.append('chat_id', chatId);
+                      formData.append('photo', imgBlob, 'generated_image.png');
+                      formData.append('caption', '🎨 生成成功');
+
+                      const photoRes = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendPhoto`, {
+                        method: 'POST',
+                        body: formData
+                      });
+
+                      if (photoRes.ok) {
+                        photoSent = true;
+                      }
+                    }
+                  } catch (err) {
+                    console.log("图片二进制拉取/推送 Telegram 异常:", err);
+                  }
+
+                  // 3. 若抓取/上传原图失败，保底回退发送文本链接
+                  if (!photoSent) {
                     await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json' },
@@ -401,7 +420,7 @@ export default {
                     });
                   }
                 } else {
-                  // 3. 普通文本消息处理
+                  // 4. 普通文本消息处理
                   let replyText = aiData.choices && aiData.choices[0]?.message ? aiData.choices[0].message.content : "AI 没有返回有效内容。";
                   
                   const maxLength = 4000; 
