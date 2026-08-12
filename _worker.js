@@ -5,12 +5,23 @@ const tgUserModels = new Map();
 let cachedConfig = null;
 let cachedEnvRef = null;
 
+// 复用 HTTP 响应头结构，减少对象频繁创建
 const CORS_HEADERS = {
   'Content-Type': 'application/json',
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 };
+
+const SSE_HEADERS = {
+  'Content-Type': 'text/event-stream',
+  'Access-Control-Allow-Origin': '*',
+  'Cache-Control': 'no-cache',
+  'Connection': 'keep-alive',
+};
+
+const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
+const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 辅助函数：高效解析逗号分隔符
 function parseCommaSeparated(str) {
@@ -34,12 +45,10 @@ function getChannelConfig(env) {
       const raw = arr[i].trim();
       if (!raw) continue;
       
-      let id = raw, name = raw;
       const colonIdx = raw.lastIndexOf(':');
-      if (colonIdx > 0) {
-        id = raw.substring(0, colonIdx).trim();
-        name = raw.substring(colonIdx + 1).trim();
-      }
+      const id = colonIdx > 0 ? raw.substring(0, colonIdx).trim() : raw;
+      const name = colonIdx > 0 ? raw.substring(colonIdx + 1).trim() : raw;
+
       if (!modelMap.has(id)) {
         models.push({ id, name, original: raw });
         modelMap.set(id, { url, keys });
@@ -99,9 +108,7 @@ export default {
 
     // 微信认证路由
     if (request.method === 'GET' && url.pathname === '/a9a015a0f6e7c9ca09f4cdce4479deb3.txt') {
-      return new Response('b7aa7e3069358c2c18f7908a7d5815788bafd020', {
-        headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
-      });
+      return new Response('b7aa7e3069358c2c18f7908a7d5815788bafd020', { headers: TEXT_HEADERS });
     }
 
     if (request.method === 'OPTIONS') {
@@ -163,14 +170,7 @@ export default {
         }
 
         if (!isImageAPI) {
-          return new Response(nvidiaResponse.body, {
-            headers: {
-              'Content-Type': 'text/event-stream',
-              'Access-Control-Allow-Origin': '*',
-              'Cache-Control': 'no-cache',
-              'Connection': 'keep-alive',
-            },
-          });
+          return new Response(nvidiaResponse.body, { headers: SSE_HEADERS });
         } else {
           const responseData = await nvidiaResponse.json();
           let imageUrlOrText = "图片生成失败或未返回格式";
@@ -191,14 +191,7 @@ export default {
             }
           });
 
-          return new Response(stream, {
-            headers: {
-              'Content-Type': 'text/event-stream',
-              'Access-Control-Allow-Origin': '*',
-              'Cache-Control': 'no-cache',
-              'Connection': 'keep-alive',
-            },
-          });
+          return new Response(stream, { headers: SSE_HEADERS });
         }
       } catch (error) {
         return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: CORS_HEADERS });
@@ -220,9 +213,7 @@ export default {
 
       const html = HTML_CONTENT.replace('{{MODEL_OPTIONS}}', optionsHtml);
 
-      return new Response(html, {
-        headers: { 'Content-Type': 'text/html;charset=UTF-8' },
-      });
+      return new Response(html, { headers: HTML_HEADERS });
     }
 
     // Telegram Bot Webhook
@@ -230,6 +221,13 @@ export default {
       try {
         const update = await request.json();
         if (!env.TG_BOT_TOKEN) return new Response('OK', { status: 200 });
+
+        // 辅助 TG 请求函数
+        const tgApi = (method, body) => fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/${method}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
 
         ctx.waitUntil((async () => {
           try {
@@ -250,23 +248,15 @@ export default {
                     ctx.waitUntil(env.KV.put(`tg_user_${chatId}`, selected.id).catch(() => {}));
                   }
                   
-                  fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                      chat_id: chatId,
-                      text: `✅ **已切换模型为:** \n\`${selected.name}\``,
-                      parse_mode: "Markdown"
-                    })
+                  tgApi('sendMessage', {
+                    chat_id: chatId,
+                    text: `✅ **已切换模型为:** \n\`${selected.name}\``,
+                    parse_mode: "Markdown"
                   }).catch(() => {});
                 }
               }
 
-              fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/answerCallbackQuery`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ callback_query_id: cb.id })
-              }).catch(() => {});
+              tgApi('answerCallbackQuery', { callback_query_id: cb.id }).catch(() => {});
               return;
             }
 
@@ -279,15 +269,11 @@ export default {
                   return [{ text: model.name, callback_data: `M:${index}` }];
                 });
 
-                await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    chat_id: chatId,
-                    text: "⚙️ **请选择对话要使用的 AI 模型:**",
-                    parse_mode: "Markdown",
-                    reply_markup: { inline_keyboard }
-                  })
+                await tgApi('sendMessage', {
+                  chat_id: chatId,
+                  text: "⚙️ **请选择对话要使用的 AI 模型:**",
+                  parse_mode: "Markdown",
+                  reply_markup: { inline_keyboard }
                 });
                 return;
               }
@@ -304,20 +290,12 @@ export default {
               const currentApiKey = channel && channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
               const apiUrl = channel ? channel.url : "";
 
-              const sendActionPromise = fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendChatAction`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ chat_id: chatId, action: 'typing' })
-              }).catch(() => {});
+              const sendActionPromise = tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
 
-              const pendingMsgPromise = fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  chat_id: chatId,
-                  text: "⏳ _正在思考并生成内容，请稍候..._",
-                  parse_mode: "Markdown"
-                })
+              const pendingMsgPromise = tgApi('sendMessage', {
+                chat_id: chatId,
+                text: "⏳ _正在思考并生成内容，请稍候..._",
+                parse_mode: "Markdown"
               }).then(async res => {
                 if (res.ok) {
                   const data = await res.json();
@@ -330,11 +308,9 @@ export default {
 
               if (!apiUrl) {
                 if (pendingMsgId) {
-                  fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/deleteMessage`, { 
-                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, message_id: pendingMsgId }) 
-                  }).catch(() => {});
+                  tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {});
                 }
-                await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: "⚠️ 此模型的 API 接口未配置。" }) });
+                await tgApi('sendMessage', { chat_id: chatId, text: "⚠️ 此模型的 API 接口未配置。" });
                 return;
               }
 
@@ -361,11 +337,7 @@ export default {
               });
 
               if (pendingMsgId) {
-                ctx.waitUntil(fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/deleteMessage`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ chat_id: chatId, message_id: pendingMsgId })
-                }).catch(() => {}));
+                ctx.waitUntil(tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {}));
               }
 
               if (aiResponse.ok) {
@@ -382,30 +354,18 @@ export default {
                 for (let i = 0; i < replyText.length; i += maxLength) {
                   const chunk = replyText.slice(i, i + maxLength);
                   
-                  const tgRes = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                      chat_id: chatId,
-                      text: chunk,
-                      parse_mode: "Markdown"
-                    })
+                  const tgRes = await tgApi('sendMessage', {
+                    chat_id: chatId,
+                    text: chunk,
+                    parse_mode: "Markdown"
                   });
 
                   if (!tgRes.ok) {
-                    await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ chat_id: chatId, text: chunk })
-                    });
+                    await tgApi('sendMessage', { chat_id: chatId, text: chunk });
                   }
                 }
               } else {
-                 await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ chat_id: chatId, text: "⚠️ AI 接口请求失败，请稍后再试。" })
-                  });
+                 await tgApi('sendMessage', { chat_id: chatId, text: "⚠️ AI 接口请求失败，请稍后再试。" });
               }
             }
           } catch (err) {
@@ -775,11 +735,16 @@ const HTML_CONTENT = `<!DOCTYPE html>
 <script>
   let isCurrentlyStreaming = false;
 
+  // 高效 HTML 字符转义映射表
+  const ESCAPE_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;' };
+  const ESCAPE_REG = /[&<>]/g;
+  const escapeHtml = str => str.replace(ESCAPE_REG, m => ESCAPE_MAP[m]);
+
   // 优化：流式传输期间使用轻量 Renderer，传输结束后再调用高亮计算
   const renderer = new marked.Renderer();
   renderer.code = function(code, language) {
     const displayLang = language || 'text';
-    const escapedCode = code.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const escapedCode = escapeHtml(code);
     
     let highlightedCode = escapedCode;
     if (!isCurrentlyStreaming && language && hljs.getLanguage(language)) {
@@ -862,9 +827,8 @@ const HTML_CONTENT = `<!DOCTYPE html>
 
   userInput.addEventListener('input', function() {
     this.style.height = 'auto';
-    this.style.height = (this.scrollHeight) + 'px';
-    if(this.value.trim().length > 0) sendBtn.classList.add('active');
-    else sendBtn.classList.remove('active');
+    this.style.height = Math.min(this.scrollHeight, 200) + 'px';
+    sendBtn.classList.toggle('active', this.value.trim().length > 0);
   });
 
   function init() {
@@ -938,8 +902,11 @@ const HTML_CONTENT = `<!DOCTYPE html>
     else renderSessionList();
   }
 
+  // 优化：使用 DocumentFragment 减少 DOM 重绘
   function renderSessionList() {
-    sessionListDiv.innerHTML = '';
+    sessionListDiv.replaceChildren();
+    const fragment = document.createDocumentFragment();
+
     sessions.forEach(session => {
       const item = document.createElement('div');
       item.className = \`session-item \${session.id === currentSessionId ? 'active' : ''}\`;
@@ -956,12 +923,14 @@ const HTML_CONTENT = `<!DOCTYPE html>
       
       item.appendChild(titleSpan); 
       item.appendChild(delBtn); 
-      sessionListDiv.appendChild(item);
+      fragment.appendChild(item);
     });
+
+    sessionListDiv.appendChild(fragment);
   }
 
   function renderMessages() {
-    messagesDiv.innerHTML = '';
+    messagesDiv.replaceChildren();
     const currentSession = sessions.find(s => s.id === currentSessionId);
     if (!currentSession) return;
     
