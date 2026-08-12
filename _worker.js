@@ -12,14 +12,20 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 };
 
+// 辅助函数：高效解析逗号分隔符
+function parseCommaSeparated(str) {
+  if (!str) return [];
+  return str.split(',').map(s => s.trim()).filter(Boolean);
+}
+
 // ======= 统一解析通道配置（带内存缓存） =======
 function getChannelConfig(env) {
   if (cachedConfig && cachedEnvRef === env) {
     return cachedConfig;
   }
 
-  let models = [];
-  let modelMap = new Map();
+  const models = [];
+  const modelMap = new Map();
 
   const addModels = (modelStr, url, keys) => {
     if (!modelStr) return;
@@ -46,7 +52,7 @@ function getChannelConfig(env) {
       const channels = JSON.parse(env.API_CONFIG);
       channels.forEach(ch => {
         const url = ch.url;
-        const keys = Array.isArray(ch.keys) ? ch.keys : (ch.keys || "").split(',').map(k => k.trim()).filter(Boolean);
+        const keys = Array.isArray(ch.keys) ? ch.keys : parseCommaSeparated(ch.keys);
         const modelStr = Array.isArray(ch.models) ? ch.models.join(',') : ch.models;
         if (url && modelStr) addModels(modelStr, url, keys);
       });
@@ -66,7 +72,7 @@ function getChannelConfig(env) {
     const modelStr = env[`MODEL_${i}`];
     if (url && modelStr) {
       hasIndexed = true;
-      const keys = (env[`API_KEY_${i}`] || "").split(',').map(k => k.trim()).filter(Boolean);
+      const keys = parseCommaSeparated(env[`API_KEY_${i}`]);
       addModels(modelStr, url, keys);
     }
   }
@@ -77,7 +83,7 @@ function getChannelConfig(env) {
   }
 
   const fallbackUrl = env.API_URL || "";
-  const fallbackKeys = (env.API_KEY || "").split(',').map(k => k.trim()).filter(Boolean);
+  const fallbackKeys = parseCommaSeparated(env.API_KEY);
   const fallbackModelStr = env.MODEL || "meta/llama3-70b-instruct:Llama 3 70B,deepseek-ai/DeepSeek-R1:深度思考 R1";
   
   addModels(fallbackModelStr, fallbackUrl, fallbackKeys);
@@ -128,7 +134,7 @@ export default {
         const apiUrl = channel.url;
         const isImageAPI = apiUrl.includes('images/generations') || selectedModel.toLowerCase().includes('image');
 
-        let payload = isImageAPI ? {
+        const payload = isImageAPI ? {
           model: selectedModel,
           prompt: body.messages[body.messages.length - 1].content,
           n: 1
@@ -219,7 +225,7 @@ export default {
       });
     }
 
-    // Telegram Bot Webhook (优化并发 RTT 延迟)
+    // Telegram Bot Webhook
     if (request.method === 'POST' && url.pathname === '/tg-webhook') {
       try {
         const update = await request.json();
@@ -298,8 +304,6 @@ export default {
               const currentApiKey = channel && channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
               const apiUrl = channel ? channel.url : "";
 
-              // 并行触发 typing 和 pending 消息，降低等待瓶颈
-              let pendingMsgId = null;
               const sendActionPromise = fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendChatAction`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -311,7 +315,7 @@ export default {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                   chat_id: chatId,
-                  text: "⏳ _正在深度思考并生成内容，请稍候..._",
+                  text: "⏳ _正在思考并生成内容，请稍候..._",
                   parse_mode: "Markdown"
                 })
               }).then(async res => {
@@ -322,8 +326,7 @@ export default {
                 return null;
               }).catch(() => null);
 
-              const [, pMsgId] = await Promise.all([sendActionPromise, pendingMsgPromise]);
-              pendingMsgId = pMsgId;
+              const [, pendingMsgId] = await Promise.all([sendActionPromise, pendingMsgPromise]);
 
               if (!apiUrl) {
                 if (pendingMsgId) {
@@ -428,7 +431,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>AI Assistant Pro</title>
   
-  <link rel="preconnect" href="https://cdn.jsdelivr.net">
+  <link rel="dns-prefetch" href="https://cdn.jsdelivr.net">
   <script src="https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js"></script>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/atom-one-dark.min.css">
   <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
@@ -486,6 +489,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
         radial-gradient(circle at 85% 30%, var(--aurora-2) 0%, transparent 45%),
         radial-gradient(circle at 50% 80%, var(--aurora-3) 0%, transparent 50%);
       filter: blur(60px); opacity: 0.7; transition: all 0.8s ease;
+      transform: translateZ(0);
     }
 
     .app-container { display: flex; height: 100%; width: 100%; position: relative; }
@@ -538,15 +542,18 @@ const HTML_CONTENT = `<!DOCTYPE html>
 
     .menu-toggle { background: none; border: none; color: var(--text-main); cursor: pointer; padding: 8px; margin-right: 12px; border-radius: 8px; display: none; }
     
-    .messages-container { flex: 1; overflow-y: auto; padding: 32px 20px; scroll-behavior: smooth; }
+    .messages-container { 
+      flex: 1; overflow-y: auto; padding: 32px 20px; scroll-behavior: smooth;
+      contain: layout style; will-change: scroll-position;
+    }
     .messages { max-width: 840px; margin: 0 auto; display: flex; flex-direction: column; gap: 32px; }
     
     .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 60vh; opacity: 0.8; }
     .empty-state svg { color: var(--text-secondary); width: 48px; height: 48px; margin-bottom: 20px; filter: drop-shadow(0 4px 6px rgba(0,0,0,0.05)); }
     .empty-state h2 { margin: 0; font-size: 22px; font-weight: 600; }
     
-    .message-row { display: flex; width: 100%; animation: fadeIn 0.4s ease forwards; }
-    @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+    .message-row { display: flex; width: 100%; animation: fadeIn 0.3s ease forwards; contain: content; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
     
     .message-row.user { justify-content: flex-end; }
     .message-bubble { line-height: 1.6; word-wrap: break-word; font-size: 16px; }
@@ -715,7 +722,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
       <button class="theme-toggle" id="themeToggle" title="切换主题">
         <svg id="themeIcon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
       </button>
-      <div style="font-size: 12px; color: var(--text-secondary); opacity: 0.6; font-weight: 500;">v4.2 Optimized</div>
+      <div style="font-size: 12px; color: var(--text-secondary); opacity: 0.6; font-weight: 500;">v4.3 Optimized</div>
     </div>
   </div>
 
@@ -766,11 +773,24 @@ const HTML_CONTENT = `<!DOCTYPE html>
 </div>
 
 <script>
+  let isCurrentlyStreaming = false;
+
+  // 优化：流式传输期间使用轻量 Renderer，传输结束后再调用高亮计算
   const renderer = new marked.Renderer();
   renderer.code = function(code, language) {
-    const validLang = !!(language && hljs.getLanguage(language));
-    const highlighted = validLang ? hljs.highlight(code, { language }).value : hljs.highlightAuto(code).value;
-    const displayLang = language ? language : 'text';
+    const displayLang = language || 'text';
+    const escapedCode = code.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    
+    let highlightedCode = escapedCode;
+    if (!isCurrentlyStreaming && language && hljs.getLanguage(language)) {
+      try {
+        highlightedCode = hljs.highlight(code, { language }).value;
+      } catch (e) {}
+    } else if (!isCurrentlyStreaming) {
+      try {
+        highlightedCode = hljs.highlightAuto(code).value;
+      } catch (e) {}
+    }
     
     return \`
       <div class="code-wrapper">
@@ -781,7 +801,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
             <span>复制代码</span>
           </button>
         </div>
-        <pre><code class="hljs \${language}">\${highlighted}</code></pre>
+        <pre><code class="hljs \${language || ''}">\${highlightedCode}</code></pre>
       </div>
     \`;
   };
@@ -978,7 +998,9 @@ const HTML_CONTENT = `<!DOCTYPE html>
       if (msgId) {
         bubble.innerHTML = content;
       } else {
+        isCurrentlyStreaming = false;
         bubble.innerHTML = '<div class="message-text markdown-body">' + marked.parse(content) + '</div>';
+        bubble.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
       }
     } else {
       bubble.innerText = content; 
@@ -1022,7 +1044,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
     \`, aiMsgId);
     
     const bubble = document.getElementById(aiMsgId);
-    let isStreaming = true; // 标记流传输状态
+    isCurrentlyStreaming = true;
 
     try {
       const response = await fetch('/api/chat', {
@@ -1050,17 +1072,22 @@ const HTML_CONTENT = `<!DOCTYPE html>
       const tBox = bubble.querySelector('.message-text');
 
       let isRenderPending = false;
+      let lastRenderTime = 0;
       const cursorHtml = '<span style="display:inline-block; width:6px; height:18px; background:var(--brand-color); animation:typing 1s infinite; vertical-align:middle; margin-left:4px; border-radius:2px;"></span>';
 
-      function scheduleUpdateUI() {
+      // 优化：加入节流阀机制 (~60ms / 15fps 节流刷新)，极大提升打字流速与降低 CPU 开销
+      function scheduleUpdateUI(force = false) {
+        const now = Date.now();
+        if (!force && now - lastRenderTime < 60) return;
+        
         if (isRenderPending) return;
         isRenderPending = true;
         
         requestAnimationFrame(() => {
           isRenderPending = false;
+          lastRenderTime = Date.now();
 
-          // 若传输已断开或结束，放弃执行带有光标的延迟渲染，防止覆盖最终状态
-          if (!isStreaming) return;
+          if (!isCurrentlyStreaming && !force) return;
 
           if (reasoningContent && rBox) {
             if (rBox.style.display === 'none') rBox.style.display = 'block';
@@ -1069,7 +1096,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
           }
 
           if (aiContent || !reasoningContent) {
-            tBox.innerHTML = marked.parse(aiContent) + cursorHtml;
+            tBox.innerHTML = marked.parse(aiContent) + (isCurrentlyStreaming ? cursorHtml : '');
           } else if (reasoningContent && !aiContent) {
             tBox.innerHTML = '<div style="color: var(--brand-color); font-size: 14px; font-weight: 500;">正在深度思考... ▍</div>';
           }
@@ -1124,22 +1151,23 @@ const HTML_CONTENT = `<!DOCTYPE html>
         } catch(e) {}
       }
 
-      // 流读取完毕，立即将标志位置为 false
-      isStreaming = false;
+      // 流读取完毕，更新状态并执行一次完整的高亮渲染
+      isCurrentlyStreaming = false;
 
       if (!reasoningContent && rBox) rBox.remove();
       
-      // 保证最终渲染时不携带任何光标
       tBox.innerHTML = marked.parse(aiContent);
+      tBox.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
       scrollArea.scrollTop = scrollArea.scrollHeight;
       
       currentSession.messages.push({ role: 'assistant', content: aiContent }); 
       saveSessions();
       
     } catch (error) {
-      isStreaming = false;
+      isCurrentlyStreaming = false;
       if (aiContent || reasoningContent) {
         tBox.innerHTML = marked.parse(aiContent) + \`<br><br><span style="color: #ef4444; font-size: 13px; font-weight: 500;">(⚠️ 网络连接中断，已保留当前生成的内容。错误: \${error.message})</span>\`;
+        tBox.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
         currentSession.messages.push({ role: 'assistant', content: aiContent });
         if (rBox && reasoningContent) rBox.remove(); 
       } else {
@@ -1149,7 +1177,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
       }
       saveSessions();
     } finally {
-      isStreaming = false;
+      isCurrentlyStreaming = false;
       sendBtn.disabled = false; 
       statusDot.classList.remove('generating'); 
       if (userInput.value.trim().length > 0) sendBtn.classList.add('active'); 
