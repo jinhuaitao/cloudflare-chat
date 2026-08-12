@@ -1,6 +1,9 @@
 // 全局内存缓存（L1 缓存）
 const tgUserModels = new Map();
+
+// 配置全局缓存单例
 let cachedConfig = null;
+let cachedEnvRef = null;
 
 const CORS_HEADERS = {
   'Content-Type': 'application/json',
@@ -9,17 +12,14 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 };
 
-// 辅助响应函数
-function jsonResponse(data, status = 200) {
-  return new Response(JSON.stringify(data), { status, headers: CORS_HEADERS });
-}
-
-// ======= 统一解析通道配置（高效单例缓存） =======
+// ======= 统一解析通道配置（带内存缓存） =======
 function getChannelConfig(env) {
-  if (cachedConfig) return cachedConfig;
+  if (cachedConfig && cachedEnvRef === env) {
+    return cachedConfig;
+  }
 
-  const models = [];
-  const modelMap = new Map();
+  let models = [];
+  let modelMap = new Map();
 
   const addModels = (modelStr, url, keys) => {
     if (!modelStr) return;
@@ -52,10 +52,11 @@ function getChannelConfig(env) {
       });
       if (models.length > 0) {
         cachedConfig = { models, modelMap };
+        cachedEnvRef = env;
         return cachedConfig;
       }
     } catch (e) {
-      console.error("API_CONFIG 解析失败:", e);
+      console.log("API_CONFIG 解析失败:", e);
     }
   }
 
@@ -69,25 +70,21 @@ function getChannelConfig(env) {
       addModels(modelStr, url, keys);
     }
   }
-
-  if (!hasIndexed) {
-    const fallbackUrl = env.API_URL || "";
-    const fallbackKeys = (env.API_KEY || "").split(',').map(k => k.trim()).filter(Boolean);
-    const fallbackModelStr = env.MODEL || "meta/llama3-70b-instruct:Llama 3 70B,deepseek-ai/DeepSeek-R1:深度思考 R1";
-    addModels(fallbackModelStr, fallbackUrl, fallbackKeys);
+  if (hasIndexed && models.length > 0) {
+    cachedConfig = { models, modelMap };
+    cachedEnvRef = env;
+    return cachedConfig;
   }
 
-  cachedConfig = { models, modelMap };
-  return cachedConfig;
-}
+  const fallbackUrl = env.API_URL || "";
+  const fallbackKeys = (env.API_KEY || "").split(',').map(k => k.trim()).filter(Boolean);
+  const fallbackModelStr = env.MODEL || "meta/llama3-70b-instruct:Llama 3 70B,deepseek-ai/DeepSeek-R1:深度思考 R1";
+  
+  addModels(fallbackModelStr, fallbackUrl, fallbackKeys);
 
-// Telegram API 快捷请求
-function callTgApi(token, method, body) {
-  return fetch(`[https://api.telegram.org/bot$](https://api.telegram.org/bot$){token}/${method}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  }).catch(() => null);
+  cachedConfig = { models, modelMap };
+  cachedEnvRef = env;
+  return cachedConfig;
 }
 
 export default {
@@ -105,14 +102,13 @@ export default {
       return new Response(null, { headers: CORS_HEADERS });
     }
 
-    // 核心 Chat API
     if (request.method === 'POST' && url.pathname === '/api/chat') {
       try {
         let body;
         try {
           body = await request.json();
         } catch (e) {
-          return jsonResponse({ error: "无效的请求格式" }, 400);
+          return new Response(JSON.stringify({ error: "无效的请求格式" }), { status: 400, headers: CORS_HEADERS });
         }
 
         const { models, modelMap } = getChannelConfig(env);
@@ -125,14 +121,14 @@ export default {
         const channel = modelMap.get(selectedModel);
 
         if (!channel || !channel.url) {
-          return jsonResponse({ error: "该模型对应的 API_URL 未配置或异常" }, 500);
+          return new Response(JSON.stringify({ error: "该模型对应的 API_URL 未配置或异常" }), { status: 500, headers: CORS_HEADERS });
         }
 
         const currentApiKey = channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
         const apiUrl = channel.url;
         const isImageAPI = apiUrl.includes('images/generations') || selectedModel.toLowerCase().includes('image');
 
-        const payload = isImageAPI ? {
+        let payload = isImageAPI ? {
           model: selectedModel,
           prompt: body.messages[body.messages.length - 1].content,
           n: 1
@@ -154,7 +150,10 @@ export default {
 
         if (!nvidiaResponse.ok) {
           const errText = await nvidiaResponse.text();
-          return jsonResponse({ error: `API 报错 (${nvidiaResponse.status}): ${errText}` }, nvidiaResponse.status);
+          return new Response(JSON.stringify({ error: `API 报错 (${nvidiaResponse.status}): ${errText}` }), {
+            status: nvidiaResponse.status,
+            headers: CORS_HEADERS,
+          });
         }
 
         if (!isImageAPI) {
@@ -196,13 +195,13 @@ export default {
           });
         }
       } catch (error) {
-        return jsonResponse({ error: error.message }, 500);
+        return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: CORS_HEADERS });
       }
     }
 
-    // 主页 UI
     if (request.method === 'GET' && url.pathname === '/') {
       const { models } = getChannelConfig(env);
+      
       let optionsHtml = '';
       for (let i = 0; i < models.length; i++) {
         const item = models[i];
@@ -214,10 +213,13 @@ export default {
       }
 
       const html = HTML_CONTENT.replace('{{MODEL_OPTIONS}}', optionsHtml);
-      return new Response(html, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+
+      return new Response(html, {
+        headers: { 'Content-Type': 'text/html;charset=UTF-8' },
+      });
     }
 
-    // Telegram Bot Webhook
+    // Telegram Bot Webhook (优化并发 RTT 延迟)
     if (request.method === 'POST' && url.pathname === '/tg-webhook') {
       try {
         const update = await request.json();
@@ -238,17 +240,27 @@ export default {
                 if (modelObjList[index]) {
                   const selected = modelObjList[index];
                   tgUserModels.set(chatId, selected.id);
-                  if (env.KV) ctx.waitUntil(env.KV.put(`tg_user_${chatId}`, selected.id).catch(() => {}));
+                  if (env.KV) {
+                    ctx.waitUntil(env.KV.put(`tg_user_${chatId}`, selected.id).catch(() => {}));
+                  }
                   
-                  callTgApi(env.TG_BOT_TOKEN, 'sendMessage', {
-                    chat_id: chatId,
-                    text: `✅ **已切换模型为:** \n\`${selected.name}\``,
-                    parse_mode: "Markdown"
-                  });
+                  fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      chat_id: chatId,
+                      text: `✅ **已切换模型为:** \n\`${selected.name}\``,
+                      parse_mode: "Markdown"
+                    })
+                  }).catch(() => {});
                 }
               }
 
-              callTgApi(env.TG_BOT_TOKEN, 'answerCallbackQuery', { callback_query_id: cb.id });
+              fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/answerCallbackQuery`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ callback_query_id: cb.id })
+              }).catch(() => {});
               return;
             }
 
@@ -257,12 +269,19 @@ export default {
               const userText = update.message.text;
 
               if (userText.startsWith('/start') || userText.startsWith('/model')) {
-                const inline_keyboard = modelObjList.map((model, index) => [{ text: model.name, callback_data: `M:${index}` }]);
-                await callTgApi(env.TG_BOT_TOKEN, 'sendMessage', {
-                  chat_id: chatId,
-                  text: "⚙️ **请选择对话要使用的 AI 模型:**",
-                  parse_mode: "Markdown",
-                  reply_markup: { inline_keyboard }
+                const inline_keyboard = modelObjList.map((model, index) => {
+                  return [{ text: model.name, callback_data: `M:${index}` }];
+                });
+
+                await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    chat_id: chatId,
+                    text: "⚙️ **请选择对话要使用的 AI 模型:**",
+                    parse_mode: "Markdown",
+                    reply_markup: { inline_keyboard }
+                  })
                 });
                 return;
               }
@@ -274,43 +293,76 @@ export default {
               if (!targetModelId || !modelMap.has(targetModelId)) {
                 targetModelId = modelObjList[0].id;
               }
-              tgUserModels.set(chatId, targetModelId);
 
               const channel = modelMap.get(targetModelId) || modelMap.values().next().value;
               const currentApiKey = channel && channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
               const apiUrl = channel ? channel.url : "";
 
-              // 并行请求：Typing 状态与 提示文本
-              const actionPromise = callTgApi(env.TG_BOT_TOKEN, 'sendChatAction', { chat_id: chatId, action: 'typing' });
-              const pendingPromise = callTgApi(env.TG_BOT_TOKEN, 'sendMessage', {
-                chat_id: chatId,
-                text: "⏳ _正在深度思考并生成内容，请稍候..._",
-                parse_mode: "Markdown"
-              }).then(res => res && res.ok ? res.json() : null).then(data => data?.result?.message_id).catch(() => null);
+              // 并行触发 typing 和 pending 消息，降低等待瓶颈
+              let pendingMsgId = null;
+              const sendActionPromise = fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendChatAction`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ chat_id: chatId, action: 'typing' })
+              }).catch(() => {});
 
-              const [, pendingMsgId] = await Promise.all([actionPromise, pendingPromise]);
+              const pendingMsgPromise = fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  chat_id: chatId,
+                  text: "⏳ _正在深度思考并生成内容，请稍候..._",
+                  parse_mode: "Markdown"
+                })
+              }).then(async res => {
+                if (res.ok) {
+                  const data = await res.json();
+                  return data.result?.message_id;
+                }
+                return null;
+              }).catch(() => null);
+
+              const [, pMsgId] = await Promise.all([sendActionPromise, pendingMsgPromise]);
+              pendingMsgId = pMsgId;
 
               if (!apiUrl) {
-                if (pendingMsgId) callTgApi(env.TG_BOT_TOKEN, 'deleteMessage', { chat_id: chatId, message_id: pendingMsgId });
-                await callTgApi(env.TG_BOT_TOKEN, 'sendMessage', { chat_id: chatId, text: "⚠️ 此模型的 API 接口未配置。" });
+                if (pendingMsgId) {
+                  fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/deleteMessage`, { 
+                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, message_id: pendingMsgId }) 
+                  }).catch(() => {});
+                }
+                await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: "⚠️ 此模型的 API 接口未配置。" }) });
                 return;
               }
 
               const isImageAPI = apiUrl.includes('images/generations') || targetModelId.toLowerCase().includes('image');
+              
               const payload = isImageAPI ? {
-                model: targetModelId, prompt: userText, n: 1
+                model: targetModelId,
+                prompt: userText,
+                n: 1
               } : {
-                model: targetModelId, messages: [{ role: "user", content: userText }], stream: false, max_tokens: 4096
+                model: targetModelId,
+                messages: [{ role: "user", content: userText }],
+                stream: false, 
+                max_tokens: 4096
               };
 
               const aiResponse = await fetch(apiUrl, {
                 method: 'POST',
-                headers: { 'Authorization': `Bearer ${currentApiKey}`, 'Content-Type': 'application/json' },
+                headers: {
+                  'Authorization': `Bearer ${currentApiKey}`, 
+                  'Content-Type': 'application/json',
+                },
                 body: JSON.stringify(payload),
               });
 
               if (pendingMsgId) {
-                ctx.waitUntil(callTgApi(env.TG_BOT_TOKEN, 'deleteMessage', { chat_id: chatId, message_id: pendingMsgId }));
+                ctx.waitUntil(fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/deleteMessage`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ chat_id: chatId, message_id: pendingMsgId })
+                }).catch(() => {}));
               }
 
               if (aiResponse.ok) {
@@ -323,29 +375,38 @@ export default {
                   replyText = `[🖼️ 点击查看生成的图片](${aiData.data[0].url})`;
                 }
 
-                // 拆分大消息并发处理发送，避免被 Telegram 挂起
-                const maxLength = 4000;
-                const chunks = [];
+                const maxLength = 4000; 
                 for (let i = 0; i < replyText.length; i += maxLength) {
-                  chunks.push(replyText.slice(i, i + maxLength));
-                }
-
-                for (const chunk of chunks) {
-                  const tgRes = await callTgApi(env.TG_BOT_TOKEN, 'sendMessage', {
-                    chat_id: chatId,
-                    text: chunk,
-                    parse_mode: "Markdown"
+                  const chunk = replyText.slice(i, i + maxLength);
+                  
+                  const tgRes = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      chat_id: chatId,
+                      text: chunk,
+                      parse_mode: "Markdown"
+                    })
                   });
-                  if (!tgRes || !tgRes.ok) {
-                    await callTgApi(env.TG_BOT_TOKEN, 'sendMessage', { chat_id: chatId, text: chunk });
+
+                  if (!tgRes.ok) {
+                    await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ chat_id: chatId, text: chunk })
+                    });
                   }
                 }
               } else {
-                 await callTgApi(env.TG_BOT_TOKEN, 'sendMessage', { chat_id: chatId, text: "⚠️ AI 接口请求失败，请稍后再试。" });
+                 await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ chat_id: chatId, text: "⚠️ AI 接口请求失败，请稍后再试。" })
+                  });
               }
             }
           } catch (err) {
-            console.error("后台处理异常:", err);
+            console.log("后台处理异常:", err);
           }
         })());
 
@@ -367,10 +428,10 @@ const HTML_CONTENT = `<!DOCTYPE html>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>AI Assistant Pro</title>
   
-  <link rel="preconnect" href="[https://cdn.jsdelivr.net](https://cdn.jsdelivr.net)">
-  <script src="[https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js](https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js)"></script>
-  <link rel="stylesheet" href="[https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/atom-one-dark.min.css](https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/atom-one-dark.min.css)">
-  <script src="[https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js](https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js)"></script>
+  <link rel="preconnect" href="https://cdn.jsdelivr.net">
+  <script src="https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 
   <style>
     :root {
@@ -654,7 +715,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
       <button class="theme-toggle" id="themeToggle" title="切换主题">
         <svg id="themeIcon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
       </button>
-      <div style="font-size: 12px; color: var(--text-secondary); opacity: 0.6; font-weight: 500;">v4.3 FastRender</div>
+      <div style="font-size: 12px; color: var(--text-secondary); opacity: 0.6; font-weight: 500;">v4.2 Optimized</div>
     </div>
   </div>
 
@@ -705,15 +766,10 @@ const HTML_CONTENT = `<!DOCTYPE html>
 </div>
 
 <script>
-  function escapeHtml(str) {
-    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  }
-
   const renderer = new marked.Renderer();
-  // 核心优化：避免耗时的 highlightAuto，仅在匹配明确语言时高亮
   renderer.code = function(code, language) {
     const validLang = !!(language && hljs.getLanguage(language));
-    const highlighted = validLang ? hljs.highlight(code, { language }).value : escapeHtml(code);
+    const highlighted = validLang ? hljs.highlight(code, { language }).value : hljs.highlightAuto(code).value;
     const displayLang = language ? language : 'text';
     
     return \`
@@ -725,7 +781,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
             <span>复制代码</span>
           </button>
         </div>
-        <pre><code class="hljs \${language || ''}">\${highlighted}</code></pre>
+        <pre><code class="hljs \${language}">\${highlighted}</code></pre>
       </div>
     \`;
   };
@@ -966,7 +1022,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
     \`, aiMsgId);
     
     const bubble = document.getElementById(aiMsgId);
-    let isStreaming = true;
+    let isStreaming = true; // 标记流传输状态
 
     try {
       const response = await fetch('/api/chat', {
@@ -1002,6 +1058,8 @@ const HTML_CONTENT = `<!DOCTYPE html>
         
         requestAnimationFrame(() => {
           isRenderPending = false;
+
+          // 若传输已断开或结束，放弃执行带有光标的延迟渲染，防止覆盖最终状态
           if (!isStreaming) return;
 
           if (reasoningContent && rBox) {
@@ -1040,8 +1098,14 @@ const HTML_CONTENT = `<!DOCTYPE html>
 
               if (data.choices && data.choices[0].delta) {
                 const delta = data.choices[0].delta;
-                if (delta.reasoning_content) reasoningContent += delta.reasoning_content;
-                if (delta.content !== undefined && delta.content !== null) aiContent += delta.content; 
+                
+                if (delta.reasoning_content) {
+                  reasoningContent += delta.reasoning_content;
+                }
+                if (delta.content !== undefined && delta.content !== null) {
+                  aiContent += delta.content; 
+                }
+                
                 scheduleUpdateUI();
               }
             } catch (e) {}
@@ -1060,10 +1124,12 @@ const HTML_CONTENT = `<!DOCTYPE html>
         } catch(e) {}
       }
 
+      // 流读取完毕，立即将标志位置为 false
       isStreaming = false;
 
       if (!reasoningContent && rBox) rBox.remove();
       
+      // 保证最终渲染时不携带任何光标
       tBox.innerHTML = marked.parse(aiContent);
       scrollArea.scrollTop = scrollArea.scrollHeight;
       
