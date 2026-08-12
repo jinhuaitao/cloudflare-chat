@@ -219,7 +219,7 @@ export default {
       });
     }
 
-    // Telegram Bot Webhook
+    // Telegram Bot Webhook (优化并发 RTT 延迟)
     if (request.method === 'POST' && url.pathname === '/tg-webhook') {
       try {
         const update = await request.json();
@@ -298,7 +298,7 @@ export default {
               const currentApiKey = channel && channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
               const apiUrl = channel ? channel.url : "";
 
-              // 并行触发 typing 和 pending 消息
+              // 并行触发 typing 和 pending 消息，降低等待瓶颈
               let pendingMsgId = null;
               const sendActionPromise = fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendChatAction`, {
                 method: 'POST',
@@ -311,7 +311,7 @@ export default {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                   chat_id: chatId,
-                  text: "⏳ _正在思考或生成中，请稍候..._",
+                  text: "⏳ _正在深度思考并生成内容，请稍候..._",
                   parse_mode: "Markdown"
                 })
               }).then(async res => {
@@ -367,64 +367,34 @@ export default {
 
               if (aiResponse.ok) {
                 const aiData = await aiResponse.json();
+                let replyText = "AI 没有返回有效内容。";
                 
-                // 1. 尝试提取图片 URL
-                let imageUrl = null;
-                if (aiData.data && aiData.data[0]?.url) {
-                  imageUrl = aiData.data[0].url;
+                if (aiData.choices && aiData.choices[0]?.message) {
+                  replyText = aiData.choices[0].message.content;
+                } else if (aiData.data && aiData.data[0]?.url) {
+                  replyText = `[🖼️ 点击查看生成的图片](${aiData.data[0].url})`;
                 }
 
-                if (!imageUrl && isImageAPI && aiData.choices && aiData.choices[0]?.message) {
-                  const content = aiData.choices[0].message.content;
-                  const match = content.match(/https?:\/\/[^\s\)\"]+/);
-                  if (match) imageUrl = match[0];
-                }
-
-                // 2. 若识别到图片 URL，优先使用 sendPhoto 直接发送图片
-                if (imageUrl) {
-                  const photoRes = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendPhoto`, {
+                const maxLength = 4000; 
+                for (let i = 0; i < replyText.length; i += maxLength) {
+                  const chunk = replyText.slice(i, i + maxLength);
+                  
+                  const tgRes = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                       chat_id: chatId,
-                      photo: imageUrl,
-                      caption: "🎨 生成成功"
+                      text: chunk,
+                      parse_mode: "Markdown"
                     })
                   });
 
-                  // 若 sendPhoto 报错（如防盗链或链接格式问题），退回发送文本链接
-                  if (!photoRes.ok) {
+                  if (!tgRes.ok) {
                     await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ chat_id: chatId, text: `🖼️ 生成成功，链接如下：\n${imageUrl}` })
+                      body: JSON.stringify({ chat_id: chatId, text: chunk })
                     });
-                  }
-                } else {
-                  // 3. 普通文本消息处理
-                  let replyText = aiData.choices && aiData.choices[0]?.message ? aiData.choices[0].message.content : "AI 没有返回有效内容。";
-                  
-                  const maxLength = 4000; 
-                  for (let i = 0; i < replyText.length; i += maxLength) {
-                    const chunk = replyText.slice(i, i + maxLength);
-                    
-                    const tgRes = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({
-                        chat_id: chatId,
-                        text: chunk,
-                        parse_mode: "Markdown"
-                      })
-                    });
-
-                    if (!tgRes.ok) {
-                      await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ chat_id: chatId, text: chunk })
-                      });
-                    }
                   }
                 }
               } else {
@@ -1052,7 +1022,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
     \`, aiMsgId);
     
     const bubble = document.getElementById(aiMsgId);
-    let isStreaming = true;
+    let isStreaming = true; // 标记流传输状态
 
     try {
       const response = await fetch('/api/chat', {
@@ -1089,6 +1059,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
         requestAnimationFrame(() => {
           isRenderPending = false;
 
+          // 若传输已断开或结束，放弃执行带有光标的延迟渲染，防止覆盖最终状态
           if (!isStreaming) return;
 
           if (reasoningContent && rBox) {
@@ -1153,10 +1124,12 @@ const HTML_CONTENT = `<!DOCTYPE html>
         } catch(e) {}
       }
 
+      // 流读取完毕，立即将标志位置为 false
       isStreaming = false;
 
       if (!reasoningContent && rBox) rBox.remove();
       
+      // 保证最终渲染时不携带任何光标
       tBox.innerHTML = marked.parse(aiContent);
       scrollArea.scrollTop = scrollArea.scrollHeight;
       
