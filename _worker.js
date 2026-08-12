@@ -1022,6 +1022,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
     \`, aiMsgId);
     
     const bubble = document.getElementById(aiMsgId);
+    let isStreaming = true; // 标记流传输状态
 
     try {
       const response = await fetch('/api/chat', {
@@ -1048,7 +1049,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
       const rBox = bubble.querySelector('.reasoning-box');
       const tBox = bubble.querySelector('.message-text');
 
-      // 使用 requestAnimationFrame 批处理渲染，规避频繁重绘导致的卡顿
       let isRenderPending = false;
       const cursorHtml = '<span style="display:inline-block; width:6px; height:18px; background:var(--brand-color); animation:typing 1s infinite; vertical-align:middle; margin-left:4px; border-radius:2px;"></span>';
 
@@ -1058,6 +1058,10 @@ const HTML_CONTENT = `<!DOCTYPE html>
         
         requestAnimationFrame(() => {
           isRenderPending = false;
+
+          // 若传输已断开或结束，放弃执行带有光标的延迟渲染，防止覆盖最终状态
+          if (!isStreaming) return;
+
           if (reasoningContent && rBox) {
             if (rBox.style.display === 'none') rBox.style.display = 'block';
             rBox.textContent = reasoningContent;
@@ -1070,7 +1074,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
             tBox.innerHTML = '<div style="color: var(--brand-color); font-size: 14px; font-weight: 500;">正在深度思考... ▍</div>';
           }
 
-          // 仅在接近底部时自动滚动，增强用户查看历史内容的自由度
           const distanceToBottom = scrollArea.scrollHeight - scrollArea.scrollTop - scrollArea.clientHeight;
           if (distanceToBottom < 120) {
             scrollArea.scrollTop = scrollArea.scrollHeight;
@@ -1121,8 +1124,12 @@ const HTML_CONTENT = `<!DOCTYPE html>
         } catch(e) {}
       }
 
+      // 流读取完毕，立即将标志位置为 false
+      isStreaming = false;
+
       if (!reasoningContent && rBox) rBox.remove();
       
+      // 保证最终渲染时不携带任何光标
       tBox.innerHTML = marked.parse(aiContent);
       scrollArea.scrollTop = scrollArea.scrollHeight;
       
@@ -1130,6 +1137,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
       saveSessions();
       
     } catch (error) {
+      isStreaming = false;
       if (aiContent || reasoningContent) {
         tBox.innerHTML = marked.parse(aiContent) + \`<br><br><span style="color: #ef4444; font-size: 13px; font-weight: 500;">(⚠️ 网络连接中断，已保留当前生成的内容。错误: \${error.message})</span>\`;
         currentSession.messages.push({ role: 'assistant', content: aiContent });
@@ -1141,6 +1149,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
       }
       saveSessions();
     } finally {
+      isStreaming = false;
       sendBtn.disabled = false; 
       statusDot.classList.remove('generating'); 
       if (userInput.value.trim().length > 0) sendBtn.classList.add('active'); 
