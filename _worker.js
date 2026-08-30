@@ -140,6 +140,88 @@ export default {
         const currentApiKey = channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
         const apiUrl = channel.url;
         const isImageAPI = apiUrl.includes('images/generations') || selectedModel.toLowerCase().includes('image');
+        
+        // ======== 新增：判定是否为视频模型 ========
+        const isVideoAPI = selectedModel.toLowerCase().includes('video');
+
+        if (isVideoAPI) {
+          const prompt = body.messages[body.messages.length - 1].content;
+          const encoder = new TextEncoder();
+          const stream = new ReadableStream({
+            async start(controller) {
+              const sendText = (text) => {
+                const chunk = JSON.stringify({ choices: [{ delta: { content: text } }] });
+                controller.enqueue(encoder.encode(`data: ${chunk}\n\n`));
+              };
+              try {
+                // 1. 创建视频任务
+                const createRes = await fetch(apiUrl, {
+                  method: 'POST',
+                  headers: { 'Authorization': `Bearer ${currentApiKey}`, 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    model: selectedModel,
+                    prompt: prompt,
+                    num_frames: 121, // 约5秒视频 (遵循 8n+1 规则)
+                    frame_rate: 24
+                  })
+                });
+                
+                if (!createRes.ok) {
+                  sendText(`❌ **视频任务创建失败**: ${await createRes.text()}`);
+                  controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+                  controller.close();
+                  return;
+                }
+                
+                const createData = await createRes.json();
+                const videoId = createData.video_id || createData.task_id;
+                const baseUrl = new URL(apiUrl).origin;
+                
+                sendText(`🎬 **任务已提交** (ID: \`${videoId}\`)\n\n> 正在云端渲染，这通常需要两到三分钟，请保持页面打开...\n\n进度: `);
+                
+                // 2. 轮询结果
+                let attempts = 0;
+                let isCompleted = false;
+                
+                while (attempts < 60) { // 最大轮询 5 分钟
+                  await new Promise(r => setTimeout(r, 5000));
+                  attempts++;
+                  
+                  const pollRes = await fetch(`${baseUrl}/agnesapi?video_id=${videoId}`, {
+                    headers: { 'Authorization': `Bearer ${currentApiKey}` }
+                  });
+                  
+                  if (!pollRes.ok) continue;
+                  
+                  const pollData = await pollRes.json();
+                  const status = pollData.status;
+                  
+                  if (status === 'completed') {
+                    const videoUrl = pollData.metadata?.url;
+                    sendText(`\n\n✅ **生成成功！**\n\n<video controls playsinline width="100%" style="border-radius: 12px; margin-top: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); background: #000;" src="${videoUrl}"></video>\n`);
+                    isCompleted = true;
+                    break;
+                  } else if (status === 'failed') {
+                    sendText(`\n\n❌ **生成失败**: ${JSON.stringify(pollData.error)}`);
+                    isCompleted = true;
+                    break;
+                  } else {
+                    sendText(' ⏳'); // 发送小沙漏表示还在排队或生成
+                  }
+                }
+                
+                if (!isCompleted) sendText('\n\n⚠️ **生成轮询超时**，由于任务拥挤，视频可能仍在后台生成。');
+                
+              } catch (e) {
+                sendText(`\n\n❌ **系统异常**: ${e.message}`);
+              }
+              controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+              controller.close();
+            }
+          });
+          return new Response(stream, { headers: SSE_HEADERS });
+        }
+        // ======== 视频 API 处理结束 ========
 
         const payload = isImageAPI ? {
           model: selectedModel,
@@ -316,6 +398,59 @@ export default {
 
               const isImageAPI = apiUrl.includes('images/generations') || targetModelId.toLowerCase().includes('image');
               
+              // ======== 新增：TG 处理视频生成 ========
+              const isVideoAPI = targetModelId.toLowerCase().includes('video');
+              
+              if (isVideoAPI) {
+                const createRes = await fetch(apiUrl, {
+                  method: 'POST',
+                  headers: { 'Authorization': `Bearer ${currentApiKey}`, 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ model: targetModelId, prompt: userText, num_frames: 121, frame_rate: 24 })
+                });
+                
+                // 删除原有的 Typing 提示消息
+                if (pendingMsgId) ctx.waitUntil(tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {}));
+                
+                if (!createRes.ok) {
+                  await tgApi('sendMessage', { chat_id: chatId, text: `❌ 视频生成请求失败: ${await createRes.text()}` });
+                  return;
+                }
+                
+                const createData = await createRes.json();
+                const videoId = createData.video_id || createData.task_id;
+                const baseUrl = new URL(apiUrl).origin;
+                
+                const msgRes = await tgApi('sendMessage', { chat_id: chatId, text: `🎬 视频任务已提交 (ID: \`${videoId}\`)\n⏳ 正在云端渲染，请耐心稍候...` });
+                const statusMsgId = msgRes.ok ? (await msgRes.json()).result?.message_id : null;
+                
+                let attempts = 0;
+                while (attempts < 60) {
+                  await new Promise(r => setTimeout(r, 6000));
+                  attempts++;
+                  const pollRes = await fetch(`${baseUrl}/agnesapi?video_id=${videoId}`, { headers: { 'Authorization': `Bearer ${currentApiKey}` }});
+                  if (!pollRes.ok) continue;
+                  
+                  const pollData = await pollRes.json();
+                  if (pollData.status === 'completed') {
+                    if (statusMsgId) tgApi('deleteMessage', { chat_id: chatId, message_id: statusMsgId }).catch(()=>{});
+                    // 直接调用 TG 的 sendVideo
+                    await tgApi('sendVideo', { 
+                      chat_id: chatId, 
+                      video: pollData.metadata.url, 
+                      caption: `✅ 视频生成完成！\n\n💡 提示词: ${userText}` 
+                    });
+                    return;
+                  } else if (pollData.status === 'failed') {
+                    if (statusMsgId) tgApi('editMessageText', { chat_id: chatId, message_id: statusMsgId, text: `❌ 生成失败！` }).catch(()=>{});
+                    return;
+                  }
+                }
+                
+                if (statusMsgId) tgApi('editMessageText', { chat_id: chatId, message_id: statusMsgId, text: `⚠️ 视频生成排队超时，请稍后检查。` }).catch(()=>{});
+                return;
+              }
+              // ======== 视频 API 处理结束 ========
+
               const payload = isImageAPI ? {
                 model: targetModelId,
                 prompt: userText,
@@ -1166,4 +1301,4 @@ const HTML_CONTENT = `<!DOCTYPE html>
   init();
 </script>
 </body>
-</html>`;
+</html>
