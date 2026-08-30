@@ -161,12 +161,17 @@ export default {
                 controller.enqueue(encoder.encode(`data: ${chunk}\n\n`));
               };
               
-              // 伪装浏览器请求头，绕过 1015 防火墙拦截
+              // 随机生成一个伪装 IP
+              const fakeIp = `${Math.floor(Math.random() * 254) + 1}.${Math.floor(Math.random() * 254)}.${Math.floor(Math.random() * 254)}.${Math.floor(Math.random() * 254)}`;
+              
+              // 伪装浏览器请求头及真实来源 IP，绕过 1015 防火墙限流
               const reqHeaders = {
                 'Authorization': `Bearer ${currentApiKey}`, 
                 'Content-Type': 'application/json',
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-                'Accept': 'application/json'
+                'Accept': 'application/json',
+                'X-Forwarded-For': fakeIp,
+                'X-Real-IP': fakeIp
               };
 
               try {
