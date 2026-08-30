@@ -1301,4 +1301,4 @@ const HTML_CONTENT = `<!DOCTYPE html>
   init();
 </script>
 </body>
-</html>
+</html>`;
