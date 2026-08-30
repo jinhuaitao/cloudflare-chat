@@ -211,7 +211,8 @@ export default {
         optionsHtml += `<option value="${item.id}" ${i === 0 ? 'selected' : ''}>${displayName}</option>`;
       }
 
-      const html = HTML_CONTENT.replace('{{MODEL_OPTIONS}}', optionsHtml);
+      // 注意：这里使用 replaceAll 以确保对话栏和设置弹窗中的 {{MODEL_OPTIONS}} 都被替换
+      const html = HTML_CONTENT.replaceAll('{{MODEL_OPTIONS}}', optionsHtml);
 
       return new Response(html, { headers: HTML_HEADERS });
     }
@@ -608,6 +609,29 @@ const HTML_CONTENT = `<!DOCTYPE html>
     
     .disclaimer { text-align: center; font-size: 12px; color: var(--text-secondary); opacity: 0.6; margin-top: 16px; }
 
+    /* ========== 设置弹窗 CSS ========== */
+    .settings-modal-overlay {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 1000;
+      backdrop-filter: blur(4px); display: none; align-items: center; justify-content: center;
+      opacity: 0; transition: opacity 0.3s ease;
+    }
+    .settings-modal-overlay.active { display: flex; opacity: 1; }
+    .settings-box {
+      background: var(--glass-bg); border: 1px solid var(--glass-border);
+      box-shadow: var(--glass-shadow); padding: 24px; border-radius: 16px;
+      width: 320px; max-width: 90%; transform: translateY(20px); transition: transform 0.3s ease;
+    }
+    .settings-modal-overlay.active .settings-box { transform: translateY(0); }
+    .settings-select {
+      width: 100%; padding: 10px; border-radius: 8px; border: 1px solid var(--glass-border);
+      background: var(--input-bg); color: var(--text-main); font-size: 14px; outline: none;
+    }
+    .settings-btn {
+      background: var(--brand-color); color: #fff; border: none; padding: 8px 20px;
+      border-radius: 8px; cursor: pointer; font-size: 14px; transition: opacity 0.2s;
+    }
+    .settings-btn:hover { opacity: 0.8; }
+
     @media (min-width: 769px) {
       .app-container { padding: 24px; gap: 24px; align-items: center; justify-content: center; }
       .sidebar { position: relative; transform: translateX(0); border-radius: 24px; height: 100%; box-shadow: var(--glass-shadow); flex-shrink: 0; }
@@ -669,6 +693,22 @@ const HTML_CONTENT = `<!DOCTYPE html>
 <div class="aurora-bg"></div>
 <div class="sidebar-overlay" id="sidebarOverlay"></div>
 
+<!-- 设置弹窗 -->
+<div class="settings-modal-overlay" id="settingsModal">
+  <div class="settings-box">
+    <h3 style="margin-top:0; font-size:18px;">系统设置</h3>
+    <div style="margin-top: 16px;">
+      <label style="font-size: 14px; color: var(--text-secondary); display: block; margin-bottom: 8px;">新对话默认模型</label>
+      <select id="defaultModelSetting" class="settings-select">
+        {{MODEL_OPTIONS}}
+      </select>
+    </div>
+    <div style="margin-top: 24px; text-align: right;">
+      <button id="closeSettingsBtn" class="settings-btn">完成</button>
+    </div>
+  </div>
+</div>
+
 <div class="app-container">
   <div class="sidebar" id="sidebar">
     <div class="sidebar-header">
@@ -679,9 +719,14 @@ const HTML_CONTENT = `<!DOCTYPE html>
     </div>
     <div class="session-list" id="sessionList"></div>
     <div class="sidebar-footer">
-      <button class="theme-toggle" id="themeToggle" title="切换主题">
-        <svg id="themeIcon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
-      </button>
+      <div style="display: flex; gap: 8px;">
+        <button class="theme-toggle" id="settingsToggle" title="系统设置">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+        </button>
+        <button class="theme-toggle" id="themeToggle" title="切换主题">
+          <svg id="themeIcon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
+        </button>
+      </div>
       <div style="font-size: 12px; color: var(--text-secondary); opacity: 0.6; font-weight: 500;">v4.3 Optimized</div>
     </div>
   </div>
@@ -853,7 +898,13 @@ const HTML_CONTENT = `<!DOCTYPE html>
 
   function createNewSession() {
     const newId = 'session_' + Date.now();
-    sessions.unshift({ id: newId, title: '新对话', messages: [], model: modelSelect.value });
+    
+    // 核心修改：读取存储的新对话默认模型配置
+    const savedDefaultModel = localStorage.getItem('default_model');
+    const fallbackModel = modelSelect.options.length > 0 ? modelSelect.options[0].value : "";
+    const targetModel = savedDefaultModel || fallbackModel;
+
+    sessions.unshift({ id: newId, title: '新对话', messages: [], model: targetModel });
     saveSessions();
     switchSession(newId);
     renderSessionList();
@@ -1153,6 +1204,37 @@ const HTML_CONTENT = `<!DOCTYPE html>
       userInput.focus();
     }
   }
+
+  // ========== 设置面板交互逻辑 ==========
+  const settingsModal = document.getElementById('settingsModal');
+  const settingsToggle = document.getElementById('settingsToggle');
+  const closeSettingsBtn = document.getElementById('closeSettingsBtn');
+  const defaultModelSetting = document.getElementById('defaultModelSetting');
+
+  // 初始化设置面板的默认值
+  if (defaultModelSetting) {
+    defaultModelSetting.value = localStorage.getItem('default_model') || (modelSelect.options.length > 0 ? modelSelect.options[0].value : "");
+  }
+
+  // 打开设置
+  settingsToggle.addEventListener('click', () => {
+    settingsModal.style.display = 'flex';
+    setTimeout(() => settingsModal.classList.add('active'), 10); 
+  });
+
+  // 关闭设置并保存
+  closeSettingsBtn.addEventListener('click', () => {
+    settingsModal.classList.remove('active');
+    if (defaultModelSetting.value) {
+      localStorage.setItem('default_model', defaultModelSetting.value);
+    }
+    setTimeout(() => settingsModal.style.display = 'none', 300);
+  });
+
+  // 点击蒙版关闭
+  settingsModal.addEventListener('click', (e) => {
+    if (e.target === settingsModal) closeSettingsBtn.click();
+  });
 
   document.getElementById('newChatBtn').addEventListener('click', createNewSession);
   sendBtn.addEventListener('click', sendMessage);
