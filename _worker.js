@@ -138,7 +138,7 @@ export default {
         }
 
         const currentApiKey = channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
-        const apiUrl = channel.url;
+        const apiUrl = channel.url.trim().replace(/[\r\n\u200B\uFEFF]/g, '');
         const isImageAPI = apiUrl.includes('images/generations') || selectedModel.toLowerCase().includes('image');
         
         // ======== 新增：判定是否为视频模型 ========
