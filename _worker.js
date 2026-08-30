@@ -587,11 +587,11 @@ const HTML_CONTENT = `<!DOCTYPE html>
     .code-wrapper pre { background: transparent !important; margin: 0 !important; padding: 20px; overflow-x: auto; border-radius: 0; box-shadow: none; }
     .code-wrapper pre code { background: transparent; padding: 0; color: #e2e8f0; font-size: 14px; line-height: 1.6; font-family: 'SFMono-Regular', Consolas, monospace; }
 
+    /* 还原原始样式：思考过程框 */
     .reasoning-box {
-      font-size: 14px; color: var(--text-secondary); background: var(--hover-bg);
-      padding: 16px 20px; border-radius: 16px; border-left: 3px solid var(--brand-color);
-      margin-bottom: 20px; white-space: pre-wrap; line-height: 1.6; max-height: 200px; overflow-y: auto;
-      font-family: monospace; border: 1px solid var(--glass-border);
+      font-size: 14px; color: var(--text-secondary); background: rgba(128,128,128,0.05);
+      padding: 12px 16px; border-radius: 12px; border-left: 3px solid var(--brand-color);
+      margin-bottom: 16px; white-space: pre-wrap; line-height: 1.6; max-height: 150px; overflow-y: auto;
     }
     .reasoning-box::-webkit-scrollbar { width: 4px; }
     .reasoning-box::-webkit-scrollbar-thumb { background: rgba(128,128,128,0.3); border-radius: 4px; }
