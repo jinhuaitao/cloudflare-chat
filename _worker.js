@@ -138,11 +138,17 @@ export default {
         }
 
         const currentApiKey = channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
-        const apiUrl = channel.url.trim().replace(/[\r\n\u200B\uFEFF]/g, '');
-        const isImageAPI = apiUrl.includes('images/generations') || selectedModel.toLowerCase().includes('image');
         
-        // ======== 新增：判定是否为视频模型 ========
+        // 终极清洗：去除首尾可能带入的双引号、单引号，以及所有空白符号
+        let apiUrl = channel.url.trim().replace(/^["']|["']$/g, '').replace(/\s+/g, '');
+        
+        const isImageAPI = apiUrl.includes('images/generations') || selectedModel.toLowerCase().includes('image');
         const isVideoAPI = selectedModel.toLowerCase().includes('video');
+        
+        // 强制保险：如果是视频模型，直接强制使用标准接口，彻底无视环境变量里的格式问题
+        if (isVideoAPI) {
+          apiUrl = 'https://apihub.agnes-ai.com/v1/videos';
+        }
 
         if (isVideoAPI) {
           const prompt = body.messages[body.messages.length - 1].content;
