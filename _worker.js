@@ -5,6 +5,7 @@ const tgUserModels = new Map();
 let cachedConfig = null;
 let cachedEnvRef = null;
 
+// 复用 HTTP 响应头结构，减少对象频繁创建
 const CORS_HEADERS = {
   'Content-Type': 'application/json',
   'Access-Control-Allow-Origin': '*',
@@ -22,6 +23,7 @@ const SSE_HEADERS = {
 const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
+// 辅助函数：高效解析逗号分隔符
 function parseCommaSeparated(str) {
   if (!str) return [];
   return str.split(',').map(s => s.trim()).filter(Boolean);
@@ -29,7 +31,9 @@ function parseCommaSeparated(str) {
 
 // ======= 统一解析通道配置（带内存缓存） =======
 function getChannelConfig(env) {
-  if (cachedConfig && cachedEnvRef === env) return cachedConfig;
+  if (cachedConfig && cachedEnvRef === env) {
+    return cachedConfig;
+  }
 
   const models = [];
   const modelMap = new Map();
@@ -66,7 +70,9 @@ function getChannelConfig(env) {
         cachedEnvRef = env;
         return cachedConfig;
       }
-    } catch (e) { console.log("API_CONFIG 解析失败:", e); }
+    } catch (e) {
+      console.log("API_CONFIG 解析失败:", e);
+    }
   }
 
   let hasIndexed = false;
@@ -79,7 +85,6 @@ function getChannelConfig(env) {
       addModels(modelStr, url, keys);
     }
   }
-  
   if (hasIndexed && models.length > 0) {
     cachedConfig = { models, modelMap };
     cachedEnvRef = env;
@@ -91,6 +96,7 @@ function getChannelConfig(env) {
   const fallbackModelStr = env.MODEL || "meta/llama3-70b-instruct:Llama 3 70B,deepseek-ai/DeepSeek-R1:深度思考 R1";
   
   addModels(fallbackModelStr, fallbackUrl, fallbackKeys);
+
   cachedConfig = { models, modelMap };
   cachedEnvRef = env;
   return cachedConfig;
@@ -100,6 +106,7 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
+    // 微信认证路由
     if (request.method === 'GET' && url.pathname === '/a9a015a0f6e7c9ca09f4cdce4479deb3.txt') {
       return new Response('b7aa7e3069358c2c18f7908a7d5815788bafd020', { headers: TEXT_HEADERS });
     }
@@ -110,28 +117,27 @@ export default {
 
     if (request.method === 'POST' && url.pathname === '/api/chat') {
       try {
-        // [优化5：密码鉴权防盗刷]
-        if (env.SITE_PASSWORD) {
-          const authHeader = request.headers.get('Authorization') || '';
-          if (authHeader !== `Bearer ${env.SITE_PASSWORD}`) {
-            return new Response(JSON.stringify({ error: "401 Unauthorized: 访问密码错误或未授权" }), { status: 401, headers: CORS_HEADERS });
-          }
-        }
-
         let body;
-        try { body = await request.json(); } catch (e) {
+        try {
+          body = await request.json();
+        } catch (e) {
           return new Response(JSON.stringify({ error: "无效的请求格式" }), { status: 400, headers: CORS_HEADERS });
         }
 
         const { models, modelMap } = getChannelConfig(env);
         let selectedModel = body.model || (models.length > 0 ? models[0].id : "");
-        if (!modelMap.has(selectedModel)) selectedModel = models.length > 0 ? models[0].id : "";
+
+        if (!modelMap.has(selectedModel)) {
+          selectedModel = models.length > 0 ? models[0].id : "";
+        }
 
         const channel = modelMap.get(selectedModel);
+
         if (!channel || !channel.url) {
           return new Response(JSON.stringify({ error: "该模型对应的 API_URL 未配置或异常" }), { status: 500, headers: CORS_HEADERS });
         }
 
+        const currentApiKey = channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
         const apiUrl = channel.url;
         const isImageAPI = apiUrl.includes('images/generations') || selectedModel.toLowerCase().includes('image');
 
@@ -146,27 +152,14 @@ export default {
           max_tokens: 4096, 
         };
 
-        // [优化4：API Key 随机容灾轮询]
-        let keys = channel.keys.length > 0 ? [...channel.keys] : [""];
-        keys.sort(() => Math.random() - 0.5); // 随机打乱负载均衡
-
-        let nvidiaResponse = null;
-        for (let i = 0; i < keys.length; i++) {
-          const fetchOptions = {
-            method: 'POST',
-            headers: { 'Authorization': `Bearer ${keys[i]}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-          };
-          nvidiaResponse = await fetch(apiUrl, fetchOptions);
-          
-          if (nvidiaResponse.ok) break; // 成功则跳出循环
-          // 若是被限流(429)或权限报错(401/403)或网关报错，且不是最后一个Key，则静默重试
-          if (i < keys.length - 1 && [401, 403, 429, 500, 502, 503, 504].includes(nvidiaResponse.status)) {
-            continue;
-          } else {
-            break; 
-          }
-        }
+        const nvidiaResponse = await fetch(apiUrl, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${currentApiKey}`, 
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(payload),
+        });
 
         if (!nvidiaResponse.ok) {
           const errText = await nvidiaResponse.text();
@@ -191,12 +184,13 @@ export default {
           const encoder = new TextEncoder();
           const stream = new ReadableStream({
             start(controller) {
-              const fakeChunk = JSON.stringify({ choices: [{ delta: { content: imageUrlOrText + "\\n\\n" } }] });
+              const fakeChunk = JSON.stringify({ choices: [{ delta: { content: imageUrlOrText + "\n\n" } }] });
               controller.enqueue(encoder.encode(`data: ${fakeChunk}\n\n`));
               controller.enqueue(encoder.encode('data: [DONE]\n\n'));
               controller.close();
             }
           });
+
           return new Response(stream, { headers: SSE_HEADERS });
         }
       } catch (error) {
@@ -206,13 +200,17 @@ export default {
 
     if (request.method === 'GET' && url.pathname === '/') {
       const { models } = getChannelConfig(env);
+      
       let optionsHtml = '';
       for (let i = 0; i < models.length; i++) {
         const item = models[i];
         let displayName = item.name;
-        if (!item.original.includes(':')) displayName = item.id.length > 24 ? item.id.substring(0, 22) + '...' : item.id;
+        if (!item.original.includes(':')) {
+          displayName = item.id.length > 24 ? item.id.substring(0, 22) + '...' : item.id;
+        }
         optionsHtml += `<option value="${item.id}" ${i === 0 ? 'selected' : ''}>${displayName}</option>`;
       }
+
       const html = HTML_CONTENT.replaceAll('{{MODEL_OPTIONS}}', optionsHtml);
       return new Response(html, { headers: HTML_HEADERS });
     }
@@ -244,10 +242,18 @@ export default {
                 if (modelObjList[index]) {
                   const selected = modelObjList[index];
                   tgUserModels.set(chatId, selected.id);
-                  if (env.KV) ctx.waitUntil(env.KV.put(`tg_user_${chatId}`, selected.id).catch(() => {}));
-                  tgApi('sendMessage', { chat_id: chatId, text: `✅ **已切换模型为:** \n\`${selected.name}\``, parse_mode: "Markdown" }).catch(() => {});
+                  if (env.KV) {
+                    ctx.waitUntil(env.KV.put(`tg_user_${chatId}`, selected.id).catch(() => {}));
+                  }
+                  
+                  tgApi('sendMessage', {
+                    chat_id: chatId,
+                    text: `✅ **已切换模型为:** \n\`${selected.name}\``,
+                    parse_mode: "Markdown"
+                  }).catch(() => {});
                 }
               }
+
               tgApi('answerCallbackQuery', { callback_query_id: cb.id }).catch(() => {});
               return;
             }
@@ -257,67 +263,82 @@ export default {
               const userText = update.message.text;
 
               if (userText.startsWith('/start') || userText.startsWith('/model')) {
-                const inline_keyboard = modelObjList.map((model, index) => [{ text: model.name, callback_data: `M:${index}` }]);
-                await tgApi('sendMessage', { chat_id: chatId, text: "⚙️ **请选择对话要使用的 AI 模型:**", parse_mode: "Markdown", reply_markup: { inline_keyboard }});
+                const inline_keyboard = modelObjList.map((model, index) => {
+                  return [{ text: model.name, callback_data: `M:${index}` }];
+                });
+
+                await tgApi('sendMessage', {
+                  chat_id: chatId,
+                  text: "⚙️ **请选择对话要使用的 AI 模型:**",
+                  parse_mode: "Markdown",
+                  reply_markup: { inline_keyboard }
+                });
                 return;
               }
 
               let targetModelId = tgUserModels.get(chatId);
-              if (!targetModelId && env.KV) try { targetModelId = await env.KV.get(`tg_user_${chatId}`); } catch(e){}
-              if (!targetModelId || !modelMap.has(targetModelId)) targetModelId = modelObjList[0].id;
+              if (!targetModelId && env.KV) {
+                try { targetModelId = await env.KV.get(`tg_user_${chatId}`); } catch(e){}
+              }
+              if (!targetModelId || !modelMap.has(targetModelId)) {
+                targetModelId = modelObjList[0].id;
+              }
 
               const channel = modelMap.get(targetModelId) || modelMap.values().next().value;
-              const isImageAPI = channel.url.includes('images/generations') || targetModelId.toLowerCase().includes('image');
+              const currentApiKey = channel && channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
+              const apiUrl = channel ? channel.url : "";
 
               const sendActionPromise = tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
-              const pendingMsgPromise = tgApi('sendMessage', { chat_id: chatId, text: "⏳ _正在思考并生成内容，请稍候..._", parse_mode: "Markdown" })
-                                          .then(async res => res.ok ? (await res.json()).result?.message_id : null).catch(() => null);
+
+              const pendingMsgPromise = tgApi('sendMessage', {
+                chat_id: chatId,
+                text: "⏳ _正在思考并生成内容，请稍候..._",
+                parse_mode: "Markdown"
+              }).then(async res => {
+                if (res.ok) {
+                  const data = await res.json();
+                  return data.result?.message_id;
+                }
+                return null;
+              }).catch(() => null);
 
               const [, pendingMsgId] = await Promise.all([sendActionPromise, pendingMsgPromise]);
 
-              if (!channel || !channel.url) {
-                if (pendingMsgId) tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {});
+              if (!apiUrl) {
+                if (pendingMsgId) {
+                  tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {});
+                }
                 await tgApi('sendMessage', { chat_id: chatId, text: "⚠️ 此模型的 API 接口未配置。" });
                 return;
               }
 
-              // [优化1：Telegram KV 上下文记忆]
-              let tgMessages = [];
-              const tgHistoryKey = `tg_hist_${chatId}`;
-              if (env.KV && !isImageAPI) {
-                try {
-                  const histStr = await env.KV.get(tgHistoryKey);
-                  if (histStr) tgMessages = JSON.parse(histStr);
-                } catch (e) {}
-              }
-              tgMessages.push({ role: "user", content: userText });
-              if (tgMessages.length > 15) tgMessages = tgMessages.slice(-15); // 保留最近 15 条
-
+              const isImageAPI = apiUrl.includes('images/generations') || targetModelId.toLowerCase().includes('image');
+              
               const payload = isImageAPI ? {
-                model: targetModelId, prompt: userText, n: 1
+                model: targetModelId,
+                prompt: userText,
+                n: 1
               } : {
-                model: targetModelId, messages: tgMessages, stream: false, max_tokens: 4096
+                model: targetModelId,
+                messages: [{ role: "user", content: userText }],
+                stream: false, 
+                max_tokens: 4096
               };
 
-              // API Key 容灾轮询 (TG端)
-              let keys = channel.keys.length > 0 ? [...channel.keys] : [""];
-              keys.sort(() => Math.random() - 0.5);
-              let aiResponse = null;
+              const aiResponse = await fetch(apiUrl, {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${currentApiKey}`, 
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(payload),
+              });
 
-              for (let i = 0; i < keys.length; i++) {
-                aiResponse = await fetch(channel.url, {
-                  method: 'POST',
-                  headers: { 'Authorization': `Bearer ${keys[i]}`, 'Content-Type': 'application/json' },
-                  body: JSON.stringify(payload),
-                });
-                if (aiResponse.ok) break;
-                if (i < keys.length - 1 && [401, 403, 429, 500, 502, 503, 504].includes(aiResponse.status)) continue;
-                break;
+              if (pendingMsgId) {
+                ctx.waitUntil(tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {}));
               }
 
-              if (pendingMsgId) ctx.waitUntil(tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {}));
-
-              if (aiResponse && aiResponse.ok) {
+              if (aiResponse.ok) {
                 const aiData = await aiResponse.json();
                 let replyText = "AI 没有返回有效内容。";
                 
@@ -327,29 +348,33 @@ export default {
                   replyText = `[🖼️ 点击查看生成的图片](${aiData.data[0].url})`;
                 }
 
-                // KV 保存新记录
-                if (env.KV && !isImageAPI && replyText !== "AI 没有返回有效内容。") {
-                  tgMessages.push({ role: "assistant", content: replyText });
-                  if (tgMessages.length > 15) tgMessages = tgMessages.slice(-15);
-                  ctx.waitUntil(env.KV.put(tgHistoryKey, JSON.stringify(tgMessages), { expirationTtl: 86400 }).catch(()=>{}));
-                }
-
-                // 拆分长消息发送
                 const maxLength = 4000; 
                 for (let i = 0; i < replyText.length; i += maxLength) {
                   const chunk = replyText.slice(i, i + maxLength);
-                  const tgRes = await tgApi('sendMessage', { chat_id: chatId, text: chunk, parse_mode: "Markdown" });
-                  if (!tgRes.ok) await tgApi('sendMessage', { chat_id: chatId, text: chunk });
+                  
+                  const tgRes = await tgApi('sendMessage', {
+                    chat_id: chatId,
+                    text: chunk,
+                    parse_mode: "Markdown"
+                  });
+
+                  if (!tgRes.ok) {
+                    await tgApi('sendMessage', { chat_id: chatId, text: chunk });
+                  }
                 }
               } else {
-                 await tgApi('sendMessage', { chat_id: chatId, text: "⚠️ AI 接口请求失败，请稍后再试或切换模型。" });
+                 await tgApi('sendMessage', { chat_id: chatId, text: "⚠️ AI 接口请求失败，请稍后再试。" });
               }
             }
-          } catch (err) { console.log("后台处理异常:", err); }
+          } catch (err) {
+            console.log("后台处理异常:", err);
+          }
         })());
 
         return new Response('OK', { status: 200 });
-      } catch (error) { return new Response('Error', { status: 500 }); }
+      } catch (error) {
+        return new Response('Error', { status: 500 });
+      }
     }
 
     return new Response('Not Found', { status: 404 });
@@ -415,6 +440,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
     ::-webkit-scrollbar-thumb { background: var(--text-secondary); border-radius: 10px; opacity: 0.2; }
     ::-webkit-scrollbar-thumb:hover { background: var(--brand-color); }
     
+    /* 严格限制视口宽度，防止整页左右晃动 */
     body, html {
       margin: 0; padding: 0; height: 100vh; height: 100dvh; 
       width: 100%; max-width: 100vw; overflow: hidden;
@@ -436,6 +462,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
     .blob-2 { top: 40%; right: -20%; width: 60vw; height: 60vw; background: var(--aurora-2); animation: float2 18s infinite ease-in-out; }
     .blob-3 { bottom: -20%; left: 20%; width: 50vw; height: 50vw; background: var(--aurora-3); animation: float3 20s infinite ease-in-out; }
 
+    /* 防溢出外层容器 */
     .app-container { display: flex; height: 100%; width: 100%; max-width: 100vw; position: relative; overflow: hidden; }
 
     .sidebar {
@@ -477,6 +504,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
 
     .sidebar-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 99; backdrop-filter: blur(4px); opacity: 0; transition: opacity 0.3s; }
 
+    /* 聊天主区域严格防溢出 */
     .chat-area { 
       flex: 1; display: flex; flex-direction: column; position: relative; 
       height: 100%; width: 100%; max-width: 100vw; overflow: hidden; 
@@ -498,9 +526,10 @@ const HTML_CONTENT = `<!DOCTYPE html>
     .menu-toggle:hover { background: var(--hover-bg); }
     
     .messages-container { 
-      flex: 1; overflow-y: auto; overflow-x: hidden;
+      flex: 1; overflow-y: auto; overflow-x: hidden; /* 强制拦截水平滚动 */
       padding: 32px 20px; scroll-behavior: smooth;
-      contain: layout style; will-change: scroll-position; width: 100%;
+      contain: layout style; will-change: scroll-position;
+      width: 100%;
     }
     .messages { max-width: 880px; width: 100%; margin: 0 auto; display: flex; flex-direction: column; gap: 36px; }
     
@@ -513,19 +542,25 @@ const HTML_CONTENT = `<!DOCTYPE html>
     
     .message-row.user { justify-content: flex-end; }
     
+    /* 强制处理超长文本断行 */
     .message-bubble { 
-      line-height: 1.7; word-wrap: break-word; word-break: break-word; overflow-wrap: break-word; 
+      line-height: 1.7; 
+      word-wrap: break-word; word-break: break-word; overflow-wrap: break-word; 
       font-size: 16px; max-width: 100%; 
     }
     
     .message-row.user .message-bubble { 
       background: var(--user-msg); color: var(--user-text); max-width: 80%;
-      padding: 14px 22px; border-radius: 24px 24px 6px 24px; 
-      white-space: pre-wrap; box-shadow: 0 8px 24px -6px rgba(59, 130, 246, 0.25); font-weight: 400;
+      padding: 14px 22px; 
+      border-radius: 24px 24px 6px 24px; 
+      white-space: pre-wrap; 
+      box-shadow: 0 8px 24px -6px rgba(59, 130, 246, 0.25);
+      font-weight: 400;
     }
     .message-row.ai .message-bubble { background: transparent; border: none; box-shadow: none; width: 100%; max-width: 100%; padding: 0; }
     .error-msg .message-bubble { color: #ef4444; }
 
+    /* Markdown 内宽元素防溢出处理 */
     .markdown-body { font-size: 16px; line-height: 1.75; color: var(--text-main); font-family: inherit; word-break: break-word; max-width: 100%; }
     .markdown-body p { margin-top: 0; margin-bottom: 1.2em; }
     .markdown-body p:last-child { margin-bottom: 0; }
@@ -540,8 +575,10 @@ const HTML_CONTENT = `<!DOCTYPE html>
     }
     .markdown-body ul, .markdown-body ol { margin-top: 0; margin-bottom: 1.2em; padding-left: 24px; }
     .markdown-body li { margin-bottom: 0.4em; }
+    
     .markdown-body img, .markdown-body video { max-width: 100%; height: auto; border-radius: 8px; margin-top: 10px; }
 
+    /* 表格支持内部水平滑动，防止撑开页面 */
     .markdown-body table { 
       display: block; overflow-x: auto; white-space: nowrap; 
       width: 100%; max-width: 100%; border-collapse: collapse; margin-bottom: 1.5em; 
@@ -557,6 +594,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
       font-size: 0.85em; color: var(--brand-color); font-weight: 500; word-break: break-all;
     }
     
+    /* 代码块自适应宽度并内部滑动 */
     .code-wrapper { background: #0f172a; border-radius: 14px; overflow: hidden; margin: 20px 0; box-shadow: 0 10px 30px rgba(0,0,0,0.15); border: 1px solid rgba(255,255,255,0.1); max-width: 100%; }
     .code-header {
       display: flex; justify-content: space-between; align-items: center; padding: 10px 16px;
@@ -585,6 +623,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
     .typing-dot:nth-child(2) { animation-delay: -0.16s; }
     @keyframes typing { 0%, 80%, 100% { transform: scale(0); opacity: 0.4; } 40% { transform: scale(1); opacity: 1; } }
 
+    /* 输入框容器 */
     .input-wrapper { padding: 0 24px 32px; max-width: 900px; width: 100%; margin: 0 auto; position: relative; z-index: 10; box-sizing: border-box; }
     .input-box { 
       background: var(--input-bg); backdrop-filter: blur(24px); border: 1px solid var(--glass-border);
@@ -616,10 +655,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
       box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
     }
     .send-btn.active:hover { transform: scale(1.08); box-shadow: 0 6px 16px rgba(59, 130, 246, 0.4); }
-
-    /* 停止生成按钮样式 */
-    .stop-btn { background: #ef4444 !important; color: #fff !important; cursor: pointer; box-shadow: 0 4px 12px rgba(239, 68, 68, 0.3) !important; }
-    .stop-btn:hover { transform: scale(1.08); box-shadow: 0 6px 16px rgba(239, 68, 68, 0.4) !important; }
     
     .input-bottom { display: flex; justify-content: space-between; align-items: center; height: 28px; padding-top: 4px; width: 100%; }
     
@@ -633,6 +668,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
       position: absolute; top: 0; left: 0; width: 100%; height: 100%; opacity: 0; 
       cursor: pointer; border: none; outline: none; -webkit-appearance: none; appearance: none;
     }
+    /* 限制长模型名称截断，防撑开 */
     .model-display-text { font-size: 13px; font-weight: 600; color: var(--text-secondary); pointer-events: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 160px; }
     
     .disclaimer { text-align: center; font-size: 12px; color: var(--text-secondary); opacity: 0.7; margin-top: 16px; font-weight: 500; }
@@ -655,10 +691,8 @@ const HTML_CONTENT = `<!DOCTYPE html>
       width: 100%; padding: 12px 16px; border-radius: 12px; border: 1px solid var(--glass-border);
       background: var(--input-bg); color: var(--text-main); font-size: 15px; outline: none;
       font-weight: 500; transition: all 0.2s; appearance: none;
-      background-repeat: no-repeat; background-position: right 1rem center; background-size: 1em;
-    }
-    select.settings-select {
       background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+      background-repeat: no-repeat; background-position: right 1rem center; background-size: 1em;
     }
     .settings-select:focus { border-color: var(--brand-color); box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1); }
     .settings-btn {
@@ -675,6 +709,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
       .delete-btn { display: block; }
     }
 
+    /* 移动端专属强制限制 */
     @media (max-width: 768px) {
       :root {
         --bg-base: #ffffff;
@@ -741,10 +776,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
         {{MODEL_OPTIONS}}
       </select>
     </div>
-    <div style="margin-top: 16px;">
-      <label style="font-size: 14px; font-weight: 500; color: var(--text-secondary); display: block; margin-bottom: 10px;">访问授权码 (如未配置请留空)</label>
-      <input type="password" id="sitePasswordSetting" class="settings-select" placeholder="仅部署端开启鉴权时填写" autocomplete="new-password">
-    </div>
     <div style="margin-top: 32px; text-align: right;">
       <button id="closeSettingsBtn" class="settings-btn">保存并关闭</button>
     </div>
@@ -769,7 +800,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
           <svg id="themeIcon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
         </button>
       </div>
-      <div style="font-size: 13px; color: var(--text-secondary); font-weight: 600;">Pro v6.0 Max</div>
+      <div style="font-size: 13px; color: var(--text-secondary); font-weight: 600;">Pro v5.0</div>
     </div>
   </div>
 
@@ -798,13 +829,8 @@ const HTML_CONTENT = `<!DOCTYPE html>
       <div class="input-box">
         <div class="input-top">
           <textarea id="userInput" placeholder="输入指令或开始对话..." rows="1"></textarea>
-          <!-- 发送按钮 -->
           <button class="send-btn" id="sendBtn">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
-          </button>
-          <!-- 停止生成按钮 (生成时显示) -->
-          <button class="send-btn stop-btn" id="stopBtn" style="display:none;" title="停止生成">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"></rect></svg>
           </button>
         </div>
         
@@ -826,13 +852,11 @@ const HTML_CONTENT = `<!DOCTYPE html>
 
 <script>
   let isCurrentlyStreaming = false;
-  let currentAbortController = null; // 控制停止生成的控制器
 
   const ESCAPE_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;' };
   const ESCAPE_REG = /[&<>]/g;
   const escapeHtml = str => str.replace(ESCAPE_REG, m => ESCAPE_MAP[m]);
 
-  // [优化6：流式 Markdown 渲染性能]
   const renderer = new marked.Renderer();
   renderer.code = function(code, language) {
     const displayLang = language || 'text';
@@ -840,9 +864,13 @@ const HTML_CONTENT = `<!DOCTYPE html>
     
     let highlightedCode = escapedCode;
     if (!isCurrentlyStreaming && language && hljs.getLanguage(language)) {
-      try { highlightedCode = hljs.highlight(code, { language }).value; } catch (e) {}
+      try {
+        highlightedCode = hljs.highlight(code, { language }).value;
+      } catch (e) {}
     } else if (!isCurrentlyStreaming) {
-      try { highlightedCode = hljs.highlightAuto(code).value; } catch (e) {}
+      try {
+        highlightedCode = hljs.highlightAuto(code).value;
+      } catch (e) {}
     }
     
     return \`
@@ -858,6 +886,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
       </div>
     \`;
   };
+
   marked.setOptions({ breaks: true, renderer: renderer });
 
   document.addEventListener('click', function(e) {
@@ -881,7 +910,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
   const scrollArea = document.getElementById('scrollArea');
   const userInput = document.getElementById('userInput');
   const sendBtn = document.getElementById('sendBtn');
-  const stopBtn = document.getElementById('stopBtn');
   const sessionListDiv = document.getElementById('sessionList');
   const modelSelect = document.getElementById('modelSelect');
   const headerTitle = document.getElementById('headerTitle');
@@ -916,11 +944,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
   userInput.addEventListener('input', function() {
     this.style.height = 'auto';
     this.style.height = Math.min(this.scrollHeight, 200) + 'px';
-    if(this.value.trim().length > 0 && !isCurrentlyStreaming) {
-      sendBtn.classList.add('active');
-    } else {
-      sendBtn.classList.remove('active');
-    }
+    sendBtn.classList.toggle('active', this.value.trim().length > 0);
   });
 
   function init() {
@@ -979,7 +1003,10 @@ const HTML_CONTENT = `<!DOCTYPE html>
 
   function onModelChange() {
     const currentSession = sessions.find(s => s.id === currentSessionId);
-    if(currentSession) { currentSession.model = modelSelect.value; saveSessions(); }
+    if(currentSession) {
+      currentSession.model = modelSelect.value;
+      saveSessions();
+    }
     updateHeaderDisplay();
   }
   modelSelect.addEventListener('change', onModelChange);
@@ -1068,18 +1095,12 @@ const HTML_CONTENT = `<!DOCTYPE html>
     }
     
     scrollArea.scrollTop = scrollArea.scrollHeight; 
+    
     const rBox = bubble.querySelector('.reasoning-box');
     if (rBox) { rBox.scrollTop = rBox.scrollHeight; }
 
     return bubble;
   }
-
-  // [优化3：中断/停止生成功能]
-  stopBtn.addEventListener('click', () => {
-    if (currentAbortController) {
-      currentAbortController.abort();
-    }
-  });
 
   async function sendMessage() {
     const text = userInput.value.trim(); 
@@ -1095,10 +1116,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
     userInput.value = ''; 
     userInput.style.height = 'auto';
     sendBtn.classList.remove('active'); 
-    
-    // UI 切换为生成状态 (显示停止按钮)
-    sendBtn.style.display = 'none';
-    stopBtn.style.display = 'flex';
+    sendBtn.disabled = true;
     statusDot.classList.add('generating'); 
     
     appendMessageDOM('user', text);
@@ -1115,25 +1133,15 @@ const HTML_CONTENT = `<!DOCTYPE html>
     
     const bubble = document.getElementById(aiMsgId);
     isCurrentlyStreaming = true;
-    currentAbortController = new AbortController();
 
     try {
-      // [优化2：截断前端过长历史]
-      let payloadMessages = currentSession.messages;
-      if (payloadMessages.length > 20) {
-        payloadMessages = payloadMessages.slice(-20);
-      }
-
-      // 带上访问密码
-      const headers = { 'Content-Type': 'application/json' };
-      const sitePwd = localStorage.getItem('site_password');
-      if (sitePwd) headers['Authorization'] = \`Bearer \${sitePwd}\`;
-
       const response = await fetch('/api/chat', {
         method: 'POST',
-        headers: headers,
-        signal: currentAbortController.signal,
-        body: JSON.stringify({ messages: payloadMessages, model: modelSelect.value })
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          messages: currentSession.messages,
+          model: modelSelect.value 
+        })
       });
 
       if (!response.ok) { 
@@ -1236,35 +1244,20 @@ const HTML_CONTENT = `<!DOCTYPE html>
       
     } catch (error) {
       isCurrentlyStreaming = false;
-      const tBox = bubble.querySelector('.message-text');
-      const rBox = bubble.querySelector('.reasoning-box');
-
-      // 处理中断逻辑
-      if (error.name === 'AbortError') {
-        aiContent += "\n\n*<span style='color: var(--brand-color); font-size: 13px;'>[已手动停止生成]</span>*";
-        tBox.innerHTML = marked.parse(aiContent);
+      if (aiContent || reasoningContent) {
+        tBox.innerHTML = marked.parse(aiContent) + \`<br><br><span style="color: #ef4444; font-size: 13px; font-weight: 500;">(⚠️ 网络连接中断，已保留当前生成的内容。错误: \${error.message})</span>\`;
         tBox.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
         currentSession.messages.push({ role: 'assistant', content: aiContent });
-        if (!reasoningContent && rBox) rBox.remove();
+        if (rBox && reasoningContent) rBox.remove(); 
       } else {
-        if (aiContent || reasoningContent) {
-          tBox.innerHTML = marked.parse(aiContent) + \`<br><br><span style="color: #ef4444; font-size: 13px; font-weight: 500;">(⚠️ 网络连接中断，已保留当前生成的内容。错误: \${error.message})</span>\`;
-          tBox.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
-          currentSession.messages.push({ role: 'assistant', content: aiContent });
-          if (!reasoningContent && rBox) rBox.remove(); 
-        } else {
-          tBox.innerText = '通信断开: ' + error.message; 
-          bubble.parentElement.classList.add('error-msg');
-          currentSession.messages.pop(); 
-        }
+        bubble.querySelector('.message-text').innerText = '通信断开: ' + error.message; 
+        bubble.parentElement.classList.add('error-msg');
+        currentSession.messages.pop(); 
       }
       saveSessions();
     } finally {
       isCurrentlyStreaming = false;
-      currentAbortController = null;
-      // UI 恢复发送状态
-      stopBtn.style.display = 'none';
-      sendBtn.style.display = 'flex';
+      sendBtn.disabled = false; 
       statusDot.classList.remove('generating'); 
       if (userInput.value.trim().length > 0) sendBtn.classList.add('active'); 
       userInput.focus();
@@ -1276,13 +1269,9 @@ const HTML_CONTENT = `<!DOCTYPE html>
   const settingsToggle = document.getElementById('settingsToggle');
   const closeSettingsBtn = document.getElementById('closeSettingsBtn');
   const defaultModelSetting = document.getElementById('defaultModelSetting');
-  const sitePasswordSetting = document.getElementById('sitePasswordSetting');
 
   if (defaultModelSetting) {
     defaultModelSetting.value = localStorage.getItem('default_model') || (modelSelect.options.length > 0 ? modelSelect.options[0].value : "");
-  }
-  if (sitePasswordSetting) {
-    sitePasswordSetting.value = localStorage.getItem('site_password') || "";
   }
 
   settingsToggle.addEventListener('click', () => {
@@ -1292,9 +1281,9 @@ const HTML_CONTENT = `<!DOCTYPE html>
 
   closeSettingsBtn.addEventListener('click', () => {
     settingsModal.classList.remove('active');
-    if (defaultModelSetting.value) localStorage.setItem('default_model', defaultModelSetting.value);
-    if (sitePasswordSetting) localStorage.setItem('site_password', sitePasswordSetting.value);
-    
+    if (defaultModelSetting.value) {
+      localStorage.setItem('default_model', defaultModelSetting.value);
+    }
     setTimeout(() => settingsModal.style.display = 'none', 300);
   });
 
