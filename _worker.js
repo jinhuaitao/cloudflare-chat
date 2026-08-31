@@ -655,6 +655,22 @@ const HTML_CONTENT = `<!DOCTYPE html>
       box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
     }
     .send-btn.active:hover { transform: scale(1.08); box-shadow: 0 6px 16px rgba(59, 130, 246, 0.4); }
+
+    /* 发送按钮 - 停止生成状态 */
+    .send-btn.stop-mode { 
+      background: rgba(239, 68, 68, 0.1); 
+      color: #ef4444; 
+      cursor: pointer; 
+      box-shadow: none;
+    }
+    .send-btn.stop-mode:hover { 
+      background: rgba(239, 68, 68, 0.2); 
+      transform: scale(1.08); 
+    }
+    .send-btn.stop-mode svg {
+      fill: #ef4444;
+      stroke: #ef4444;
+    }
     
     .input-bottom { display: flex; justify-content: space-between; align-items: center; height: 28px; padding-top: 4px; width: 100%; }
     
@@ -852,6 +868,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
 
 <script>
   let isCurrentlyStreaming = false;
+  let currentAbortController = null; // 新增：用于存储当前的请求控制器
 
   const ESCAPE_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;' };
   const ESCAPE_REG = /[&<>]/g;
@@ -1104,7 +1121,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
 
   async function sendMessage() {
     const text = userInput.value.trim(); 
-    if (!text) return;
+    if (!text && !isCurrentlyStreaming) return;
     
     const currentSession = sessions.find(s => s.id === currentSessionId);
     if (currentSession.messages.length === 0) {
@@ -1115,8 +1132,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
     emptyState.style.display = 'none'; 
     userInput.value = ''; 
     userInput.style.height = 'auto';
-    sendBtn.classList.remove('active'); 
-    sendBtn.disabled = true;
     statusDot.classList.add('generating'); 
     
     appendMessageDOM('user', text);
@@ -1133,6 +1148,12 @@ const HTML_CONTENT = `<!DOCTYPE html>
     
     const bubble = document.getElementById(aiMsgId);
     isCurrentlyStreaming = true;
+    
+    // 初始化 AbortController 并切换按钮为“停止”状态
+    currentAbortController = new AbortController();
+    sendBtn.classList.remove('active');
+    sendBtn.classList.add('stop-mode');
+    sendBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12" rx="2" ry="2"></rect></svg>';
 
     try {
       const response = await fetch('/api/chat', {
@@ -1141,7 +1162,8 @@ const HTML_CONTENT = `<!DOCTYPE html>
         body: JSON.stringify({ 
           messages: currentSession.messages,
           model: modelSelect.value 
-        })
+        }),
+        signal: currentAbortController.signal // 绑定中断信号
       });
 
       if (!response.ok) { 
@@ -1232,7 +1254,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
       }
 
       isCurrentlyStreaming = false;
-
       if (!reasoningContent && rBox) rBox.remove();
       
       tBox.innerHTML = marked.parse(aiContent);
@@ -1244,26 +1265,59 @@ const HTML_CONTENT = `<!DOCTYPE html>
       
     } catch (error) {
       isCurrentlyStreaming = false;
-      if (aiContent || reasoningContent) {
-        tBox.innerHTML = marked.parse(aiContent) + \`<br><br><span style="color: #ef4444; font-size: 13px; font-weight: 500;">(⚠️ 网络连接中断，已保留当前生成的内容。错误: \${error.message})</span>\`;
-        tBox.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
-        currentSession.messages.push({ role: 'assistant', content: aiContent });
-        if (rBox && reasoningContent) rBox.remove(); 
+      const tBox = bubble.querySelector('.message-text');
+      
+      // 判断是否是主动打断的请求
+      if (error.name === 'AbortError') {
+        const interruptNote = '<br><br><span style="color: var(--text-secondary); font-size: 13px; font-weight: 500;">(🛑 生成已手动中止)</span>';
+        tBox.innerHTML = marked.parse(aiContent || '已中止') + interruptNote;
+        if (aiContent) currentSession.messages.push({ role: 'assistant', content: aiContent });
       } else {
-        bubble.querySelector('.message-text').innerText = '通信断开: ' + error.message; 
-        bubble.parentElement.classList.add('error-msg');
-        currentSession.messages.pop(); 
+        if (aiContent || reasoningContent) {
+          tBox.innerHTML = marked.parse(aiContent) + \`<br><br><span style="color: #ef4444; font-size: 13px; font-weight: 500;">(⚠️ 网络连接中断，已保留当前生成的内容。错误: \${error.message})</span>\`;
+          currentSession.messages.push({ role: 'assistant', content: aiContent });
+          if (rBox && reasoningContent) rBox.remove(); 
+        } else {
+          tBox.innerText = '通信断开: ' + error.message; 
+          bubble.parentElement.classList.add('error-msg');
+          currentSession.messages.pop(); 
+        }
       }
+      tBox.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
       saveSessions();
     } finally {
       isCurrentlyStreaming = false;
-      sendBtn.disabled = false; 
+      currentAbortController = null;
       statusDot.classList.remove('generating'); 
+      
+      // 还原发送按钮为纸飞机状态
+      sendBtn.classList.remove('stop-mode');
+      sendBtn.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>';
+      
       if (userInput.value.trim().length > 0) sendBtn.classList.add('active'); 
       userInput.focus();
     }
   }
 
+  // 修改事件监听逻辑，实现点击切换停止或发送
+  sendBtn.addEventListener('click', () => {
+    if (isCurrentlyStreaming && currentAbortController) {
+      currentAbortController.abort(); // 发送打断信号
+    } else {
+      sendMessage();
+    }
+  });
+
+  userInput.addEventListener('keydown', (e) => { 
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault(); 
+      // 在正在生成时不允许敲击回车再次发送
+      if (sendBtn.classList.contains('active') && !isCurrentlyStreaming) { 
+        sendMessage(); 
+      }
+    } 
+  });
+  
   // ========== 设置面板交互逻辑 ==========
   const settingsModal = document.getElementById('settingsModal');
   const settingsToggle = document.getElementById('settingsToggle');
@@ -1292,13 +1346,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
   });
 
   document.getElementById('newChatBtn').addEventListener('click', createNewSession);
-  sendBtn.addEventListener('click', sendMessage);
-  userInput.addEventListener('keydown', (e) => { 
-    if (e.key === 'Enter' && !e.shiftKey && sendBtn.classList.contains('active')) { 
-      e.preventDefault(); 
-      sendMessage(); 
-    } 
-  });
   
   init();
 </script>
