@@ -111,6 +111,42 @@ export default {
       return new Response('b7aa7e3069358c2c18f7908a7d5815788bafd020', { headers: TEXT_HEADERS });
     }
 
+    // ======= PWA 路由支持 =======
+    if (request.method === 'GET' && url.pathname === '/manifest.json') {
+      const manifest = {
+        "name": "AI Assistant Pro",
+        "short_name": "AI Pro",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#f8fafc",
+        "theme_color": "#3b82f6",
+        "icons": [
+          {
+            "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1024 1024'%3E%3Cpath d='M512 0c282.77 0 512 229.23 512 512s-229.23 512-512 512S0 794.77 0 512 229.23 0 512 0z' fill='%233b82f6'/%3E%3Cpath d='M768 512a256 256 0 1 1-512 0 256 256 0 0 1 512 0z' fill='%23ffffff'/%3E%3C/svg%3E",
+            "sizes": "512x512",
+            "type": "image/svg+xml",
+            "purpose": "any maskable"
+          }
+        ]
+      };
+      return new Response(JSON.stringify(manifest), { headers: { 'Content-Type': 'application/manifest+json;charset=UTF-8' } });
+    }
+
+    if (request.method === 'GET' && url.pathname === '/sw.js') {
+      const swCode = `
+const CACHE_NAME = 'ai-pro-cache-v1';
+self.addEventListener('install', e => {
+  e.waitUntil(caches.open(CACHE_NAME).then(c => c.addAll(['/'])));
+});
+self.addEventListener('fetch', e => {
+  if (e.request.url.includes('/api/')) return;
+  e.respondWith(caches.match(e.request).then(res => res || fetch(e.request)));
+});
+      `;
+      return new Response(swCode, { headers: { 'Content-Type': 'application/javascript;charset=UTF-8' } });
+    }
+    // ======= PWA 路由结束 =======
+
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: CORS_HEADERS });
     }
@@ -389,6 +425,12 @@ const HTML_CONTENT = `<!DOCTYPE html>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>AI Assistant Pro</title>
   
+  <!-- PWA 支持标签 -->
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#3b82f6">
+  <link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1024 1024'%3E%3Cpath d='M512 0c282.77 0 512 229.23 512 512s-229.23 512-512 512S0 794.77 0 512 229.23 0 512 0z' fill='%233b82f6'/%3E%3Cpath d='M768 512a256 256 0 1 1-512 0 256 256 0 0 1 512 0z' fill='%23ffffff'/%3E%3C/svg%3E">
+  <!-- PWA 支持标签结束 -->
+
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
@@ -1347,6 +1389,13 @@ const HTML_CONTENT = `<!DOCTYPE html>
 
   document.getElementById('newChatBtn').addEventListener('click', createNewSession);
   
+  // PWA Service Worker 自动注册
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('/sw.js').catch(err => console.log('SW registration failed:', err));
+    });
+  }
+
   init();
 </script>
 </body>
