@@ -29,11 +29,41 @@ function parseCommaSeparated(str) {
   return str.split(',').map(s => s.trim()).filter(Boolean);
 }
 
+// 辅助函数：API 密钥容灾重试 (自动打乱顺序并跳过失效 Key)
+async function fetchWithRetry(url, payload, keys) {
+  // 如果没有 key，依然尝试发出无 auth 请求
+  const attemptKeys = keys && keys.length > 0 ? [...keys].sort(() => Math.random() - 0.5) : [""];
+  let lastResponse = null;
+  let lastError = null;
+
+  for (let key of attemptKeys) {
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Authorization': key ? `Bearer ${key}` : '',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
+
+      // 401: 未授权, 429: 限流, 5xx: 服务端异常 -> 尝试下一个 Key
+      if (response.status === 401 || response.status === 429 || response.status >= 500) {
+        lastResponse = response;
+        continue;
+      }
+      return response; // 请求成功或其他业务错误 (如 400)，直接返回
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  if (lastResponse) return lastResponse;
+  throw lastError || new Error("所有 API Key 均已失效或网络异常");
+}
+
 // ======= 统一解析通道配置（带内存缓存） =======
 function getChannelConfig(env) {
-  if (cachedConfig && cachedEnvRef === env) {
-    return cachedConfig;
-  }
+  if (cachedConfig && cachedEnvRef === env) return cachedConfig;
 
   const models = [];
   const modelMap = new Map();
@@ -44,7 +74,6 @@ function getChannelConfig(env) {
     for (let i = 0; i < arr.length; i++) {
       const raw = arr[i].trim();
       if (!raw) continue;
-      
       const colonIdx = raw.lastIndexOf(':');
       const id = colonIdx > 0 ? raw.substring(0, colonIdx).trim() : raw;
       const name = colonIdx > 0 ? raw.substring(colonIdx + 1).trim() : raw;
@@ -94,7 +123,6 @@ function getChannelConfig(env) {
   const fallbackUrl = env.API_URL || "";
   const fallbackKeys = parseCommaSeparated(env.API_KEY);
   const fallbackModelStr = env.MODEL || "meta/llama3-70b-instruct:Llama 3 70B,deepseek-ai/DeepSeek-R1:深度思考 R1";
-  
   addModels(fallbackModelStr, fallbackUrl, fallbackKeys);
 
   cachedConfig = { models, modelMap };
@@ -115,8 +143,17 @@ export default {
       return new Response(null, { headers: CORS_HEADERS });
     }
 
+    // AI 对话核心接口
     if (request.method === 'POST' && url.pathname === '/api/chat') {
       try {
+        // [鉴权机制] Web 端访问密码保护
+        if (env.SITE_PASSWORD) {
+          const authHeader = request.headers.get('Authorization');
+          if (authHeader !== `Bearer ${env.SITE_PASSWORD}`) {
+            return new Response(JSON.stringify({ error: "401 Unauthorized: 访问密码错误或未授权访问，请在设置中配置正确的密码" }), { status: 401, headers: CORS_HEADERS });
+          }
+        }
+
         let body;
         try {
           body = await request.json();
@@ -132,12 +169,10 @@ export default {
         }
 
         const channel = modelMap.get(selectedModel);
-
         if (!channel || !channel.url) {
           return new Response(JSON.stringify({ error: "该模型对应的 API_URL 未配置或异常" }), { status: 500, headers: CORS_HEADERS });
         }
 
-        const currentApiKey = channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
         const apiUrl = channel.url;
         const isImageAPI = apiUrl.includes('images/generations') || selectedModel.toLowerCase().includes('image');
 
@@ -147,19 +182,13 @@ export default {
           n: 1
         } : {
           model: selectedModel,
-          messages: body.messages,
+          messages: body.messages, // 前端已做了上下文截断处理
           stream: true,
           max_tokens: 4096, 
         };
 
-        const nvidiaResponse = await fetch(apiUrl, {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${currentApiKey}`, 
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(payload),
-        });
+        // [容灾机制] 带重试和备用密钥的请求
+        const nvidiaResponse = await fetchWithRetry(apiUrl, payload, channel.keys);
 
         if (!nvidiaResponse.ok) {
           const errText = await nvidiaResponse.text();
@@ -200,7 +229,6 @@ export default {
 
     if (request.method === 'GET' && url.pathname === '/') {
       const { models } = getChannelConfig(env);
-      
       let optionsHtml = '';
       for (let i = 0; i < models.length; i++) {
         const item = models[i];
@@ -211,7 +239,11 @@ export default {
         optionsHtml += `<option value="${item.id}" ${i === 0 ? 'selected' : ''}>${displayName}</option>`;
       }
 
-      const html = HTML_CONTENT.replaceAll('{{MODEL_OPTIONS}}', optionsHtml);
+      // 根据环境变量决定是否在前端展示密码输入框
+      const authSettingDisplay = env.SITE_PASSWORD ? 'block' : 'none';
+      let html = HTML_CONTENT.replaceAll('{{MODEL_OPTIONS}}', optionsHtml);
+      html = html.replaceAll('{{AUTH_SETTING_DISPLAY}}', authSettingDisplay);
+      
       return new Response(html, { headers: HTML_HEADERS });
     }
 
@@ -253,7 +285,6 @@ export default {
                   }).catch(() => {});
                 }
               }
-
               tgApi('answerCallbackQuery', { callback_query_id: cb.id }).catch(() => {});
               return;
             }
@@ -266,7 +297,6 @@ export default {
                 const inline_keyboard = modelObjList.map((model, index) => {
                   return [{ text: model.name, callback_data: `M:${index}` }];
                 });
-
                 await tgApi('sendMessage', {
                   chat_id: chatId,
                   text: "⚙️ **请选择对话要使用的 AI 模型:**",
@@ -285,54 +315,44 @@ export default {
               }
 
               const channel = modelMap.get(targetModelId) || modelMap.values().next().value;
-              const currentApiKey = channel && channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
               const apiUrl = channel ? channel.url : "";
 
-              const sendActionPromise = tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
-
-              const pendingMsgPromise = tgApi('sendMessage', {
-                chat_id: chatId,
-                text: "⏳ _正在思考并生成内容，请稍候..._",
-                parse_mode: "Markdown"
-              }).then(async res => {
-                if (res.ok) {
-                  const data = await res.json();
-                  return data.result?.message_id;
-                }
-                return null;
-              }).catch(() => null);
-
-              const [, pendingMsgId] = await Promise.all([sendActionPromise, pendingMsgPromise]);
-
               if (!apiUrl) {
-                if (pendingMsgId) {
-                  tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {});
-                }
                 await tgApi('sendMessage', { chat_id: chatId, text: "⚠️ 此模型的 API 接口未配置。" });
                 return;
               }
 
+              const sendActionPromise = tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
+              const pendingMsgPromise = tgApi('sendMessage', {
+                chat_id: chatId,
+                text: "⏳ _正在思考并生成内容，请稍候..._",
+                parse_mode: "Markdown"
+              }).then(async res => res.ok ? (await res.json()).result?.message_id : null).catch(() => null);
+
+              const [, pendingMsgId] = await Promise.all([sendActionPromise, pendingMsgPromise]);
+
               const isImageAPI = apiUrl.includes('images/generations') || targetModelId.toLowerCase().includes('image');
               
+              // [TG 记忆增强] 获取历史对话记录 (仅取最近 10 条)
+              let tgHistory = [];
+              if (!isImageAPI && env.KV) {
+                try {
+                  const rawHistory = await env.KV.get(`tg_history_${chatId}`);
+                  if (rawHistory) tgHistory = JSON.parse(rawHistory);
+                } catch(e) {}
+              }
+
+              tgHistory.push({ role: "user", content: userText });
+              if (tgHistory.length > 10) tgHistory = tgHistory.slice(-10);
+
               const payload = isImageAPI ? {
-                model: targetModelId,
-                prompt: userText,
-                n: 1
+                model: targetModelId, prompt: userText, n: 1
               } : {
-                model: targetModelId,
-                messages: [{ role: "user", content: userText }],
-                stream: false, 
-                max_tokens: 4096
+                model: targetModelId, messages: tgHistory, stream: false, max_tokens: 4096
               };
 
-              const aiResponse = await fetch(apiUrl, {
-                method: 'POST',
-                headers: {
-                  'Authorization': `Bearer ${currentApiKey}`, 
-                  'Content-Type': 'application/json',
-                },
-                body: JSON.stringify(payload),
-              });
+              // [容灾机制] TG 机器人请求带重试
+              const aiResponse = await fetchWithRetry(apiUrl, payload, channel.keys).catch(() => ({ ok: false }));
 
               if (pendingMsgId) {
                 ctx.waitUntil(tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {}));
@@ -348,22 +368,22 @@ export default {
                   replyText = `[🖼️ 点击查看生成的图片](${aiData.data[0].url})`;
                 }
 
+                // 保存 AI 响应到历史记录
+                if (!isImageAPI && env.KV && aiData.choices && aiData.choices[0]?.message) {
+                  tgHistory.push({ role: "assistant", content: replyText });
+                  if (tgHistory.length > 10) tgHistory = tgHistory.slice(-10);
+                  // 24小时 (86400秒) 过期机制
+                  ctx.waitUntil(env.KV.put(`tg_history_${chatId}`, JSON.stringify(tgHistory), { expirationTtl: 86400 }).catch(() => {}));
+                }
+
                 const maxLength = 4000; 
                 for (let i = 0; i < replyText.length; i += maxLength) {
                   const chunk = replyText.slice(i, i + maxLength);
-                  
-                  const tgRes = await tgApi('sendMessage', {
-                    chat_id: chatId,
-                    text: chunk,
-                    parse_mode: "Markdown"
-                  });
-
-                  if (!tgRes.ok) {
-                    await tgApi('sendMessage', { chat_id: chatId, text: chunk });
-                  }
+                  const tgRes = await tgApi('sendMessage', { chat_id: chatId, text: chunk, parse_mode: "Markdown" });
+                  if (!tgRes.ok) await tgApi('sendMessage', { chat_id: chatId, text: chunk });
                 }
               } else {
-                 await tgApi('sendMessage', { chat_id: chatId, text: "⚠️ AI 接口请求失败，请稍后再试。" });
+                 await tgApi('sendMessage', { chat_id: chatId, text: "⚠️ AI 接口请求失败或余额不足，请稍后再试。" });
               }
             }
           } catch (err) {
@@ -440,7 +460,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
     ::-webkit-scrollbar-thumb { background: var(--text-secondary); border-radius: 10px; opacity: 0.2; }
     ::-webkit-scrollbar-thumb:hover { background: var(--brand-color); }
     
-    /* 严格限制视口宽度，防止整页左右晃动 */
     body, html {
       margin: 0; padding: 0; height: 100vh; height: 100dvh; 
       width: 100%; max-width: 100vw; overflow: hidden;
@@ -462,7 +481,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
     .blob-2 { top: 40%; right: -20%; width: 60vw; height: 60vw; background: var(--aurora-2); animation: float2 18s infinite ease-in-out; }
     .blob-3 { bottom: -20%; left: 20%; width: 50vw; height: 50vw; background: var(--aurora-3); animation: float3 20s infinite ease-in-out; }
 
-    /* 防溢出外层容器 */
     .app-container { display: flex; height: 100%; width: 100%; max-width: 100vw; position: relative; overflow: hidden; }
 
     .sidebar {
@@ -504,11 +522,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
 
     .sidebar-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 99; backdrop-filter: blur(4px); opacity: 0; transition: opacity 0.3s; }
 
-    /* 聊天主区域严格防溢出 */
-    .chat-area { 
-      flex: 1; display: flex; flex-direction: column; position: relative; 
-      height: 100%; width: 100%; max-width: 100vw; overflow: hidden; 
-    }
+    .chat-area { flex: 1; display: flex; flex-direction: column; position: relative; height: 100%; width: 100%; max-width: 100vw; overflow: hidden; }
     
     .header { height: 70px; display: flex; align-items: center; padding: 0 24px; border-bottom: 1px solid var(--glass-border); background: var(--glass-bg); backdrop-filter: blur(20px); z-index: 10; }
     .header-inner { max-width: 880px; margin: 0 auto; width: 100%; display: flex; align-items: center; }
@@ -526,10 +540,8 @@ const HTML_CONTENT = `<!DOCTYPE html>
     .menu-toggle:hover { background: var(--hover-bg); }
     
     .messages-container { 
-      flex: 1; overflow-y: auto; overflow-x: hidden; /* 强制拦截水平滚动 */
-      padding: 32px 20px; scroll-behavior: smooth;
-      contain: layout style; will-change: scroll-position;
-      width: 100%;
+      flex: 1; overflow-y: auto; overflow-x: hidden; padding: 32px 20px; scroll-behavior: smooth;
+      contain: layout style; will-change: scroll-position; width: 100%;
     }
     .messages { max-width: 880px; width: 100%; margin: 0 auto; display: flex; flex-direction: column; gap: 36px; }
     
@@ -542,25 +554,17 @@ const HTML_CONTENT = `<!DOCTYPE html>
     
     .message-row.user { justify-content: flex-end; }
     
-    /* 强制处理超长文本断行 */
-    .message-bubble { 
-      line-height: 1.7; 
-      word-wrap: break-word; word-break: break-word; overflow-wrap: break-word; 
-      font-size: 16px; max-width: 100%; 
-    }
+    .message-bubble { line-height: 1.7; word-wrap: break-word; word-break: break-word; overflow-wrap: break-word; font-size: 16px; max-width: 100%; }
     
     .message-row.user .message-bubble { 
       background: var(--user-msg); color: var(--user-text); max-width: 80%;
-      padding: 14px 22px; 
-      border-radius: 24px 24px 6px 24px; 
-      white-space: pre-wrap; 
-      box-shadow: 0 8px 24px -6px rgba(59, 130, 246, 0.25);
-      font-weight: 400;
+      padding: 14px 22px; border-radius: 24px 24px 6px 24px; 
+      white-space: pre-wrap; box-shadow: 0 8px 24px -6px rgba(59, 130, 246, 0.25); font-weight: 400;
     }
     .message-row.ai .message-bubble { background: transparent; border: none; box-shadow: none; width: 100%; max-width: 100%; padding: 0; }
     .error-msg .message-bubble { color: #ef4444; }
 
-    /* Markdown 内宽元素防溢出处理 */
+    /* Markdown 元素防溢出处理 */
     .markdown-body { font-size: 16px; line-height: 1.75; color: var(--text-main); font-family: inherit; word-break: break-word; max-width: 100%; }
     .markdown-body p { margin-top: 0; margin-bottom: 1.2em; }
     .markdown-body p:last-child { margin-bottom: 0; }
@@ -575,10 +579,9 @@ const HTML_CONTENT = `<!DOCTYPE html>
     }
     .markdown-body ul, .markdown-body ol { margin-top: 0; margin-bottom: 1.2em; padding-left: 24px; }
     .markdown-body li { margin-bottom: 0.4em; }
-    
     .markdown-body img, .markdown-body video { max-width: 100%; height: auto; border-radius: 8px; margin-top: 10px; }
 
-    /* 表格支持内部水平滑动，防止撑开页面 */
+    /* 表格支持内部水平滑动 */
     .markdown-body table { 
       display: block; overflow-x: auto; white-space: nowrap; 
       width: 100%; max-width: 100%; border-collapse: collapse; margin-bottom: 1.5em; 
@@ -608,6 +611,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
     .code-wrapper pre { background: transparent !important; margin: 0 !important; padding: 20px; overflow-x: auto; border-radius: 0; box-shadow: none; max-width: 100%; }
     .code-wrapper pre code { background: transparent; padding: 0; color: #e2e8f0; font-size: 14px; line-height: 1.6; font-family: 'SFMono-Regular', Consolas, monospace; word-break: normal; }
 
+    /* 还原原始样式：思考过程框 */
     .reasoning-box {
       font-size: 14px; color: var(--text-secondary); background: rgba(128,128,128,0.05);
       padding: 12px 16px; border-radius: 12px; border-left: 3px solid var(--brand-color);
@@ -623,19 +627,25 @@ const HTML_CONTENT = `<!DOCTYPE html>
     .typing-dot:nth-child(2) { animation-delay: -0.16s; }
     @keyframes typing { 0%, 80%, 100% { transform: scale(0); opacity: 0.4; } 40% { transform: scale(1); opacity: 1; } }
 
+    /* 停止生成按钮悬浮在上方 */
+    .stop-btn {
+      position: absolute; top: -45px; left: 50%; transform: translateX(-50%);
+      background: var(--input-bg); border: 1px solid var(--glass-border); color: var(--text-main); 
+      padding: 6px 16px; border-radius: 20px; font-size: 13px; font-weight: 500;
+      display: none; cursor: pointer; box-shadow: 0 4px 12px rgba(0,0,0,0.08); z-index: 20;
+      align-items: center; gap: 6px; backdrop-filter: blur(10px); transition: all 0.2s;
+    }
+    .stop-btn:hover { background: var(--hover-bg); color: #ef4444; }
+
     /* 输入框容器 */
     .input-wrapper { padding: 0 24px 32px; max-width: 900px; width: 100%; margin: 0 auto; position: relative; z-index: 10; box-sizing: border-box; }
     .input-box { 
       background: var(--input-bg); backdrop-filter: blur(24px); border: 1px solid var(--glass-border);
       border-radius: 24px; padding: 14px 18px; display: flex; flex-direction: column; gap: 8px; 
       box-shadow: 0 12px 40px rgba(0,0,0,0.06), 0 2px 10px rgba(0,0,0,0.02); transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1); 
-      width: 100%;
+      width: 100%; position: relative;
     }
-    .input-box:focus-within { 
-      border-color: var(--brand-color); 
-      box-shadow: 0 12px 40px rgba(59, 130, 246, 0.12), 0 0 0 3px rgba(59, 130, 246, 0.1); 
-      transform: translateY(-2px); 
-    }
+    .input-box:focus-within { border-color: var(--brand-color); box-shadow: 0 12px 40px rgba(59, 130, 246, 0.12), 0 0 0 3px rgba(59, 130, 246, 0.1); transform: translateY(-2px); }
     
     .input-top { display: flex; align-items: flex-end; gap: 12px; }
     textarea { 
@@ -650,10 +660,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
       color: var(--text-secondary); display: flex; align-items: center; justify-content: center; 
       cursor: not-allowed; transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1); flex-shrink: 0; margin-bottom: 2px; 
     }
-    .send-btn.active { 
-      background: var(--brand-gradient); color: #ffffff; cursor: pointer; 
-      box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
-    }
+    .send-btn.active { background: var(--brand-gradient); color: #ffffff; cursor: pointer; box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3); }
     .send-btn.active:hover { transform: scale(1.08); box-shadow: 0 6px 16px rgba(59, 130, 246, 0.4); }
     
     .input-bottom { display: flex; justify-content: space-between; align-items: center; height: 28px; padding-top: 4px; width: 100%; }
@@ -668,7 +675,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
       position: absolute; top: 0; left: 0; width: 100%; height: 100%; opacity: 0; 
       cursor: pointer; border: none; outline: none; -webkit-appearance: none; appearance: none;
     }
-    /* 限制长模型名称截断，防撑开 */
     .model-display-text { font-size: 13px; font-weight: 600; color: var(--text-secondary); pointer-events: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 160px; }
     
     .disclaimer { text-align: center; font-size: 12px; color: var(--text-secondary); opacity: 0.7; margin-top: 16px; font-weight: 500; }
@@ -687,14 +693,16 @@ const HTML_CONTENT = `<!DOCTYPE html>
       width: 360px; max-width: 90%; transform: scale(0.95) translateY(10px); transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
     }
     .settings-modal-overlay.active .settings-box { transform: scale(1) translateY(0); }
-    .settings-select {
+    .settings-select, .settings-input {
       width: 100%; padding: 12px 16px; border-radius: 12px; border: 1px solid var(--glass-border);
       background: var(--input-bg); color: var(--text-main); font-size: 15px; outline: none;
-      font-weight: 500; transition: all 0.2s; appearance: none;
-      background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+      font-weight: 500; transition: all 0.2s; box-sizing: border-box;
+    }
+    .settings-select {
+      appearance: none; background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
       background-repeat: no-repeat; background-position: right 1rem center; background-size: 1em;
     }
-    .settings-select:focus { border-color: var(--brand-color); box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1); }
+    .settings-select:focus, .settings-input:focus { border-color: var(--brand-color); box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1); }
     .settings-btn {
       background: var(--brand-gradient); color: #fff; border: none; padding: 10px 24px;
       border-radius: 12px; cursor: pointer; font-size: 15px; font-weight: 600; transition: all 0.2s;
@@ -711,46 +719,28 @@ const HTML_CONTENT = `<!DOCTYPE html>
 
     /* 移动端专属强制限制 */
     @media (max-width: 768px) {
-      :root {
-        --bg-base: #ffffff;
-        --glass-bg: #ffffff;
-        --glass-border: #e5e5e5;
-        --glass-shadow: none;
-        --input-bg: #f8fafc;
-      }
-      [data-theme="dark"] {
-        --bg-base: #0f172a;
-        --glass-bg: #0f172a;
-        --glass-border: #334155;
-        --input-bg: #1e293b;
-      }
-
+      :root { --bg-base: #ffffff; --glass-bg: #ffffff; --glass-border: #e5e5e5; --glass-shadow: none; --input-bg: #f8fafc; }
+      [data-theme="dark"] { --bg-base: #0f172a; --glass-bg: #0f172a; --glass-border: #334155; --input-bg: #1e293b; }
       body, html { background-color: var(--bg-base); }
       .app-container { display: flex; flex-direction: column; padding: 0; background: var(--bg-base); width: 100%; height: 100%; overflow: hidden; }
       .aurora-bg { display: none; }
-      
       .sidebar { border-radius: 0; box-shadow: none; position: absolute; top: 0; left: 0; height: 100%; z-index: 100; border-right: 1px solid var(--glass-border); width: 280px; max-width: 85vw; transform: translateX(-100%); transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1); }
       .sidebar.open { transform: translateX(0); }
       .new-chat-btn { background: var(--input-bg); }
       .session-item.active { background: var(--hover-bg); }
       .delete-btn { display: block; opacity: 1; color: var(--text-secondary); background: none; }
-      
       .sidebar-overlay { backdrop-filter: none; -webkit-backdrop-filter: none; }
       .sidebar-overlay.active { display: block; opacity: 1; }
-      
       .chat-area { background: transparent; border: none; box-shadow: none; border-radius: 0; width: 100%; overflow: hidden; }
       .header { border-bottom: 1px solid transparent; height: 60px; padding: 0 16px; justify-content: flex-start; }
       .header-title { display: none; }
       .menu-toggle { display: flex; }
-      
       .messages-container { padding: 0; width: 100%; overflow-x: hidden; }
       .messages { padding: 24px 16px; gap: 32px; max-width: 100vw; width: 100%; overflow-x: hidden; box-sizing: border-box; }
       .message-row.user .message-bubble { border-radius: 22px 22px 4px 22px; max-width: 92%; }
-      
       .input-wrapper { padding: 8px 16px 12px 16px; padding-bottom: max(16px, env(safe-area-inset-bottom)); width: 100%; max-width: 100vw; background: var(--bg-base); box-sizing: border-box; }
       .input-box { border: 1px solid var(--glass-border); box-shadow: 0 -4px 20px rgba(0,0,0,0.03); border-radius: 24px; padding: 12px 16px 16px 16px; gap: 12px; width: 100%; box-sizing: border-box; }
       .input-box:focus-within { transform: none; }
-      
       .send-btn.active:hover { transform: none; }
       .input-bottom { min-height: 28px; }
       .disclaimer { margin-top: 12px; }
@@ -776,6 +766,13 @@ const HTML_CONTENT = `<!DOCTYPE html>
         {{MODEL_OPTIONS}}
       </select>
     </div>
+    
+    <!-- 动态展示鉴权密码框 -->
+    <div style="margin-top: 20px; display: {{AUTH_SETTING_DISPLAY}};">
+      <label style="font-size: 14px; font-weight: 500; color: var(--text-secondary); display: block; margin-bottom: 10px;">访问授权密码</label>
+      <input type="password" id="sitePasswordSetting" class="settings-input" placeholder="输入服务端配置的访问密码" />
+    </div>
+
     <div style="margin-top: 32px; text-align: right;">
       <button id="closeSettingsBtn" class="settings-btn">保存并关闭</button>
     </div>
@@ -800,7 +797,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
           <svg id="themeIcon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
         </button>
       </div>
-      <div style="font-size: 13px; color: var(--text-secondary); font-weight: 600;">Pro v5.0</div>
+      <div style="font-size: 13px; color: var(--text-secondary); font-weight: 600;">Pro Max版</div>
     </div>
   </div>
 
@@ -826,6 +823,11 @@ const HTML_CONTENT = `<!DOCTYPE html>
     </div>
 
     <div class="input-wrapper">
+      <button id="stopBtn" class="stop-btn">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"></rect></svg>
+        停止生成
+      </button>
+      
       <div class="input-box">
         <div class="input-top">
           <textarea id="userInput" placeholder="输入指令或开始对话..." rows="1"></textarea>
@@ -852,25 +854,24 @@ const HTML_CONTENT = `<!DOCTYPE html>
 
 <script>
   let isCurrentlyStreaming = false;
+  let currentAbortController = null; // 用于控制停止生成
 
   const ESCAPE_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;' };
   const ESCAPE_REG = /[&<>]/g;
   const escapeHtml = str => str.replace(ESCAPE_REG, m => ESCAPE_MAP[m]);
 
+  // 渲染性能优化：增量且延迟应用重计算的 Markdown 渲染引擎
   const renderer = new marked.Renderer();
   renderer.code = function(code, language) {
     const displayLang = language || 'text';
     const escapedCode = escapeHtml(code);
     
     let highlightedCode = escapedCode;
+    // 仅在非流式输出 (生成结束) 时才执行高亮计算，节省手机 CPU 渲染发热
     if (!isCurrentlyStreaming && language && hljs.getLanguage(language)) {
-      try {
-        highlightedCode = hljs.highlight(code, { language }).value;
-      } catch (e) {}
+      try { highlightedCode = hljs.highlight(code, { language }).value; } catch (e) {}
     } else if (!isCurrentlyStreaming) {
-      try {
-        highlightedCode = hljs.highlightAuto(code).value;
-      } catch (e) {}
+      try { highlightedCode = hljs.highlightAuto(code).value; } catch (e) {}
     }
     
     return \`
@@ -910,6 +911,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
   const scrollArea = document.getElementById('scrollArea');
   const userInput = document.getElementById('userInput');
   const sendBtn = document.getElementById('sendBtn');
+  const stopBtn = document.getElementById('stopBtn');
   const sessionListDiv = document.getElementById('sessionList');
   const modelSelect = document.getElementById('modelSelect');
   const headerTitle = document.getElementById('headerTitle');
@@ -1095,12 +1097,20 @@ const HTML_CONTENT = `<!DOCTYPE html>
     }
     
     scrollArea.scrollTop = scrollArea.scrollHeight; 
-    
     const rBox = bubble.querySelector('.reasoning-box');
     if (rBox) { rBox.scrollTop = rBox.scrollHeight; }
 
     return bubble;
   }
+
+  // 绑定停止生成功能
+  stopBtn.addEventListener('click', () => {
+    if (currentAbortController) {
+      currentAbortController.abort();
+      stopBtn.style.display = 'none';
+      statusDot.classList.remove('generating');
+    }
+  });
 
   async function sendMessage() {
     const text = userInput.value.trim(); 
@@ -1117,7 +1127,10 @@ const HTML_CONTENT = `<!DOCTYPE html>
     userInput.style.height = 'auto';
     sendBtn.classList.remove('active'); 
     sendBtn.disabled = true;
+    
+    // 显示打字状态和停止按钮
     statusDot.classList.add('generating'); 
+    stopBtn.style.display = 'flex';
     
     appendMessageDOM('user', text);
     currentSession.messages.push({ role: 'user', content: text });
@@ -1133,19 +1146,28 @@ const HTML_CONTENT = `<!DOCTYPE html>
     
     const bubble = document.getElementById(aiMsgId);
     isCurrentlyStreaming = true;
+    currentAbortController = new AbortController(); // 初始化停止控制器
 
     try {
+      // 携带 Auth Header 并加入前端上下文截断控制，防止 Tokens 爆炸
+      const authPassword = localStorage.getItem('site_password') || '';
+      
       const response = await fetch('/api/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': \`Bearer \${authPassword}\`
+        },
+        signal: currentAbortController.signal,
         body: JSON.stringify({ 
-          messages: currentSession.messages,
+          // 前端只发送最后 12 条记录给服务端，节省 Token 和防崩溃
+          messages: currentSession.messages.slice(-12),
           model: modelSelect.value 
         })
       });
 
       if (!response.ok) { 
-        const errorData = await response.json().catch(() => ({ error: '网络或服务接口错误' })); 
+        const errorData = await response.json().catch(() => ({ error: '网络或服务接口错误 (可能因密码错误或配置异常)' })); 
         throw new Error(errorData.error || '请求失败'); 
       }
       
@@ -1165,7 +1187,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
 
       function scheduleUpdateUI(force = false) {
         const now = Date.now();
-        if (!force && now - lastRenderTime < 60) return;
+        if (!force && now - lastRenderTime < 80) return; // 节流延迟提高到 80ms 进一步降低发热
         if (isRenderPending) return;
         isRenderPending = true;
         
@@ -1188,7 +1210,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
           }
 
           const distanceToBottom = scrollArea.scrollHeight - scrollArea.scrollTop - scrollArea.clientHeight;
-          if (distanceToBottom < 120) {
+          if (distanceToBottom < 150) {
             scrollArea.scrollTop = scrollArea.scrollHeight;
           }
         });
@@ -1231,10 +1253,9 @@ const HTML_CONTENT = `<!DOCTYPE html>
         } catch(e) {}
       }
 
+      // 正常生成完毕后的最终渲染
       isCurrentlyStreaming = false;
-
       if (!reasoningContent && rBox) rBox.remove();
-      
       tBox.innerHTML = marked.parse(aiContent);
       tBox.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
       scrollArea.scrollTop = scrollArea.scrollHeight;
@@ -1244,21 +1265,33 @@ const HTML_CONTENT = `<!DOCTYPE html>
       
     } catch (error) {
       isCurrentlyStreaming = false;
-      if (aiContent || reasoningContent) {
-        tBox.innerHTML = marked.parse(aiContent) + \`<br><br><span style="color: #ef4444; font-size: 13px; font-weight: 500;">(⚠️ 网络连接中断，已保留当前生成的内容。错误: \${error.message})</span>\`;
-        tBox.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
-        currentSession.messages.push({ role: 'assistant', content: aiContent });
-        if (rBox && reasoningContent) rBox.remove(); 
+      
+      if (error.name === 'AbortError') {
+         // 用户主动停止生成处理
+         aiContent += '\n\n*(⏹ 已经停止生成)*';
+         tBox.innerHTML = marked.parse(aiContent);
+         tBox.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
+         currentSession.messages.push({ role: 'assistant', content: aiContent });
       } else {
-        bubble.querySelector('.message-text').innerText = '通信断开: ' + error.message; 
-        bubble.parentElement.classList.add('error-msg');
-        currentSession.messages.pop(); 
+         // 其他真实网络或鉴权错误处理
+         if (aiContent || reasoningContent) {
+           tBox.innerHTML = marked.parse(aiContent) + \`<br><br><span style="color: #ef4444; font-size: 13px; font-weight: 500;">(⚠️ 网络或请求异常，已保留生成内容。错误: \${error.message})</span>\`;
+           tBox.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
+           currentSession.messages.push({ role: 'assistant', content: aiContent });
+           if (rBox && reasoningContent) rBox.remove(); 
+         } else {
+           bubble.querySelector('.message-text').innerText = '通信断开或未授权: ' + error.message; 
+           bubble.parentElement.classList.add('error-msg');
+           currentSession.messages.pop(); 
+         }
       }
       saveSessions();
     } finally {
       isCurrentlyStreaming = false;
+      currentAbortController = null;
       sendBtn.disabled = false; 
       statusDot.classList.remove('generating'); 
+      stopBtn.style.display = 'none'; // 隐藏停止按钮
       if (userInput.value.trim().length > 0) sendBtn.classList.add('active'); 
       userInput.focus();
     }
@@ -1269,9 +1302,14 @@ const HTML_CONTENT = `<!DOCTYPE html>
   const settingsToggle = document.getElementById('settingsToggle');
   const closeSettingsBtn = document.getElementById('closeSettingsBtn');
   const defaultModelSetting = document.getElementById('defaultModelSetting');
+  const sitePasswordSetting = document.getElementById('sitePasswordSetting');
 
+  // 初始化设置弹窗数据
   if (defaultModelSetting) {
     defaultModelSetting.value = localStorage.getItem('default_model') || (modelSelect.options.length > 0 ? modelSelect.options[0].value : "");
+  }
+  if (sitePasswordSetting) {
+    sitePasswordSetting.value = localStorage.getItem('site_password') || '';
   }
 
   settingsToggle.addEventListener('click', () => {
@@ -1281,9 +1319,10 @@ const HTML_CONTENT = `<!DOCTYPE html>
 
   closeSettingsBtn.addEventListener('click', () => {
     settingsModal.classList.remove('active');
-    if (defaultModelSetting.value) {
-      localStorage.setItem('default_model', defaultModelSetting.value);
-    }
+    
+    if (defaultModelSetting.value) localStorage.setItem('default_model', defaultModelSetting.value);
+    if (sitePasswordSetting) localStorage.setItem('site_password', sitePasswordSetting.value.trim());
+
     setTimeout(() => settingsModal.style.display = 'none', 300);
   });
 
