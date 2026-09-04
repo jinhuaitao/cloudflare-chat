@@ -29,7 +29,7 @@ function parseCommaSeparated(str) {
   return str.split(',').map(s => s.trim()).filter(Boolean);
 }
 
-// ======= 统一解析通道配置（带内存缓存） =======
+// ======= 统一解析通道配置（带内存缓存） ======
 function getChannelConfig(env) {
   if (cachedConfig && cachedEnvRef === env) {
     return cachedConfig;
