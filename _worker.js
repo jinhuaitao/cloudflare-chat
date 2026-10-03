@@ -89,9 +89,10 @@ function getChannelConfig(env) {
 
   const fallbackUrl = env.API_URL || "";
   const fallbackKeys = parseCommaSeparated(env.API_KEY);
-  const fallbackModelStr = env.MODEL || "meta/llama3-70b-instruct:Llama 3 70B,deepseek-ai/DeepSeek-R1:深度思考 R1";
-  
-  addModels(fallbackModelStr, fallbackUrl, fallbackKeys);
+  addModels(env.MODEL, fallbackUrl, fallbackKeys);
+
+  // 解析不到任何模型时不写缓存，避免空配置被永久固化
+  if (models.length === 0) return { models, modelMap };
 
   cachedConfig = { models, modelMap };
   return cachedConfig;
@@ -100,10 +101,14 @@ function getChannelConfig(env) {
 // 提取共用的 AI 请求构建逻辑 (DRY原则)
 function buildAIRequest(env, requestedModel, messagesArray, isStream) {
   const { models, modelMap } = getChannelConfig(env);
-  let selectedModel = requestedModel || (models.length > 0 ? models[0].id : "");
+  if (models.length === 0) {
+    return { error: "未配置任何模型：请在 Worker 环境变量中添加 API_CONFIG，或 API_URL_1 / API_KEY_1 / MODEL_1" };
+  }
+
+  let selectedModel = requestedModel || models[0].id;
 
   if (!modelMap.has(selectedModel)) {
-    selectedModel = models.length > 0 ? models[0].id : "";
+    selectedModel = models[0].id;
   }
 
   const channel = modelMap.get(selectedModel);
@@ -212,6 +217,9 @@ export default {
           displayName = item.id.length > 24 ? item.id.substring(0, 22) + '...' : item.id;
         }
         optionsHtml += `<option value="${item.id}" ${i === 0 ? 'selected' : ''}>${displayName}</option>`;
+      }
+      if (!optionsHtml) {
+        optionsHtml = '<option value="">未配置模型，请设置环境变量</option>';
       }
 
       const html = HTML_CONTENT.replaceAll('{{MODEL_OPTIONS}}', optionsHtml);
