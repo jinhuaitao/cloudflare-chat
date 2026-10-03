@@ -9,7 +9,7 @@ const CORS_HEADERS = {
   'Content-Type': 'application/json',
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Access-Token',
 };
 
 const SSE_HEADERS = {
@@ -25,6 +25,33 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 function parseCommaSeparated(str) {
   if (!str) return [];
   return str.split(',').map(s => s.trim()).filter(Boolean);
+}
+
+// 定长比较，避免通过响应耗时逐字节猜解口令
+function safeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const ab = new TextEncoder().encode(a);
+  const bb = new TextEncoder().encode(b);
+  if (ab.length !== bb.length) return false;
+  let diff = 0;
+  for (let i = 0; i < ab.length; i++) diff |= ab[i] ^ bb[i];
+  return diff === 0;
+}
+
+// /api/chat 访问口令校验
+// 未配置 ACCESS_PASSWORD 时返回 null（直接放行，行为与从前一致）；
+// 配置后要求请求头 X-Access-Token 与之一致，否则返回 401。
+function denyUnauthorized(env, request) {
+  const required = env.ACCESS_PASSWORD;
+  if (!required) return null;
+
+  const provided = request.headers.get('X-Access-Token') || '';
+  if (safeEqual(provided, required)) return null;
+
+  return new Response(JSON.stringify({
+    error: "访问口令错误或未提供",
+    code: "UNAUTHORIZED",
+  }), { status: 401, headers: CORS_HEADERS });
 }
 
 // ======= 统一解析通道配置（带内存缓存） =======
@@ -148,6 +175,9 @@ export default {
     }
 
     if (request.method === 'POST' && url.pathname === '/api/chat') {
+      const denied = denyUnauthorized(env, request);
+      if (denied) return denied;
+
       try {
         let body;
         try {
@@ -710,6 +740,13 @@ const HTML_CONTENT = `<!DOCTYPE html>
       background-repeat: no-repeat; background-position: right 1rem center; background-size: 1em;
     }
     .settings-select:focus { border-color: var(--brand-color); box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1); }
+    .settings-input {
+      width: 100%; padding: 12px 16px; border-radius: 12px; border: 1px solid var(--glass-border);
+      background: var(--input-bg); color: var(--text-main); font-size: 15px; outline: none;
+      font-weight: 500; transition: all 0.2s; box-sizing: border-box; font-family: inherit;
+    }
+    .settings-input:focus { border-color: var(--brand-color); box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1); }
+    .settings-hint { font-size: 12px; color: var(--text-secondary); opacity: 0.75; margin-top: 8px; line-height: 1.5; }
     .settings-btn {
       background: var(--brand-gradient); color: #fff; border: none; padding: 10px 24px;
       border-radius: 12px; cursor: pointer; font-size: 15px; font-weight: 600; transition: all 0.2s;
@@ -788,6 +825,11 @@ const HTML_CONTENT = `<!DOCTYPE html>
       <select id="defaultModelSetting" class="settings-select">
         {{MODEL_OPTIONS}}
       </select>
+    </div>
+    <div style="margin-top: 20px;">
+      <label style="font-size: 14px; font-weight: 500; color: var(--text-secondary); display: block; margin-bottom: 10px;">访问口令</label>
+      <input type="password" id="accessTokenSetting" class="settings-input" placeholder="留空则不发送校验头" autocomplete="off">
+      <div class="settings-hint">仅当服务端配置了 ACCESS_PASSWORD 时才需要填写，需与之一致。口令只保存在本机浏览器，不会上传。</div>
     </div>
     <div style="margin-top: 32px; text-align: right;">
       <button id="closeSettingsBtn" class="settings-btn">保存并关闭</button>
@@ -917,6 +959,10 @@ const HTML_CONTENT = `<!DOCTYPE html>
   const STORAGE_KEY = 'nvidia_ai_sessions';
   let sessions = JSON.parse(localStorage.getItem(STORAGE_KEY)) || [];
   let currentSessionId = null;
+
+  // /api/chat 访问口令：存在本机浏览器，随请求以 X-Access-Token 头发出
+  const ACCESS_TOKEN_KEY = 'access_token';
+  let accessToken = localStorage.getItem(ACCESS_TOKEN_KEY) || '';
 
   const messagesDiv = document.getElementById('messages');
   const emptyState = document.getElementById('emptyState');
@@ -1151,9 +1197,12 @@ const HTML_CONTENT = `<!DOCTYPE html>
     sendBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12" rx="2" ry="2"></rect></svg>';
 
     try {
+      const reqHeaders = { 'Content-Type': 'application/json' };
+      if (accessToken) reqHeaders['X-Access-Token'] = accessToken;
+
       const response = await fetch('/api/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: reqHeaders,
         body: JSON.stringify({ 
           messages: currentSession.messages,
           model: modelSelect.value 
@@ -1163,6 +1212,12 @@ const HTML_CONTENT = `<!DOCTYPE html>
 
       if (!response.ok) { 
         const errorData = await response.json().catch(() => ({ error: '网络或服务接口错误' })); 
+        if (response.status === 401) {
+          openSettings();
+          const authErr = new Error('访问口令错误或未填写');
+          authErr.name = 'AuthError';
+          throw authErr;
+        }
         throw new Error(errorData.error || '请求失败'); 
       }
       
@@ -1266,6 +1321,13 @@ const HTML_CONTENT = `<!DOCTYPE html>
         const interruptNote = '<br><br><span style="color: var(--text-secondary); font-size: 13px; font-weight: 500;">(🛑 生成已手动中止)</span>';
         tBox.innerHTML = marked.parse(aiContent || '已中止') + interruptNote;
         if (aiContent) currentSession.messages.push({ role: 'assistant', content: aiContent });
+      } else if (error.name === 'AuthError') {
+        tBox.innerHTML = '<span style="color: var(--brand-color); font-size: 15px; font-weight: 600;">需要访问口令</span>' +
+          '<div style="color: var(--text-secondary); font-size: 13px; margin-top: 8px; line-height: 1.6;">请在左下角「设置」中填写与服务端 ACCESS_PASSWORD 一致的口令，保存后重新发送。</div>';
+        bubble.parentElement.classList.add('error-msg');
+        currentSession.messages.pop();
+        userInput.value = text;
+        userInput.dispatchEvent(new Event('input'));
       } else {
         if (aiContent || reasoningContent) {
           // 字符串拼接替换模板字符串，彻底规避 CF 编辑器转义 Bug
@@ -1314,20 +1376,31 @@ const HTML_CONTENT = `<!DOCTYPE html>
   const settingsToggle = document.getElementById('settingsToggle');
   const closeSettingsBtn = document.getElementById('closeSettingsBtn');
   const defaultModelSetting = document.getElementById('defaultModelSetting');
+  const accessTokenSetting = document.getElementById('accessTokenSetting');
 
   if (defaultModelSetting) {
     defaultModelSetting.value = localStorage.getItem('default_model') || (modelSelect.options.length > 0 ? modelSelect.options[0].value : "");
   }
+  if (accessTokenSetting) {
+    accessTokenSetting.value = accessToken;
+  }
 
-  settingsToggle.addEventListener('click', () => {
+  function openSettings() {
     settingsModal.style.display = 'flex';
-    setTimeout(() => settingsModal.classList.add('active'), 10); 
-  });
+    setTimeout(() => settingsModal.classList.add('active'), 10);
+  }
+
+  settingsToggle.addEventListener('click', openSettings);
 
   closeSettingsBtn.addEventListener('click', () => {
     settingsModal.classList.remove('active');
     if (defaultModelSetting.value) {
       localStorage.setItem('default_model', defaultModelSetting.value);
+    }
+    if (accessTokenSetting) {
+      accessToken = accessTokenSetting.value.trim();
+      if (accessToken) localStorage.setItem(ACCESS_TOKEN_KEY, accessToken);
+      else localStorage.removeItem(ACCESS_TOKEN_KEY);
     }
     setTimeout(() => settingsModal.style.display = 'none', 300);
   });

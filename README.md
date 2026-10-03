@@ -129,6 +129,26 @@ MODEL   = gpt-4o:GPT-4o, deepseek-ai/DeepSeek-R1:深度思考 R1
 
 ---
 
+### 访问口令（可选，防止接口被白嫖）
+
+如果 Worker 部署在公开域名上，建议设置访问口令。在 **设置 → 变量和机密** 中添加：
+
+```
+ACCESS_PASSWORD = 你自己设定的一串口令
+```
+
+添加后：
+
+- `/api/chat` 会要求请求头 `X-Access-Token` 与该值一致，否则返回 `401`；
+- 前端在**左下角设置 → 访问口令**中填入同样的口令即可正常使用，口令只保存在本机浏览器，不会上传到服务端；
+- 首次发送时若口令错误或未填写，界面会提示并自动弹出设置面板；已输入的内容会保留在输入框里，填完口令直接重发即可。
+
+**不添加 `ACCESS_PASSWORD` 时接口保持开放**，行为与从前完全一致 —— 这个校验是可选的，不会影响已有部署。
+
+> 口令校验只保护 `/api/chat`。`/` 页面本身仍是公开的（否则界面无法加载），但即使有人打开页面，没有口令也无法发起对话。Telegram 机器人走的是独立的 webhook 通道，不受此口令影响。
+
+---
+
 # 第四步：启用 Telegram 机器人（可选）
 
 1. 在 @BotFather 处创建机器人，拿到 Bot Token。
@@ -161,6 +181,12 @@ https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=https://<你的Work
 
 如果下拉框有模型但对话报错，多半是 `API_KEY_1` 没填或填错，可以在 Cloudflare 的实时日志（Workers & Pages → 你的 Worker → Logs）里看到上游接口返回的具体报错。
 
+**提示「需要访问口令」**
+
+服务端已配置 `ACCESS_PASSWORD`，但浏览器里没有口令或口令不一致。点击左下角设置图标，在「访问口令」中填入与服务端一致的值后重新发送即可。
+
+若你并不想启用口令，把服务端的 `ACCESS_PASSWORD` 变量删除后重新部署，即可恢复开放访问。反过来，如果你没配置过 `ACCESS_PASSWORD` 却收到 401，说明有人给这个 Worker 加了口令，去「设置 → 变量和机密」确认一下。
+
 **每次部署都会重复创建 KV 命名空间**
 
 去 KV 页面确认是否出现多个同名或相似名字的命名空间。若有，删除多余的，并按第二步「回填 id」的方式把正确的 id 固定到 `wrangler.toml` 中。
@@ -173,10 +199,9 @@ https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=https://<你的Work
 
 # 安全提示
 
-当前实现中，`/api/chat` 接口为 `Access-Control-Allow-Origin: *` 且**没有任何鉴权**。任何拿到 Worker 域名的人都可以调用它并消耗你配置的 API 额度。`/tg-webhook` 也未校验 Telegram 的 secret token。
+- **`/api/chat` 支持访问口令**：配置环境变量 `ACCESS_PASSWORD` 即生效，未配置则保持开放。部署在公开域名上时建议务必配置，见第三步的「访问口令」小节。
+- **`/tg-webhook` 未做校验**：任何人只要知道你的 Worker 域名，都可以伪造 Telegram 更新请求。建议在 `setWebhook` 时带上 `secret_token` 参数，并在 Worker 中校验 `X-Telegram-Bot-Api-Secret-Token` 请求头。
+- **CORS 为 `*`**：`Access-Control-Allow-Origin: *` 允许任意站点调用你的接口。如果只在自己的域名下使用，建议收紧为实际域名。
+- **API Key 只存在于服务端**：密钥通过环境变量注入，不会下发到浏览器，前端只能看到模型名称。
 
-如果部署在公开可访问的域名上，建议至少做以下一项加固：
-
-- 为 `/api/chat` 增加访问口令校验（前端带一个自定义 Header，后端比对环境变量）；
-- 把 CORS 的 `*` 收紧为你实际使用的域名；
-- 在 `setWebhook` 时带上 `secret_token` 参数，并在 Worker 中校验 `X-Telegram-Bot-Api-Secret-Token` 请求头。
+> 关于口令强度的说明：口令以明文形式保存在浏览器 localStorage 中，并通过请求头传输（HTTPS 加密）。服务端比较采用定长实现，可避免通过响应耗时逐字节猜解。它能有效挡住扫描器和随手调用接口的人，但不宜作为对抗定向攻击的唯一防线。
