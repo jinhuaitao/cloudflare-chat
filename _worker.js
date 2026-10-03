@@ -36,7 +36,7 @@ function getChannelConfig(env) {
   const models = [];
   const modelMap = new Map();
 
-  const addModels = (modelStr, url, keys, declaredType) => {
+  const addModels = (modelStr, url, keys) => {
     if (!modelStr) return;
     const arr = modelStr.split(',');
     for (let i = 0; i < arr.length; i++) {
@@ -49,7 +49,7 @@ function getChannelConfig(env) {
 
       if (!modelMap.has(id)) {
         models.push({ id, name, original: raw });
-        modelMap.set(id, { url, keys, type: declaredType });
+        modelMap.set(id, { url, keys });
       }
     }
   };
@@ -61,7 +61,7 @@ function getChannelConfig(env) {
         const url = ch.url;
         const keys = Array.isArray(ch.keys) ? ch.keys : parseCommaSeparated(ch.keys);
         const modelStr = Array.isArray(ch.models) ? ch.models.join(',') : ch.models;
-        if (url && modelStr) addModels(modelStr, url, keys, ch.type);
+        if (url && modelStr) addModels(modelStr, url, keys);
       });
       if (models.length > 0) {
         cachedConfig = { models, modelMap };
@@ -97,20 +97,11 @@ function getChannelConfig(env) {
   return cachedConfig;
 }
 
-// ======= 通道类型识别 =======
-function detectApiKind(apiUrl, modelId, declaredType) {
-  if (declaredType === 'video' || declaredType === 'image' || declaredType === 'chat') return declaredType;
-  const u = (apiUrl || '').toLowerCase();
-  const m = (modelId || '').toLowerCase();
-  if (m.includes('video') || u.includes('/videos')) return 'video';
-  if (m.includes('image') || u.includes('images/generations')) return 'image';
-  return 'chat';
-}
-
-// 选出模型对应的通道，返回地址、密钥与接口类型
-function resolveChannel(env, requestedModel) {
+// 提取共用的 AI 请求构建逻辑 (DRY原则)
+function buildAIRequest(env, requestedModel, messagesArray, isStream) {
   const { models, modelMap } = getChannelConfig(env);
   let selectedModel = requestedModel || (models.length > 0 ? models[0].id : "");
+
   if (!modelMap.has(selectedModel)) {
     selectedModel = models.length > 0 ? models[0].id : "";
   }
@@ -119,21 +110,8 @@ function resolveChannel(env, requestedModel) {
   if (!channel || !channel.url) return { error: "该模型对应的 API_URL 未配置或异常" };
 
   const currentApiKey = channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
-  return {
-    apiUrl: channel.url,
-    currentApiKey,
-    selectedModel,
-    kind: detectApiKind(channel.url, selectedModel, channel.type),
-  };
-}
-
-// 提取共用的 AI 请求构建逻辑 (DRY原则)
-function buildAIRequest(env, requestedModel, messagesArray, isStream) {
-  const resolved = resolveChannel(env, requestedModel);
-  if (resolved.error) return { error: resolved.error };
-
-  const { apiUrl, currentApiKey, selectedModel, kind } = resolved;
-  const isImageAPI = kind === 'image';
+  const apiUrl = channel.url;
+  const isImageAPI = apiUrl.includes('images/generations') || selectedModel.toLowerCase().includes('image');
 
   const payload = isImageAPI ? {
     model: selectedModel,
@@ -146,313 +124,7 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream) {
     max_tokens: 4096, 
   };
 
-  return { apiUrl, currentApiKey, payload, isImageAPI, kind, selectedModel };
-}
-
-function extractPrompt(messagesArray) {
-  if (!Array.isArray(messagesArray)) return '';
-  for (let i = messagesArray.length - 1; i >= 0; i--) {
-    const msg = messagesArray[i];
-    if (msg && msg.role === 'user' && typeof msg.content === 'string' && msg.content.trim()) {
-      return msg.content.trim();
-    }
-  }
-  const last = messagesArray[messagesArray.length - 1];
-  return last && typeof last.content === 'string' ? last.content.trim() : '';
-}
-
-// ======= Agnes Video 2.5 Flash =======
-const VIDEO_SIZES = { '21:9': '1680x720', '16:9': '1280x704', '4:3': '960x720', '1:1': '720x720', '3:4': '720x960', '9:16': '720x1280' };
-const AUDIO_EXT_RE = /\.(mp3|wav|m4a|aac|ogg|flac)([?#]|$)/i;
-
-function toMediaList(value, kind) {
-  const arr = Array.isArray(value) ? value : (value ? [value] : []);
-  return arr.map(s => String(s).trim()).filter(Boolean);
-}
-
-function findNonHttpUrl(list, fieldName) {
-  for (let i = 0; i < list.length; i++) {
-    if (!/^https?:\/\//i.test(list[i])) {
-      return `${fieldName}[${i + 1}] 必须是 http(s) 公网可访问地址，当前为：${list[i].substring(0, 80)}`;
-    }
-  }
-  return null;
-}
-
-// 本地校验 Flash 限制，避免把注定 400 的请求发出去
-function buildVideoPayload(modelId, prompt, options) {
-  const v = options || {};
-  const mode = v.mode || 'text';
-  if (mode !== 'text' && mode !== 'keyframe' && mode !== 'reference') {
-    return { error: 'mode 仅支持 text、keyframe、reference，当前为：' + mode };
-  }
-
-  const seconds = String(v.seconds || '5');
-  if (!/^\d+$/.test(seconds) || Number(seconds) < 4 || Number(seconds) > 12) {
-    return { error: 'seconds 必须是字符串 "4"-"12"，当前为：' + seconds };
-  }
-
-  const aspectRatio = v.aspect_ratio || '16:9';
-  if (!VIDEO_SIZES[aspectRatio]) {
-    return { error: 'aspect_ratio 仅支持 ' + Object.keys(VIDEO_SIZES).join('、') + '，当前为：' + aspectRatio };
-  }
-
-  if (!prompt) return { error: 'prompt 不能为空，请在输入框描述要生成的视频内容' };
-
-  const payload = {
-    model: modelId,
-    prompt,
-    mode,
-    seconds,
-    size: '720P',
-    aspect_ratio: aspectRatio,
-    n: 1,
-  };
-
-  if (mode === 'keyframe') {
-    const first = v.first_frame ? String(v.first_frame).trim() : '';
-    const last = v.last_frame ? String(v.last_frame).trim() : '';
-    if (!first && !last) return { error: 'keyframe 模式需要 first_frame 或 last_frame 至少一个图片 URL' };
-    const urlError = findNonHttpUrl([first, last].filter(Boolean), 'first_frame/last_frame');
-    if (urlError) return { error: urlError };
-    if (first) payload.first_frame = first;
-    if (last) payload.last_frame = last;
-    return { payload };
-  }
-
-  if (mode === 'reference') {
-    if (v.videos && toMediaList(v.videos).length > 0) {
-      return { error: 'agnes-video-2.5-flash 不支持 videos 参考输入' };
-    }
-    const images = toMediaList(v.images, 'image');
-    const audios = toMediaList(v.audios, 'audio');
-    if (images.length > 5) return { error: 'images length must not exceed 5，当前 ' + images.length + ' 张' };
-    if (audios.length > 3) return { error: 'audios length must not exceed 3，当前 ' + audios.length + ' 段' };
-    if (images.length === 0 && audios.length === 0) {
-      return { error: 'reference 模式至少需要一张参考图片（images）或一段参考音频（audios）' };
-    }
-    const urlError = findNonHttpUrl(images.concat(audios), 'images/audios');
-    if (urlError) return { error: urlError };
-    if (images.length) payload.images = images;
-    if (audios.length) payload.audios = audios;
-    return { payload };
-  }
-
-  if (v.first_frame || v.last_frame || v.images || v.audios || v.videos) {
-    return { error: 'text 模式不接受任何媒体输入，如需使用素材请切换到 keyframe 或 reference 模式' };
-  }
-  return { payload };
-}
-
-// 查询接口固定为 <创建地址 origin>/agnesapi?video_id=..&model_name=..
-function videoTaskQueryUrl(apiUrl, videoId, modelId) {
-  return new URL(apiUrl).origin + '/agnesapi?video_id=' + encodeURIComponent(videoId)
-    + '&model_name=' + encodeURIComponent(modelId);
-}
-
-// Cloudflare 网关的 429 会返回 HTML 错误页，直接透传会淹没关键信息
-function summarizeErrorBody(text) {
-  let s = String(text || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-  const code = s.match(/error code:\s*(\d+)/i);
-  if (code) {
-    s = code[1] === '1015'
-      ? '429 / error code 1015：Cloudflare 对同一出口 IP 限流，与提示词内容无关，降低发送频率即可'
-      : `error code: ${code[1]}`;
-  }
-  return s.substring(0, 300) || '（空响应体）';
-}
-
-function retryAfterMs(response, fallbackMs) {
-  const raw = Number(response.headers.get('retry-after'));
-  if (Number.isFinite(raw) && raw > 0) return Math.min(raw * 1000, 30000);
-  return fallbackMs;
-}
-
-function isTransientStatus(status) {
-  return status === 429 || status === 502 || status === 503 || status === 504;
-}
-
-async function fetchVideoTask(apiUrl, apiKey, videoId, modelId) {
-  let response;
-  try {
-    response = await fetch(videoTaskQueryUrl(apiUrl, videoId, modelId), {
-      headers: { 'Authorization': `Bearer ${apiKey}` },
-    });
-  } catch (e) {
-    return { status: 'processing', url: null, progress: null, retryable: true, retryAfterMs: 5000, error: `查询任务网络异常：${e.message}` };
-  }
-
-  const text = await response.text();
-  if (!response.ok) {
-    const retryable = isTransientStatus(response.status);
-    return {
-      status: retryable ? 'processing' : 'failed',
-      url: null,
-      progress: null,
-      retryable,
-      retryAfterMs: retryable ? retryAfterMs(response, 6000) : 0,
-      error: `查询任务失败 (${response.status}): ${summarizeErrorBody(text)}`,
-    };
-  }
-
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch (e) {
-    return { status: 'failed', url: null, progress: null, error: `无法解析任务查询响应：${summarizeErrorBody(text)}` };
-  }
-
-  const videoUrl = data.url || (data.data && data.data.url) || null;
-  const status = String(data.status || (videoUrl ? 'completed' : 'processing')).toLowerCase();
-  let errorText = null;
-  if (data.error) errorText = typeof data.error === 'string' ? data.error : JSON.stringify(data.error);
-
-  return {
-    status,
-    url: videoUrl,
-    progress: typeof data.progress === 'number' ? data.progress : null,
-    error: errorText,
-  };
-}
-
-async function createVideoTask(env, channel, payload) {
-  const maxAttempts = getNumberEnv(env, 'VIDEO_CREATE_RETRY', 3, 1, 5);
-  const waitBudgetMs = 45000;
-  const startedAt = Date.now();
-  let lastError = '';
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const response = await fetch(channel.apiUrl, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${channel.currentApiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(payload),
-    });
-    const text = await response.text();
-
-    if (response.ok) return { text };
-
-    if (isTransientStatus(response.status)) {
-      const wait = retryAfterMs(response, 4000 * attempt);
-      lastError = `(${response.status}) ${summarizeErrorBody(text)}`;
-      const exhausted = attempt === maxAttempts || Date.now() - startedAt + wait > waitBudgetMs;
-      if (exhausted) {
-        return { error: `Agnes 创建视频任务被限流，已重试 ${attempt} 次仍未放行：${lastError}。请稍后再发或调小请求频率（可调环境变量 VIDEO_CREATE_RETRY）。` };
-      }
-      await sleep(wait);
-      continue;
-    }
-
-    return { error: `Agnes 创建视频任务失败 (${response.status}): ${summarizeErrorBody(text)}` };
-  }
-
-  return { error: `Agnes 创建视频任务失败：${lastError}` };
-}
-
-const VIDEO_MODE_LABELS = { text: '文生视频', keyframe: '首尾帧视频', reference: '素材参考视频' };
-
-function renderVideoResult(modelId, payload, videoUrl) {
-  return [
-    `**${VIDEO_MODE_LABELS[payload.mode] || '视频'} 已生成**`,
-    `模型 \`${modelId}\` · ${payload.seconds}s · ${payload.aspect_ratio} (${VIDEO_SIZES[payload.aspect_ratio] || '720P'}) · ${payload.size}`,
-    `<video src="${videoUrl}" controls playsinline preload="metadata" style="width:100%;max-width:640px;border-radius:12px;background:#000"></video>`,
-    `[下载视频](${videoUrl})`,
-  ].join('\n\n');
-}
-
-function sseEvent(controller, encoder, obj) {
-  controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
-}
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function getNumberEnv(env, name, defaultValue, min, max) {
-  const raw = Number(env[name]);
-  if (!Number.isFinite(raw)) return defaultValue;
-  return Math.min(max, Math.max(min, raw));
-}
-
-async function handleVideoChat(env, channel, body) {
-  const prompt = extractPrompt(body.messages);
-  const built = buildVideoPayload(channel.selectedModel, prompt, body.video);
-  if (built.error) {
-    return new Response(JSON.stringify({ error: built.error }), { status: 400, headers: CORS_HEADERS });
-  }
-
-  const created = await createVideoTask(env, channel, built.payload);
-  if (created.error) {
-    return new Response(JSON.stringify({ error: created.error }), { status: 502, headers: CORS_HEADERS });
-  }
-
-  let createdData;
-  try {
-    createdData = JSON.parse(created.text);
-  } catch (e) {
-    return new Response(JSON.stringify({
-      error: `无法解析创建任务响应：${summarizeErrorBody(created.text)}`,
-    }), { status: 502, headers: CORS_HEADERS });
-  }
-
-  const videoId = createdData.video_id || createdData.id || createdData.task_id || (createdData.data && createdData.data.video_id);
-  if (!videoId) {
-    return new Response(JSON.stringify({
-      error: `创建任务响应中未找到 video_id：${summarizeErrorBody(created.text)}`,
-    }), { status: 502, headers: CORS_HEADERS });
-  }
-
-  const pollIntervalMs = getNumberEnv(env, 'VIDEO_POLL_INTERVAL', 3, 1, 30) * 1000;
-  const pollTimeoutMs = getNumberEnv(env, 'VIDEO_POLL_TIMEOUT', 170, 10, 600) * 1000;
-  const deadline = Date.now() + pollTimeoutMs;
-
-  const encoder = new TextEncoder();
-  const stream = new ReadableStream({
-    async start(controller) {
-      let finished = false;
-      let nextDelay = pollIntervalMs;
-      try {
-        sseEvent(controller, encoder, { video_job: { video_id: videoId, model: channel.selectedModel } });
-
-        while (Date.now() < deadline) {
-          await sleep(nextDelay);
-          const task = await fetchVideoTask(channel.apiUrl, channel.currentApiKey, videoId, channel.selectedModel);
-
-          if (task.status === 'completed' && task.url) {
-            sseEvent(controller, encoder, { choices: [{ delta: { content: renderVideoResult(channel.selectedModel, built.payload, task.url) } }] });
-            finished = true;
-            break;
-          }
-          if (task.status === 'failed') {
-            sseEvent(controller, encoder, { choices: [{ delta: { content: '⚠️ 视频生成失败：' + (task.error || '接口未返回具体原因，status=failed') } }] });
-            finished = true;
-            break;
-          }
-          // 限流/网络抖动不算失败，任务仍在队列里，退避后继续查
-          nextDelay = task.retryable ? Math.min(task.retryAfterMs || pollIntervalMs, 20000) : pollIntervalMs;
-          sseEvent(controller, encoder, {
-            video_progress: task.progress,
-            video_status: task.retryable ? 'rate_limited' : task.status,
-            video_notice: task.error || null,
-          });
-        }
-
-        if (!finished) {
-          sseEvent(controller, encoder, { video_pending: { video_id: videoId, model: channel.selectedModel } });
-        }
-        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-      } catch (error) {
-        sseEvent(controller, encoder, { choices: [{ delta: { content: '⚠️ 视频任务处理中断：' + error.message } }] });
-        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-      } finally {
-        controller.close();
-      }
-    },
-  });
-
-  return new Response(stream, { headers: SSE_HEADERS });
+  return { apiUrl, currentApiKey, payload, isImageAPI };
 }
 
 export default {
@@ -479,10 +151,6 @@ export default {
         const aiConfig = buildAIRequest(env, body.model, body.messages, true);
         if (aiConfig.error) {
           return new Response(JSON.stringify({ error: aiConfig.error }), { status: 500, headers: CORS_HEADERS });
-        }
-
-        if (aiConfig.kind === 'video') {
-          return await handleVideoChat(env, aiConfig, body);
         }
 
         const { apiUrl, currentApiKey, payload, isImageAPI } = aiConfig;
@@ -528,38 +196,6 @@ export default {
 
           return new Response(stream, { headers: SSE_HEADERS });
         }
-      } catch (error) {
-        return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: CORS_HEADERS });
-      }
-    }
-
-    // Worker 侧轮询超时后由浏览器调用此接口续查，长任务不会因为连接断开而丢失
-    if (request.method === 'GET' && url.pathname === '/api/video_task') {
-      try {
-        const videoId = url.searchParams.get('video_id');
-        const modelId = url.searchParams.get('model');
-        if (!videoId || !modelId) {
-          return new Response(JSON.stringify({ error: "缺少 video_id 或 model 参数" }), { status: 400, headers: CORS_HEADERS });
-        }
-
-        const channel = resolveChannel(env, modelId);
-        if (channel.error) {
-          return new Response(JSON.stringify({ error: channel.error }), { status: 500, headers: CORS_HEADERS });
-        }
-        if (channel.selectedModel !== modelId) {
-          return new Response(JSON.stringify({ error: `模型 ${modelId} 未在任何通道配置中登记` }), { status: 400, headers: CORS_HEADERS });
-        }
-
-        const task = await fetchVideoTask(channel.apiUrl, channel.currentApiKey, videoId, modelId);
-        return new Response(JSON.stringify({
-          video_id: videoId,
-          model: modelId,
-          status: task.status,
-          progress: task.progress,
-          url: task.url,
-          error: task.error,
-          retry_after: task.retryable ? Math.max(1, Math.round((task.retryAfterMs || 3000) / 1000)) : null,
-        }), { headers: CORS_HEADERS });
       } catch (error) {
         return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: CORS_HEADERS });
       }
@@ -669,14 +305,6 @@ export default {
                   tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {});
                 }
                 await tgApi('sendMessage', { chat_id: chatId, text: "⚠️ 此模型的 API 接口未配置或异常。" });
-                return;
-              }
-
-              if (aiConfig.kind === 'video') {
-                if (pendingMsgId) {
-                  tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {});
-                }
-                await tgApi('sendMessage', { chat_id: chatId, text: "🎬 视频模型是异步任务，请在网页端使用（Telegram 通道暂不支持）。" });
                 return;
               }
 
@@ -1047,25 +675,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
     
     .disclaimer { text-align: center; font-size: 12px; color: var(--text-secondary); opacity: 0.7; margin-top: 16px; font-weight: 500; }
 
-    .video-panel {
-      display: none; flex-direction: column; gap: 8px; padding: 10px 12px;
-      border: 1px dashed var(--glass-border); border-radius: 14px; background: var(--hover-bg);
-    }
-    .video-panel.active { display: flex; }
-    .video-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-    .video-row label { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 500; color: var(--text-secondary); }
-    .video-row select {
-      font-size: 12px; padding: 5px 8px; border-radius: 8px; outline: none;
-      border: 1px solid var(--glass-border); background: var(--input-bg); color: var(--text-main);
-    }
-    .video-media-row { display: none; }
-    .video-media-row.active { display: flex; }
-    .video-media-input {
-      flex: 1; min-width: 180px; font-size: 12px; padding: 7px 10px; border-radius: 10px; outline: none;
-      border: 1px solid var(--glass-border); background: var(--input-bg); color: var(--text-main);
-    }
-    .video-status { color: var(--brand-color); font-size: 14px; font-weight: 500; line-height: 1.6; }
-
     .settings-modal-overlay {
       position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 1000;
       backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
@@ -1217,27 +826,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
 
     <div class="input-wrapper">
       <div class="input-box">
-        <div class="video-panel" id="videoPanel">
-          <div class="video-row">
-            <label>时长 <select id="videoSeconds"></select></label>
-            <label>画幅 <select id="videoAspect">
-              <option value="16:9">16:9</option>
-              <option value="9:16">9:16</option>
-              <option value="1:1">1:1</option>
-              <option value="4:3">4:3</option>
-              <option value="3:4">3:4</option>
-              <option value="21:9">21:9</option>
-            </select></label>
-            <label>模式 <select id="videoMode">
-              <option value="text">文生视频</option>
-              <option value="keyframe">首尾帧</option>
-              <option value="reference">素材参考</option>
-            </select></label>
-          </div>
-          <div class="video-row video-media-row" id="videoMediaRow">
-            <input type="text" class="video-media-input" id="videoMedia" placeholder="">
-          </div>
-        </div>
         <div class="input-top">
           <textarea id="userInput" placeholder="输入指令或开始对话..." rows="1"></textarea>
           <button class="send-btn" id="sendBtn">
@@ -1352,140 +940,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
     }
   }
 
-  // ======= 视频通道（Agnes Video 2.5 Flash） =======
-  const videoPanel = document.getElementById('videoPanel');
-  const videoSeconds = document.getElementById('videoSeconds');
-  const videoAspect = document.getElementById('videoAspect');
-  const videoMode = document.getElementById('videoMode');
-  const videoMediaRow = document.getElementById('videoMediaRow');
-  const videoMedia = document.getElementById('videoMedia');
-  const VIDEO_MARK = '[[VIDEO_WAIT:';
-  const videoPolls = new Map();
-
-  for (var vs = 4; vs <= 12; vs++) {
-    var secOption = document.createElement('option');
-    secOption.value = String(vs);
-    secOption.text = vs + ' 秒';
-    if (vs === 5) secOption.selected = true;
-    videoSeconds.appendChild(secOption);
-  }
-
-  function isVideoModel(id) {
-    return String(id || '').toLowerCase().indexOf('video') !== -1;
-  }
-
-  function syncVideoPanel() {
-    if (!videoPanel) return;
-    var isVideo = isVideoModel(modelSelect.value);
-    videoPanel.classList.toggle('active', isVideo);
-    if (!isVideo) return;
-    var mode = videoMode.value;
-    videoMediaRow.classList.toggle('active', mode !== 'text');
-    videoMedia.placeholder = mode === 'keyframe'
-      ? '首帧图片 URL，可选用第二个逗号分隔的 URL 作为尾帧'
-      : '参考图片 / 音频 URL，逗号分隔（图片最多 5 张，音频最多 3 段）';
-  }
-
-  function collectVideoOptions() {
-    var mode = videoMode.value;
-    var opts = { mode: mode, seconds: videoSeconds.value, aspect_ratio: videoAspect.value };
-    if (mode === 'text') return opts;
-
-    var parts = videoMedia.value.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
-    if (mode === 'keyframe') {
-      opts.first_frame = parts[0] || '';
-      opts.last_frame = parts[1] || '';
-      return opts;
-    }
-
-    var images = [], audios = [];
-    parts.forEach(function (u) {
-      if (/\\.(mp3|wav|m4a|aac|ogg|flac)([?#]|$)/i.test(u)) audios.push(u); else images.push(u);
-    });
-    if (images.length) opts.images = images;
-    if (audios.length) opts.audios = audios;
-    return opts;
-  }
-
-  function videoStatusHtml(progress, status, notice) {
-    var text = '🎬 视频生成中';
-    if (progress !== null && progress !== undefined) text += ' ' + progress + '%';
-    else if (status && status !== 'rate_limited') text += '（' + status + '）';
-    text += ' · 通常需要 1–2 分钟，请稍候…';
-    if (notice) text += '<br><span style="font-size:12px;opacity:0.75;">' + notice + '（自动退避重试中）</span>';
-    return '<div class="video-status">' + text + '</div>';
-  }
-
-  function parseVideoMark(content) {
-    var parts = content.slice(VIDEO_MARK.length, -2).split('|');
-    if (parts.length < 2) return null;
-    return { videoId: parts[0], model: parts.slice(1).join('|') };
-  }
-
-  function stopVideoPoll(key, handle) {
-    if (handle.timer) clearTimeout(handle.timer);
-    videoPolls.delete(key);
-    if (videoPolls.size === 0) statusDot.classList.remove('generating');
-  }
-
-  function finishVideoMessage(session, msgIndex, html) {
-    if (session.messages[msgIndex]) session.messages[msgIndex].content = html;
-    saveSessions();
-    if (session.id === currentSessionId) renderMessages();
-  }
-
-  // Worker 轮询超时后由浏览器继续查询，任务不会因连接断开而丢失
-  function startVideoPoll(videoId, modelId, session, msgIndex) {
-    var key = session.id + ':' + msgIndex + ':' + videoId;
-    if (videoPolls.has(key)) return;
-
-    var handle = { timer: null };
-    videoPolls.set(key, handle);
-    statusDot.classList.add('generating');
-
-    var attempts = 0;
-    var tick = async function () {
-      handle.timer = null;
-      if (session.id !== currentSessionId) { stopVideoPoll(key, handle); return; }
-
-      attempts++;
-      var task = null;
-      try {
-        var res = await fetch('/api/video_task?video_id=' + encodeURIComponent(videoId) + '&model=' + encodeURIComponent(modelId));
-        task = await res.json();
-      } catch (e) {}
-
-      if (task && task.status === 'completed' && task.url) {
-        finishVideoMessage(session, msgIndex, '<video src="' + task.url + '" controls playsinline preload="metadata" style="width:100%;max-width:640px;border-radius:12px;background:#000"></video>\\n\\n[下载视频](' + task.url + ')');
-        stopVideoPoll(key, handle);
-        return;
-      }
-
-      if (task && task.status === 'failed') {
-        finishVideoMessage(session, msgIndex, '⚠️ 视频生成失败：' + (task.error || '接口未返回具体原因，status=failed'));
-        stopVideoPoll(key, handle);
-        return;
-      }
-
-      if (attempts > 200) {
-        finishVideoMessage(session, msgIndex, '⚠️ 已停止自动查询（超过 10 分钟）。任务可能仍在生成中，video_id：' + videoId + '，稍后可重新打开本对话继续查询。');
-        stopVideoPoll(key, handle);
-        return;
-      }
-
-      var row = messagesDiv.children[msgIndex];
-      var target = row ? row.querySelector('.message-text') : null;
-      if (target) target.innerHTML = videoStatusHtml(task ? task.progress : null, task ? task.status : 'processing', task ? task.error : '查询请求失败');
-      var delay = (task && task.retry_after) ? Math.min(Math.max(task.retry_after, 1), 30) * 1000 : 3000;
-      handle.timer = setTimeout(tick, delay);
-    };
-
-    handle.timer = setTimeout(tick, 1500);
-  }
-
-  videoMode.addEventListener('change', syncVideoPanel);
-  syncVideoPanel();
-
   userInput.addEventListener('input', function() {
     this.style.height = 'auto';
     this.style.height = Math.min(this.scrollHeight, 200) + 'px';
@@ -1553,7 +1007,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
       saveSessions();
     }
     updateHeaderDisplay();
-    syncVideoPanel();
   }
   modelSelect.addEventListener('change', onModelChange);
   modelSelect.addEventListener('input', onModelChange);
@@ -1603,14 +1056,8 @@ const HTML_CONTENT = `<!DOCTYPE html>
       emptyState.style.display = 'flex';
     } else { 
       emptyState.style.display = 'none'; 
-      currentSession.messages.forEach((msg, msgIndex) => {
+      currentSession.messages.forEach(msg => {
         const uiRole = msg.role === 'assistant' ? 'ai' : msg.role;
-        if (typeof msg.content === 'string' && msg.content.slice(0, VIDEO_MARK.length) === VIDEO_MARK) {
-          appendMessageDOM(uiRole, videoStatusHtml(null, 'queued'), null, false);
-          const pending = parseVideoMark(msg.content);
-          if (pending) startVideoPoll(pending.videoId, pending.model, currentSession, msgIndex);
-          return;
-        }
         appendMessageDOM(uiRole, msg.content, null, false);
       }); 
     }
@@ -1689,20 +1136,14 @@ const HTML_CONTENT = `<!DOCTYPE html>
     sendBtn.classList.add('stop-mode');
     sendBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12" rx="2" ry="2"></rect></svg>';
 
-    // 声明在 try 之外，catch 分支需要读取已生成的内容（否则错误提示会失效）
-    let pendingVideo = null;
-    let aiContent = '';
-    let reasoningContent = '';
-    let buffer = '';
-
     try {
-      const requestBody = { messages: currentSession.messages, model: modelSelect.value };
-      if (isVideoModel(modelSelect.value)) requestBody.video = collectVideoOptions();
-
       const response = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestBody),
+        body: JSON.stringify({ 
+          messages: currentSession.messages,
+          model: modelSelect.value 
+        }),
         signal: currentAbortController.signal 
       });
 
@@ -1713,6 +1154,10 @@ const HTML_CONTENT = `<!DOCTYPE html>
       
       const reader = response.body.getReader(); 
       const decoder = new TextDecoder('utf-8');
+      
+      let aiContent = ''; 
+      let reasoningContent = ''; 
+      let buffer = ''; 
       
       const rBox = bubble.querySelector('.reasoning-box');
       const tBox = bubble.querySelector('.message-text');
@@ -1767,13 +1212,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
               const data = JSON.parse(line.slice(5).trim());
               if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
 
-              if (data.video_progress !== undefined || data.video_status !== undefined) {
-                tBox.innerHTML = videoStatusHtml(data.video_progress, data.video_status, data.video_notice);
-                scrollArea.scrollTop = scrollArea.scrollHeight;
-                continue;
-              }
-              if (data.video_pending) { pendingVideo = data.video_pending; continue; }
-
               if (data.choices && data.choices[0].delta) {
                 const delta = data.choices[0].delta;
                 if (delta.reasoning_content) reasoningContent += delta.reasoning_content;
@@ -1798,16 +1236,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
 
       isCurrentlyStreaming = false;
       if (!reasoningContent && rBox) rBox.remove();
-
-      if (pendingVideo) {
-        const waitContent = VIDEO_MARK + pendingVideo.video_id + '|' + pendingVideo.model + ']]';
-        currentSession.messages.push({ role: 'assistant', content: waitContent });
-        saveSessions();
-        tBox.innerHTML = videoStatusHtml(null, 'queued');
-        startVideoPoll(pendingVideo.video_id, pendingVideo.model, currentSession, currentSession.messages.length - 1);
-        return;
-      }
-
+      
       tBox.innerHTML = marked.parse(aiContent);
       tBox.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
       scrollArea.scrollTop = scrollArea.scrollHeight;
@@ -1840,7 +1269,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
     } finally {
       isCurrentlyStreaming = false;
       currentAbortController = null;
-      if (videoPolls.size === 0) statusDot.classList.remove('generating');
+      statusDot.classList.remove('generating'); 
       
       sendBtn.classList.remove('stop-mode');
       sendBtn.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>';
