@@ -596,6 +596,14 @@ export default {
                 return;
               }
 
+              if (aiConfig.kind === 'video') {
+                if (pendingMsgId) {
+                  tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {});
+                }
+                await tgApi('sendMessage', { chat_id: chatId, text: "🎬 视频模型是异步任务，请在网页端使用（Telegram 通道暂不支持）。" });
+                return;
+              }
+
               const { apiUrl, currentApiKey, payload } = aiConfig;
 
               const aiResponse = await fetch(apiUrl, {
@@ -1603,8 +1611,13 @@ const HTML_CONTENT = `<!DOCTYPE html>
     sendBtn.classList.add('stop-mode');
     sendBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12" rx="2" ry="2"></rect></svg>';
 
+    // 声明在 try 之外，catch 分支需要读取已生成的内容（否则错误提示会失效）
+    let pendingVideo = null;
+    let aiContent = '';
+    let reasoningContent = '';
+    let buffer = '';
+
     try {
-      let pendingVideo = null;
       const requestBody = { messages: currentSession.messages, model: modelSelect.value };
       if (isVideoModel(modelSelect.value)) requestBody.video = collectVideoOptions();
 
@@ -1622,10 +1635,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
       
       const reader = response.body.getReader(); 
       const decoder = new TextDecoder('utf-8');
-      
-      let aiContent = ''; 
-      let reasoningContent = ''; 
-      let buffer = ''; 
       
       const rBox = bubble.querySelector('.reasoning-box');
       const tBox = bubble.querySelector('.message-text');
