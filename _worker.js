@@ -424,7 +424,7 @@ async function handleVideoChat(env, channel, body) {
   }
 
   const pollFloorMs = getNumberEnv(env, 'VIDEO_POLL_INTERVAL', 30, 10, 300) * 1000;
-  const pollCapMs = getNumberEnv(env, 'VIDEO_POLL_MAX_INTERVAL', 15, 3, 60) * 1000;
+  const pollCapMs = getNumberEnv(env, 'VIDEO_POLL_MAX_INTERVAL', 150, 30, 600) * 1000;
   const pollTimeoutMs = getNumberEnv(env, 'VIDEO_POLL_TIMEOUT', 170, 10, 600) * 1000;
   const startedAt = Date.now();
   const deadline = startedAt + pollTimeoutMs;
