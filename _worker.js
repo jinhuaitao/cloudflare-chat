@@ -262,24 +262,42 @@ function summarizeErrorBody(text) {
   return s.substring(0, 300) || '（空响应体）';
 }
 
-function retryAfterMs(response, fallbackMs) {
+// 只在上游明确给出 Retry-After 时遵从它，否则返回 0 交给本地退避策略
+function retryAfterMs(response) {
   const raw = Number(response.headers.get('retry-after'));
   if (Number.isFinite(raw) && raw > 0) return Math.min(raw * 1000, 30000);
-  return fallbackMs;
+  return 0;
 }
 
 function isTransientStatus(status) {
   return status === 429 || status === 502 || status === 503 || status === 504;
 }
 
+// 视频通常要 40s 以上才出结果，前 10s 之后逐步拉长间隔，避免轮询本身把上游打成 1015
+function pollDelayMs(elapsedMs, floorMs, capMs) {
+  if (elapsedMs < 10000) return floorMs;
+  if (elapsedMs < 40000) return Math.min(floorMs * 2, capMs);
+  return Math.min(floorMs * 3, capMs);
+}
+
+function backoffMs(streak, capMs) {
+  const base = Math.min(capMs, 4000 * Math.pow(2, Math.max(0, streak - 1)));
+  return Math.round(base * (0.85 + Math.random() * 0.3));
+}
+
+const UPSTREAM_HEADERS = {
+  'User-Agent': 'cloudflare-chat/1.0 (Cloudflare Worker; video task client)',
+  'Accept': 'application/json',
+};
+
 async function fetchVideoTask(apiUrl, apiKey, videoId, modelId) {
   let response;
   try {
     response = await fetch(videoTaskQueryUrl(apiUrl, videoId, modelId), {
-      headers: { 'Authorization': `Bearer ${apiKey}` },
+      headers: Object.assign({ 'Authorization': `Bearer ${apiKey}` }, UPSTREAM_HEADERS),
     });
   } catch (e) {
-    return { status: 'processing', url: null, progress: null, retryable: true, retryAfterMs: 5000, error: `查询任务网络异常：${e.message}` };
+    return { status: 'processing', url: null, progress: null, retryable: true, retryAfterMs: 0, error: `查询任务网络异常：${e.message}` };
   }
 
   const text = await response.text();
@@ -290,7 +308,7 @@ async function fetchVideoTask(apiUrl, apiKey, videoId, modelId) {
       url: null,
       progress: null,
       retryable,
-      retryAfterMs: retryable ? retryAfterMs(response, 6000) : 0,
+      retryAfterMs: retryable ? retryAfterMs(response) : 0,
       error: `查询任务失败 (${response.status}): ${summarizeErrorBody(text)}`,
     };
   }
@@ -317,6 +335,7 @@ async function fetchVideoTask(apiUrl, apiKey, videoId, modelId) {
 
 async function createVideoTask(env, channel, payload) {
   const maxAttempts = getNumberEnv(env, 'VIDEO_CREATE_RETRY', 3, 1, 5);
+  const capMs = getNumberEnv(env, 'VIDEO_POLL_MAX_INTERVAL', 15, 3, 60) * 1000;
   const waitBudgetMs = 45000;
   const startedAt = Date.now();
   let lastError = '';
@@ -324,10 +343,10 @@ async function createVideoTask(env, channel, payload) {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const response = await fetch(channel.apiUrl, {
       method: 'POST',
-      headers: {
+      headers: Object.assign({
         'Authorization': `Bearer ${channel.currentApiKey}`,
         'Content-Type': 'application/json',
-      },
+      }, UPSTREAM_HEADERS),
       body: JSON.stringify(payload),
     });
     const text = await response.text();
@@ -335,7 +354,7 @@ async function createVideoTask(env, channel, payload) {
     if (response.ok) return { text };
 
     if (isTransientStatus(response.status)) {
-      const wait = retryAfterMs(response, 4000 * attempt);
+      const wait = retryAfterMs(response) || backoffMs(attempt, capMs);
       lastError = `(${response.status}) ${summarizeErrorBody(text)}`;
       const exhausted = attempt === maxAttempts || Date.now() - startedAt + wait > waitBudgetMs;
       if (exhausted) {
@@ -404,15 +423,18 @@ async function handleVideoChat(env, channel, body) {
     }), { status: 502, headers: CORS_HEADERS });
   }
 
-  const pollIntervalMs = getNumberEnv(env, 'VIDEO_POLL_INTERVAL', 3, 1, 30) * 1000;
+  const pollFloorMs = getNumberEnv(env, 'VIDEO_POLL_INTERVAL', 3, 1, 30) * 1000;
+  const pollCapMs = getNumberEnv(env, 'VIDEO_POLL_MAX_INTERVAL', 15, 3, 60) * 1000;
   const pollTimeoutMs = getNumberEnv(env, 'VIDEO_POLL_TIMEOUT', 170, 10, 600) * 1000;
-  const deadline = Date.now() + pollTimeoutMs;
+  const startedAt = Date.now();
+  const deadline = startedAt + pollTimeoutMs;
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     async start(controller) {
       let finished = false;
-      let nextDelay = pollIntervalMs;
+      let transientStreak = 0;
+      let nextDelay = pollFloorMs;
       try {
         sseEvent(controller, encoder, { video_job: { video_id: videoId, model: channel.selectedModel } });
 
@@ -431,11 +453,18 @@ async function handleVideoChat(env, channel, body) {
             break;
           }
           // 限流/网络抖动不算失败，任务仍在队列里，退避后继续查
-          nextDelay = task.retryable ? Math.min(task.retryAfterMs || pollIntervalMs, 20000) : pollIntervalMs;
+          if (task.retryable) {
+            transientStreak++;
+            nextDelay = Math.min(task.retryAfterMs || backoffMs(transientStreak, pollCapMs), 30000);
+          } else {
+            transientStreak = 0;
+            nextDelay = pollDelayMs(Date.now() - startedAt, pollFloorMs, pollCapMs);
+          }
           sseEvent(controller, encoder, {
             video_progress: task.progress,
             video_status: task.retryable ? 'rate_limited' : task.status,
             video_notice: task.error || null,
+            video_retry_after: Math.round(nextDelay / 1000),
           });
         }
 
@@ -558,7 +587,7 @@ export default {
           progress: task.progress,
           url: task.url,
           error: task.error,
-          retry_after: task.retryable ? Math.max(1, Math.round((task.retryAfterMs || 3000) / 1000)) : null,
+          retry_after: task.retryable ? Math.max(5, Math.round((task.retryAfterMs || 8000) / 1000)) : null,
         }), { headers: CORS_HEADERS });
       } catch (error) {
         return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: CORS_HEADERS });
@@ -1476,11 +1505,12 @@ const HTML_CONTENT = `<!DOCTYPE html>
       var row = messagesDiv.children[msgIndex];
       var target = row ? row.querySelector('.message-text') : null;
       if (target) target.innerHTML = videoStatusHtml(task ? task.progress : null, task ? task.status : 'processing', task ? task.error : '查询请求失败');
-      var delay = (task && task.retry_after) ? Math.min(Math.max(task.retry_after, 1), 30) * 1000 : 3000;
+      // 上游按 IP 限流，浏览器侧同样要低频查询：默认 8 秒，有 Retry-After 时不少于 5 秒
+      var delay = (task && task.retry_after) ? Math.min(Math.max(task.retry_after, 5), 30) * 1000 : 8000;
       handle.timer = setTimeout(tick, delay);
     };
 
-    handle.timer = setTimeout(tick, 1500);
+    handle.timer = setTimeout(tick, 4000);
   }
 
   videoMode.addEventListener('change', syncVideoPanel);
