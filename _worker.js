@@ -27,6 +27,47 @@ function parseCommaSeparated(str) {
   return str.split(',').map(s => s.trim()).filter(Boolean);
 }
 
+// 取最后一条 user 消息作为绘图提示词
+function getLastUserPrompt(messagesArray) {
+  for (let i = messagesArray.length - 1; i >= 0; i--) {
+    const m = messagesArray[i];
+    if (m && m.role === 'user' && typeof m.content === 'string' && m.content.trim()) {
+      return m.content.trim();
+    }
+  }
+  const last = messagesArray[messagesArray.length - 1];
+  return last && typeof last.content === 'string' ? last.content.trim() : '';
+}
+
+// 从提示词中识别图片链接（markdown 图片语法或裸 URL），用于图生图/多图合成
+const IMG_URL_REG = /(https?:\/\/[^\s)"'<>\u4e00-\u9fa5]+?\.(?:png|jpe?g|webp|gif|bmp)(?:\?[^\s)"'<>\u4e00-\u9fa5]*)?|data:image\/[a-z+]+;base64,[A-Za-z0-9+/=]+)/gi;
+function extractImageUrls(prompt) {
+  const found = prompt.match(IMG_URL_REG) || [];
+  return [...new Set(found)].slice(0, 8);
+}
+
+// 把上游图像响应统一成前端可渲染的 markdown；优先 URL，退回 Base64 Data URI
+function formatImageReply(responseData) {
+  const item = responseData?.data?.[0];
+  if (item?.url) return `![生成结果](${item.url})`;
+  if (item?.b64_json) return `![生成结果](data:image/png;base64,${item.b64_json})`;
+  if (responseData?.choices?.[0]?.message?.content) return responseData.choices[0].message.content;
+  return "图片生成失败或未返回有效格式：响应中既没有 data[0].url 也没有 data[0].b64_json。";
+}
+
+// 一次性推送完整 SSE 响应（图像/视频任务用，无需真实流）
+function sseResponse(payloadObjects) {
+  const chunks = payloadObjects.map(obj => 'data: ' + JSON.stringify(obj) + '\n\n');
+  chunks.push('data: [DONE]\n\n');
+  return new Response(chunks.join(''), { headers: SSE_HEADERS });
+}
+
+// 文档说明：id / task_id 是任务 ID，video_id 才用于查询；不同响应里字段名不完全一致，按优先级取
+function extractVideoTaskId(taskData) {
+  const id = taskData.video_id || taskData.id || taskData.task_id;
+  return id ? String(id) : '';
+}
+
 // ======= 统一解析通道配置（带内存缓存） =======
 function getChannelConfig(env) {
   if (cachedConfig) {
@@ -98,7 +139,48 @@ function getChannelConfig(env) {
   return cachedConfig;
 }
 
+// 查询视频任务状态（Agnes 异步接口挂在域名根路径，不在 /v1 下）
+async function requestVideoStatus(channel, targetModel, videoId) {
+  const apiKey = channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : '';
+  const queryUrl = getVideoQueryUrl(channel.url) + '?video_id=' + encodeURIComponent(videoId) + '&model_name=' + encodeURIComponent(targetModel);
+  const upstream = await fetch(queryUrl, { headers: { 'Authorization': `Bearer ${apiKey}` } });
+  const rawText = await upstream.text();
+  let data = null;
+  try { data = JSON.parse(rawText); } catch (e) {}
+  return { queryUrl, ok: upstream.ok, upstreamStatus: upstream.status, rawText, data };
+}
+
+// 文档要求忽略 internal_status / internal_progress，只认 status 与 progress
+async function pollVideoTask(channel, targetModel, videoId, maxAttempts, delayMs) {
+  for (let i = 0; i < maxAttempts; i++) {
+    await new Promise(r => setTimeout(r, delayMs));
+    const res = await requestVideoStatus(channel, targetModel, videoId);
+    if (!res.ok) return { status: 'failed', error: `查询失败 (${res.upstreamStatus}) -> ${res.queryUrl}: ${res.rawText.slice(0, 200)}` };
+    if (!res.data) return { status: 'failed', error: `查询响应不是合法 JSON: ${res.rawText.slice(0, 200)}` };
+
+    if (res.data.status === 'completed') return { status: 'completed', url: res.data.url || '', data: res.data };
+    if (res.data.status === 'failed') {
+      const e = res.data.error;
+      return { status: 'failed', error: (typeof e === 'string' && e) || e?.message || res.data.detail || '上游任务执行失败' };
+    }
+  }
+  return { status: 'timeout', error: `轮询 ${maxAttempts} 次仍未完成。可稍后重试 GET /api/video?video_id=${videoId}&model=${targetModel}` };
+}
+
 // 提取共用的 AI 请求构建逻辑 (DRY原则)
+function isAgnesImageApi(apiUrl, modelId) {
+  return apiUrl.includes('agnes') || modelId.toLowerCase().includes('agnes');
+}
+
+// 视频通道是异步任务制：创建接口以 /videos 结尾，查询接口固定挂在域名根路径的 /agnesapi
+function isVideoApi(apiUrl, modelId) {
+  return apiUrl.includes('/videos') || modelId.toLowerCase().includes('video');
+}
+
+function getVideoQueryUrl(apiUrl) {
+  return new URL(apiUrl).origin + '/agnesapi';
+}
+
 function buildAIRequest(env, requestedModel, messagesArray, isStream) {
   const { models, modelMap } = getChannelConfig(env);
   if (models.length === 0) {
@@ -116,20 +198,49 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream) {
 
   const currentApiKey = channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
   const apiUrl = channel.url;
-  const isImageAPI = apiUrl.includes('images/generations') || selectedModel.toLowerCase().includes('image');
+  const isVideoAPI = isVideoApi(apiUrl, selectedModel);
+  const isImageAPI = !isVideoAPI && (apiUrl.includes('images/generations') || selectedModel.toLowerCase().includes('image'));
 
-  const payload = isImageAPI ? {
-    model: selectedModel,
-    prompt: messagesArray[messagesArray.length - 1].content,
-    n: 1
-  } : {
-    model: selectedModel,
-    messages: messagesArray,
-    stream: isStream,
-    max_tokens: 4096, 
-  };
+  let payload;
+  if (isVideoAPI) {
+    // Agnes Video Flash：size 只接受字符串 "720P"，seconds 为字符串 "4"-"12"，参考模式不在本次支持范围
+    payload = {
+      model: selectedModel,
+      prompt: getLastUserPrompt(messagesArray),
+      mode: 'text',
+      size: env.VIDEO_SIZE || '720P',
+      seconds: env.VIDEO_SECONDS || '5',
+      aspect_ratio: env.VIDEO_ASPECT_RATIO || '16:9',
+    };
+  } else if (!isImageAPI) {
+    payload = {
+      model: selectedModel,
+      messages: messagesArray,
+      stream: isStream,
+      max_tokens: 4096,
+    };
+  } else if (isAgnesImageApi(apiUrl, selectedModel)) {
+    // Agnes 图像接口：size 必填，response_format 必须放在 extra_body 内部（顶层会 400）
+    const prompt = getLastUserPrompt(messagesArray);
+    const extraBody = { response_format: env.IMAGE_RESPONSE_FORMAT || 'url' };
+    const images = extractImageUrls(prompt);
+    if (images.length > 0) extraBody.image = images;
 
-  return { apiUrl, currentApiKey, payload, isImageAPI };
+    payload = {
+      model: selectedModel,
+      prompt,
+      size: env.IMAGE_SIZE || '1024x768',
+      extra_body: extraBody,
+    };
+  } else {
+    payload = {
+      model: selectedModel,
+      prompt: getLastUserPrompt(messagesArray),
+      n: 1
+    };
+  }
+
+  return { apiUrl, currentApiKey, payload, isImageAPI, isVideoAPI, selectedModel };
 }
 
 export default {
@@ -145,6 +256,7 @@ export default {
     }
 
     if (request.method === 'POST' && url.pathname === '/api/chat') {
+      let aiConfig = null;
       try {
         let body;
         try {
@@ -153,12 +265,12 @@ export default {
           return new Response(JSON.stringify({ error: "无效的请求格式" }), { status: 400, headers: CORS_HEADERS });
         }
 
-        const aiConfig = buildAIRequest(env, body.model, body.messages, true);
+        aiConfig = buildAIRequest(env, body.model, body.messages, true);
         if (aiConfig.error) {
           return new Response(JSON.stringify({ error: aiConfig.error }), { status: 500, headers: CORS_HEADERS });
         }
 
-        const { apiUrl, currentApiKey, payload, isImageAPI } = aiConfig;
+        const { apiUrl, currentApiKey, payload, isImageAPI, isVideoAPI } = aiConfig;
 
         const nvidiaResponse = await fetch(apiUrl, {
           method: 'POST',
@@ -177,32 +289,58 @@ export default {
           });
         }
 
+        if (isVideoAPI) {
+          const taskData = await nvidiaResponse.json();
+          const videoId = extractVideoTaskId(taskData);
+          if (!videoId) {
+            return new Response(JSON.stringify({ error: `视频任务已创建但响应里没有 video_id/id/task_id，原始响应: ${JSON.stringify(taskData).slice(0, 300)}` }), { status: 502, headers: CORS_HEADERS });
+          }
+          // 只回传任务 ID，由前端轮询 /api/video 获取最终地址，避免长时间占用单次请求
+          return sseResponse([{ video_task: { video_id: videoId, model: payload.model } }]);
+        }
+
         if (!isImageAPI) {
           return new Response(nvidiaResponse.body, { headers: SSE_HEADERS });
         } else {
           const responseData = await nvidiaResponse.json();
-          let imageUrlOrText = "图片生成失败或未返回格式";
-          
-          if (responseData.data && responseData.data[0]?.url) {
-            imageUrlOrText = `![生成结果](${responseData.data[0].url})`;
-          } else if (responseData.choices && responseData.choices[0]?.message) {
-            imageUrlOrText = responseData.choices[0].message.content;
-          }
-
-          const encoder = new TextEncoder();
-          const stream = new ReadableStream({
-            start(controller) {
-              const fakeChunk = JSON.stringify({ choices: [{ delta: { content: imageUrlOrText + "\n\n" } }] });
-              controller.enqueue(encoder.encode(`data: ${fakeChunk}\n\n`));
-              controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-              controller.close();
-            }
-          });
-
-          return new Response(stream, { headers: SSE_HEADERS });
+          const imageUrlOrText = formatImageReply(responseData);
+          return sseResponse([{ choices: [{ delta: { content: imageUrlOrText + "\n\n" } }] }]);
         }
       } catch (error) {
-        return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: CORS_HEADERS });
+        const ctxInfo = aiConfig?.apiUrl ? ` [模型 ${aiConfig.payload.model} -> ${aiConfig.apiUrl}] ` : '';
+        return new Response(JSON.stringify({ error: ctxInfo + error.message }), { status: 500, headers: CORS_HEADERS });
+      }
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/video') {
+      const videoId = url.searchParams.get('video_id') || '';
+      const model = url.searchParams.get('model') || '';
+      if (!videoId) {
+        return new Response(JSON.stringify({ error: '缺少 video_id 参数' }), { status: 400, headers: CORS_HEADERS });
+      }
+
+      const { models, modelMap } = getChannelConfig(env);
+      let targetModel = model;
+      if (!modelMap.has(targetModel)) {
+        const videoModel = models.find(m => isVideoApi('', m.id));
+        targetModel = videoModel ? videoModel.id : '';
+      }
+      const channel = targetModel ? modelMap.get(targetModel) : null;
+      if (!channel) {
+        return new Response(JSON.stringify({ error: `未找到视频模型 ${model || '(自动匹配)'} 对应的通道：请在环境变量 MODEL_x 中添加该视频模型` }), { status: 500, headers: CORS_HEADERS });
+      }
+
+      try {
+        const query = await requestVideoStatus(channel, targetModel, videoId);
+        if (!query.ok) {
+          return new Response(JSON.stringify({ error: `视频任务查询失败 (${query.upstreamStatus}) -> ${query.queryUrl}: ${query.rawText.slice(0, 300)}` }), { status: query.upstreamStatus, headers: CORS_HEADERS });
+        }
+        if (!query.data) {
+          return new Response(JSON.stringify({ error: `视频任务查询响应不是合法 JSON -> ${query.queryUrl}: ${query.rawText.slice(0, 300)}` }), { status: 502, headers: CORS_HEADERS });
+        }
+        return new Response(query.rawText, { headers: CORS_HEADERS });
+      } catch (error) {
+        return new Response(JSON.stringify({ error: `视频任务查询请求异常 [模型 ${targetModel}]: ${error.message}` }), { status: 500, headers: CORS_HEADERS });
       }
     }
 
@@ -334,8 +472,19 @@ export default {
               if (aiResponse.ok) {
                 const aiData = await aiResponse.json();
                 let replyText = "AI 没有返回有效内容。";
-                
-                if (aiData.choices && aiData.choices[0]?.message) {
+
+                if (aiConfig.isVideoAPI) {
+                  const videoId = extractVideoTaskId(aiData);
+                  if (!videoId) {
+                    replyText = `⚠️ 视频任务已创建但响应里没有 video_id/id/task_id，原始响应: ${JSON.stringify(aiData).slice(0, 200)}`;
+                  } else {
+                    await tgApi('sendMessage', { chat_id: chatId, text: `🎬 视频任务已提交（任务 ID: ${videoId}），生成通常需要 1-3 分钟，完成后会自动发送结果。` });
+                    const final = await pollVideoTask({ url: apiUrl, keys: [currentApiKey] }, payload.model, videoId, 100, 3000);
+                    replyText = final.status === 'completed' && final.url
+                      ? `🎬 视频已生成，[点击在线观看](${final.url})`
+                      : `⚠️ 视频未生成成功: ${final.error}`;
+                  }
+                } else if (aiData.choices && aiData.choices[0]?.message) {
                   replyText = aiData.choices[0].message.content;
                 } else if (aiData.data && aiData.data[0]?.url) {
                   replyText = `[🖼️ 点击查看生成的图片](${aiData.data[0].url})`;
@@ -1066,6 +1215,13 @@ const HTML_CONTENT = `<!DOCTYPE html>
       emptyState.style.display = 'none'; 
       currentSession.messages.forEach(msg => {
         const uiRole = msg.role === 'assistant' ? 'ai' : msg.role;
+        // 刷新页面后未完成的视频任务接着轮询
+        if (msg.videoTask && msg.videoTask.video_id) {
+          const resumeId = 'ai_resume_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
+          appendMessageDOM('ai', '<div style="color: var(--brand-color); font-size: 14px; font-weight: 500;">🎬 恢复视频任务轮询 ' + msg.videoTask.video_id + ' ...</div>', resumeId, false);
+          pollVideoTaskOnPage(msg.videoTask, resumeId, msg);
+          return;
+        }
         appendMessageDOM(uiRole, msg.content, null, false);
       }); 
     }
@@ -1107,6 +1263,86 @@ const HTML_CONTENT = `<!DOCTYPE html>
     if (rBox) { rBox.scrollTop = rBox.scrollHeight; }
 
     return bubble;
+  }
+
+  const VIDEO_POLL_INTERVAL = 4000;
+  const VIDEO_POLL_MAX = 150;
+
+  // 视频 URL 来自上游接口，作为 HTML 属性注入前先做转义
+  function escapeHtmlAttr(str) {
+    return String(str).replace(ESCAPE_REG, m => ESCAPE_MAP[m]).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function buildVideoHtml(url) {
+    const safeUrl = escapeHtmlAttr(url);
+    return '<video src="' + safeUrl + '" controls playsinline preload="metadata" style="width:100%;max-width:640px;border-radius:12px;display:block;margin-bottom:10px;"></video>' +
+      '<a href="' + safeUrl + '" target="_blank" rel="noopener">在新窗口打开视频</a>';
+  }
+
+  function renderVideoState(msgId, html) {
+    if (document.getElementById(msgId)) appendMessageDOM('ai', html, msgId);
+  }
+
+  function videoErrorHtml(text) {
+    return '<span style="color: #ef4444; font-size: 13px; font-weight: 500;">' + text + '</span>';
+  }
+
+  function finishVideoTask(msgObj, content) {
+    if (!msgObj) return;
+    msgObj.videoTask = null;
+    msgObj.content = content;
+    saveSessions();
+  }
+
+  // 异步任务由前端轮询，避免把几分钟的等待压在单次 Worker 请求里
+  async function pollVideoTaskOnPage(task, msgId, msgObj) {
+    for (let i = 0; i < VIDEO_POLL_MAX; i++) {
+      await new Promise(resolve => setTimeout(resolve, VIDEO_POLL_INTERVAL));
+
+      let response;
+      try {
+        response = await fetch('/api/video?video_id=' + encodeURIComponent(task.video_id) + '&model=' + encodeURIComponent(task.model));
+      } catch (e) {
+        renderVideoState(msgId, videoErrorHtml('视频状态查询请求失败: ' + e.message + '，正在重试...'));
+        continue;
+      }
+
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        const why = data.error || ('视频状态查询失败 HTTP ' + response.status);
+        renderVideoState(msgId, videoErrorHtml(why));
+        finishVideoTask(msgObj, '(视频生成失败: ' + why + ')');
+        return;
+      }
+
+      if (data.status === 'completed') {
+        if (!data.url) {
+          const why = '任务已完成，但响应里没有顶层 url 字段，原始响应: ' + JSON.stringify(data).slice(0, 200);
+          renderVideoState(msgId, videoErrorHtml(why));
+          finishVideoTask(msgObj, why);
+          return;
+        }
+        const html = buildVideoHtml(data.url);
+        renderVideoState(msgId, html);
+        finishVideoTask(msgObj, html);
+        return;
+      }
+
+      if (data.status === 'failed') {
+        const why = (typeof data.error === 'string' && data.error) || (data.error && data.error.message) || data.detail || '上游任务失败';
+        renderVideoState(msgId, videoErrorHtml('视频生成失败: ' + why));
+        finishVideoTask(msgObj, '(视频生成失败: ' + why + ')');
+        return;
+      }
+
+      const progress = typeof data.progress === 'number' ? data.progress : 0;
+      renderVideoState(msgId, '<div style="color: var(--brand-color); font-size: 14px; font-weight: 500;">🎬 视频生成中 ' + progress + '%，通常需要 1-3 分钟，请勿关闭页面。</div>');
+    }
+
+    const why = '轮询超时：任务 ' + task.video_id + ' 在 ' + Math.round(VIDEO_POLL_INTERVAL * VIDEO_POLL_MAX / 1000) + ' 秒内未完成，可稍后访问 /api/video?video_id=' + encodeURIComponent(task.video_id) + ' 继续查询。';
+    renderVideoState(msgId, videoErrorHtml(why));
+    finishVideoTask(msgObj, '(视频生成超时: ' + why + ')');
   }
 
   async function sendMessage() {
@@ -1166,6 +1402,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
       let aiContent = ''; 
       let reasoningContent = ''; 
       let buffer = ''; 
+      let videoTask = null;
       
       const rBox = bubble.querySelector('.reasoning-box');
       const tBox = bubble.querySelector('.message-text');
@@ -1220,6 +1457,9 @@ const HTML_CONTENT = `<!DOCTYPE html>
               const data = JSON.parse(line.slice(5).trim());
               if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
 
+              // 视频通道只回传任务 ID，后续状态由前端轮询获取
+              if (data.video_task) { videoTask = data.video_task; continue; }
+
               if (data.choices && data.choices[0].delta) {
                 const delta = data.choices[0].delta;
                 if (delta.reasoning_content) reasoningContent += delta.reasoning_content;
@@ -1243,6 +1483,17 @@ const HTML_CONTENT = `<!DOCTYPE html>
       }
 
       isCurrentlyStreaming = false;
+
+      if (videoTask) {
+        if (rBox) rBox.remove();
+        const videoMsg = { role: 'assistant', content: '(视频生成中...)', videoTask: videoTask };
+        currentSession.messages.push(videoMsg);
+        saveSessions();
+        renderVideoState(aiMsgId, '<div style="color: var(--brand-color); font-size: 14px; font-weight: 500;">🎬 视频任务已提交，正在排队生成...</div>');
+        await pollVideoTaskOnPage(videoTask, aiMsgId, videoMsg);
+        return;
+      }
+
       if (!reasoningContent && rBox) rBox.remove();
       
       tBox.innerHTML = marked.parse(aiContent);
