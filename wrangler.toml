@@ -1,11 +1,5 @@
 name = "ai-assistant-pro"
-main = "_worker.js"
+main = "index.js"
 compatibility_date = "2024-03-20"
 
-# 在控制台 Storage & Databases -> KV -> Create 建名为 TG_KV 的命名空间，
-# 把它的 Namespace ID 填到下面的 id，然后提交推送；Git 构建会自动绑定。
-# binding 必须保持为 "KV"：代码读的是 env.KV（_worker.js:247、282），
-# TG_KV 只是控制台的显示名。
-[[kv_namespaces]]
-binding = "KV"
-id = "REPLACE_WITH_TG_KV_NAMESPACE_ID"
+# 如果你使用的是不同的文件名，请将上面的 main 修改为对应的文件名
