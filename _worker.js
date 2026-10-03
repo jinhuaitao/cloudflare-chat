@@ -87,11 +87,14 @@ function getChannelConfig(env) {
     return cachedConfig;
   }
 
+  // 兜底：只使用环境变量中显式配置的模型，不再内置任何默认模型
   const fallbackUrl = env.API_URL || "";
   const fallbackKeys = parseCommaSeparated(env.API_KEY);
-  const fallbackModelStr = env.MODEL || "meta/llama3-70b-instruct:Llama 3 70B,deepseek-ai/DeepSeek-R1:深度思考 R1";
-  
-  addModels(fallbackModelStr, fallbackUrl, fallbackKeys);
+  const fallbackModelStr = env.MODEL || "";
+
+  if (fallbackUrl && fallbackModelStr) {
+    addModels(fallbackModelStr, fallbackUrl, fallbackKeys);
+  }
 
   cachedConfig = { models, modelMap };
   return cachedConfig;
@@ -100,14 +103,19 @@ function getChannelConfig(env) {
 // 提取共用的 AI 请求构建逻辑 (DRY原则)
 function buildAIRequest(env, requestedModel, messagesArray, isStream) {
   const { models, modelMap } = getChannelConfig(env);
-  let selectedModel = requestedModel || (models.length > 0 ? models[0].id : "");
+
+  if (models.length === 0) {
+    return { error: "未配置任何可用模型。请在 Worker 的环境变量中设置 API_URL_1 / API_KEY_1 / MODEL_1（或 API_URL / API_KEY / MODEL），保存后重新部署一次。" };
+  }
+
+  let selectedModel = requestedModel || models[0].id;
 
   if (!modelMap.has(selectedModel)) {
-    selectedModel = models.length > 0 ? models[0].id : "";
+    selectedModel = models[0].id;
   }
 
   const channel = modelMap.get(selectedModel);
-  if (!channel || !channel.url) return { error: "该模型对应的 API_URL 未配置或异常" };
+  if (!channel || !channel.url) return { error: `模型 ${selectedModel} 对应的 API_URL 未配置或异常` };
 
   const currentApiKey = channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
   const apiUrl = channel.url;
@@ -203,7 +211,9 @@ export default {
 
     if (request.method === 'GET' && url.pathname === '/') {
       const { models } = getChannelConfig(env);
-      
+
+      const escHtml = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
       let optionsHtml = '';
       for (let i = 0; i < models.length; i++) {
         const item = models[i];
@@ -211,7 +221,11 @@ export default {
         if (!item.original.includes(':')) {
           displayName = item.id.length > 24 ? item.id.substring(0, 22) + '...' : item.id;
         }
-        optionsHtml += `<option value="${item.id}" ${i === 0 ? 'selected' : ''}>${displayName}</option>`;
+        optionsHtml += `<option value="${escHtml(item.id)}" ${i === 0 ? 'selected' : ''}>${escHtml(displayName)}</option>`;
+      }
+
+      if (models.length === 0) {
+        optionsHtml = '<option value="" disabled selected>未配置模型，请检查环境变量</option>';
       }
 
       const html = HTML_CONTENT.replaceAll('{{MODEL_OPTIONS}}', optionsHtml);

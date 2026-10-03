@@ -125,6 +125,8 @@ MODEL   = gpt-4o:GPT-4o, deepseek-ai/DeepSeek-R1:深度思考 R1
 
 > 优先级说明：`API_CONFIG`（JSON 格式）> 带编号的 `API_URL_1/API_KEY_1/MODEL_1` 系列 > 不带编号的 `API_URL/API_KEY/MODEL`。同时存在时以优先级高的为准。
 
+> 代码中**不内置任何默认模型**。没有配置环境变量时，前端下拉框会显示「未配置模型，请检查环境变量」，调用接口会返回明确的错误提示，而不会出现一个选了就报错的幽灵模型。
+
 ---
 
 # 第四步：启用 Telegram 机器人（可选）
@@ -153,7 +155,11 @@ https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=https://<你的Work
 
 **页面一直提示 API 错误 / 模型下拉框是空的**
 
-环境变量没填、填错通道编号，或者改完变量没有重新部署。检查 `API_URL_1` / `API_KEY_1` / `MODEL_1` 三件套是否齐全，且编号连续。
+如果下拉框显示「未配置模型，请检查环境变量」，说明 Worker 没有读到任何模型配置：检查 `API_URL_1` / `API_KEY_1` / `MODEL_1` 三件套是否齐全、编号是否从 1 开始连续，以及改完变量后是否重新部署过。
+
+注意 `MODEL_1` 只有和 `API_URL_1` 同时存在时才会生效 —— 只填模型名不填接口地址不会产生任何模型。
+
+如果下拉框有模型但对话报错，多半是 `API_KEY_1` 没填或填错，可以在 Cloudflare 的实时日志（Workers & Pages → 你的 Worker → Logs）里看到上游接口返回的具体报错。
 
 **每次部署都会重复创建 KV 命名空间**
 
