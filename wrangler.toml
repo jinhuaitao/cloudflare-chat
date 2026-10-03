@@ -1,5 +1,10 @@
 name = "ai-assistant-pro"
-main = "index.js"
+main = "_worker.js"
 compatibility_date = "2024-03-20"
 
-# 如果你使用的是不同的文件名，请将上面的 main 修改为对应的文件名
+# 运行 `wrangler kv namespace create TG_KV`，把返回的 id 粘贴到下面。
+# binding 必须保持为 "KV"：代码里读的是 env.KV（_worker.js:247、282），
+# TG_KV 只是控制台里看到的命名空间名字。
+[[kv_namespaces]]
+binding = "KV"
+id = "REPLACE_WITH_TG_KV_NAMESPACE_ID"
