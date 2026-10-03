@@ -250,20 +250,56 @@ function videoTaskQueryUrl(apiUrl, videoId, modelId) {
     + '&model_name=' + encodeURIComponent(modelId);
 }
 
+// Cloudflare 网关的 429 会返回 HTML 错误页，直接透传会淹没关键信息
+function summarizeErrorBody(text) {
+  let s = String(text || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  const code = s.match(/error code:\s*(\d+)/i);
+  if (code) {
+    s = code[1] === '1015'
+      ? '429 / error code 1015：Cloudflare 对同一出口 IP 限流，与提示词内容无关，降低发送频率即可'
+      : `error code: ${code[1]}`;
+  }
+  return s.substring(0, 300) || '（空响应体）';
+}
+
+function retryAfterMs(response, fallbackMs) {
+  const raw = Number(response.headers.get('retry-after'));
+  if (Number.isFinite(raw) && raw > 0) return Math.min(raw * 1000, 30000);
+  return fallbackMs;
+}
+
+function isTransientStatus(status) {
+  return status === 429 || status === 502 || status === 503 || status === 504;
+}
+
 async function fetchVideoTask(apiUrl, apiKey, videoId, modelId) {
-  const response = await fetch(videoTaskQueryUrl(apiUrl, videoId, modelId), {
-    headers: { 'Authorization': `Bearer ${apiKey}` },
-  });
+  let response;
+  try {
+    response = await fetch(videoTaskQueryUrl(apiUrl, videoId, modelId), {
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+    });
+  } catch (e) {
+    return { status: 'processing', url: null, progress: null, retryable: true, retryAfterMs: 5000, error: `查询任务网络异常：${e.message}` };
+  }
+
   const text = await response.text();
   if (!response.ok) {
-    return { status: 'failed', url: null, progress: null, error: `查询任务失败 (${response.status}): ${text.substring(0, 400)}` };
+    const retryable = isTransientStatus(response.status);
+    return {
+      status: retryable ? 'processing' : 'failed',
+      url: null,
+      progress: null,
+      retryable,
+      retryAfterMs: retryable ? retryAfterMs(response, 6000) : 0,
+      error: `查询任务失败 (${response.status}): ${summarizeErrorBody(text)}`,
+    };
   }
 
   let data;
   try {
     data = JSON.parse(text);
   } catch (e) {
-    return { status: 'failed', url: null, progress: null, error: `无法解析任务查询响应：${text.substring(0, 400)}` };
+    return { status: 'failed', url: null, progress: null, error: `无法解析任务查询响应：${summarizeErrorBody(text)}` };
   }
 
   const videoUrl = data.url || (data.data && data.data.url) || null;
@@ -277,6 +313,42 @@ async function fetchVideoTask(apiUrl, apiKey, videoId, modelId) {
     progress: typeof data.progress === 'number' ? data.progress : null,
     error: errorText,
   };
+}
+
+async function createVideoTask(env, channel, payload) {
+  const maxAttempts = getNumberEnv(env, 'VIDEO_CREATE_RETRY', 3, 1, 5);
+  const waitBudgetMs = 45000;
+  const startedAt = Date.now();
+  let lastError = '';
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const response = await fetch(channel.apiUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${channel.currentApiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+    const text = await response.text();
+
+    if (response.ok) return { text };
+
+    if (isTransientStatus(response.status)) {
+      const wait = retryAfterMs(response, 4000 * attempt);
+      lastError = `(${response.status}) ${summarizeErrorBody(text)}`;
+      const exhausted = attempt === maxAttempts || Date.now() - startedAt + wait > waitBudgetMs;
+      if (exhausted) {
+        return { error: `Agnes 创建视频任务被限流，已重试 ${attempt} 次仍未放行：${lastError}。请稍后再发或调小请求频率（可调环境变量 VIDEO_CREATE_RETRY）。` };
+      }
+      await sleep(wait);
+      continue;
+    }
+
+    return { error: `Agnes 创建视频任务失败 (${response.status}): ${summarizeErrorBody(text)}` };
+  }
+
+  return { error: `Agnes 创建视频任务失败：${lastError}` };
 }
 
 const VIDEO_MODE_LABELS = { text: '文生视频', keyframe: '首尾帧视频', reference: '素材参考视频' };
@@ -311,35 +383,24 @@ async function handleVideoChat(env, channel, body) {
     return new Response(JSON.stringify({ error: built.error }), { status: 400, headers: CORS_HEADERS });
   }
 
-  const createResponse = await fetch(channel.apiUrl, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${channel.currentApiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(built.payload),
-  });
-
-  const createText = await createResponse.text();
-  if (!createResponse.ok) {
-    return new Response(JSON.stringify({
-      error: `Agnes 创建视频任务失败 (${createResponse.status}): ${createText.substring(0, 400)}`,
-    }), { status: 502, headers: CORS_HEADERS });
+  const created = await createVideoTask(env, channel, built.payload);
+  if (created.error) {
+    return new Response(JSON.stringify({ error: created.error }), { status: 502, headers: CORS_HEADERS });
   }
 
-  let created;
+  let createdData;
   try {
-    created = JSON.parse(createText);
+    createdData = JSON.parse(created.text);
   } catch (e) {
     return new Response(JSON.stringify({
-      error: `无法解析创建任务响应：${createText.substring(0, 400)}`,
+      error: `无法解析创建任务响应：${summarizeErrorBody(created.text)}`,
     }), { status: 502, headers: CORS_HEADERS });
   }
 
-  const videoId = created.video_id || created.id || created.task_id || (created.data && created.data.video_id);
+  const videoId = createdData.video_id || createdData.id || createdData.task_id || (createdData.data && createdData.data.video_id);
   if (!videoId) {
     return new Response(JSON.stringify({
-      error: `创建任务响应中未找到 video_id：${createText.substring(0, 400)}`,
+      error: `创建任务响应中未找到 video_id：${summarizeErrorBody(created.text)}`,
     }), { status: 502, headers: CORS_HEADERS });
   }
 
@@ -351,11 +412,12 @@ async function handleVideoChat(env, channel, body) {
   const stream = new ReadableStream({
     async start(controller) {
       let finished = false;
+      let nextDelay = pollIntervalMs;
       try {
         sseEvent(controller, encoder, { video_job: { video_id: videoId, model: channel.selectedModel } });
 
         while (Date.now() < deadline) {
-          await sleep(pollIntervalMs);
+          await sleep(nextDelay);
           const task = await fetchVideoTask(channel.apiUrl, channel.currentApiKey, videoId, channel.selectedModel);
 
           if (task.status === 'completed' && task.url) {
@@ -368,7 +430,13 @@ async function handleVideoChat(env, channel, body) {
             finished = true;
             break;
           }
-          sseEvent(controller, encoder, { video_progress: task.progress, video_status: task.status });
+          // 限流/网络抖动不算失败，任务仍在队列里，退避后继续查
+          nextDelay = task.retryable ? Math.min(task.retryAfterMs || pollIntervalMs, 20000) : pollIntervalMs;
+          sseEvent(controller, encoder, {
+            video_progress: task.progress,
+            video_status: task.retryable ? 'rate_limited' : task.status,
+            video_notice: task.error || null,
+          });
         }
 
         if (!finished) {
@@ -483,7 +551,15 @@ export default {
         }
 
         const task = await fetchVideoTask(channel.apiUrl, channel.currentApiKey, videoId, modelId);
-        return new Response(JSON.stringify({ video_id: videoId, model: modelId, ...task }), { headers: CORS_HEADERS });
+        return new Response(JSON.stringify({
+          video_id: videoId,
+          model: modelId,
+          status: task.status,
+          progress: task.progress,
+          url: task.url,
+          error: task.error,
+          retry_after: task.retryable ? Math.max(1, Math.round((task.retryAfterMs || 3000) / 1000)) : null,
+        }), { headers: CORS_HEADERS });
       } catch (error) {
         return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: CORS_HEADERS });
       }
@@ -1331,11 +1407,12 @@ const HTML_CONTENT = `<!DOCTYPE html>
     return opts;
   }
 
-  function videoStatusHtml(progress, status) {
+  function videoStatusHtml(progress, status, notice) {
     var text = '🎬 视频生成中';
     if (progress !== null && progress !== undefined) text += ' ' + progress + '%';
-    else if (status) text += '（' + status + '）';
+    else if (status && status !== 'rate_limited') text += '（' + status + '）';
     text += ' · 通常需要 1–2 分钟，请稍候…';
+    if (notice) text += '<br><span style="font-size:12px;opacity:0.75;">' + notice + '（自动退避重试中）</span>';
     return '<div class="video-status">' + text + '</div>';
   }
 
@@ -1398,8 +1475,9 @@ const HTML_CONTENT = `<!DOCTYPE html>
 
       var row = messagesDiv.children[msgIndex];
       var target = row ? row.querySelector('.message-text') : null;
-      if (target) target.innerHTML = videoStatusHtml(task ? task.progress : null, task ? task.status : 'processing');
-      handle.timer = setTimeout(tick, 3000);
+      if (target) target.innerHTML = videoStatusHtml(task ? task.progress : null, task ? task.status : 'processing', task ? task.error : '查询请求失败');
+      var delay = (task && task.retry_after) ? Math.min(Math.max(task.retry_after, 1), 30) * 1000 : 3000;
+      handle.timer = setTimeout(tick, delay);
     };
 
     handle.timer = setTimeout(tick, 1500);
@@ -1690,7 +1768,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
               if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
 
               if (data.video_progress !== undefined || data.video_status !== undefined) {
-                tBox.innerHTML = videoStatusHtml(data.video_progress, data.video_status);
+                tBox.innerHTML = videoStatusHtml(data.video_progress, data.video_status, data.video_notice);
                 scrollArea.scrollTop = scrollArea.scrollHeight;
                 continue;
               }
