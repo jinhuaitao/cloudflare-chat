@@ -2,7 +2,7 @@ name = "ai-assistant-pro"
 main = "_worker.js"
 compatibility_date = "2024-03-20"
 
-# 运行 `wrangler kv namespace create TG_KV`，把返回的 id 粘贴到下面。
+# 执行 ./setup-kv.sh 会自动创建 TG_KV 命名空间并把 id 填进下面。
 # binding 必须保持为 "KV"：代码里读的是 env.KV（_worker.js:247、282），
 # TG_KV 只是控制台里看到的命名空间名字。
 [[kv_namespaces]]
