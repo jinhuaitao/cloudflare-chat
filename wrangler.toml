@@ -1,5 +1,25 @@
-name = "Cloudflare-Chat"
-main = "index.js"
+name = "cloudflare-chat"
+main = "_worker.js"
 compatibility_date = "2024-03-20"
 
-# 如果你使用的是不同的文件名，请将上面的 main 修改为对应的文件名
+# 保留控制台里手动添加的环境变量，避免每次部署被配置文件同步清空
+keep_vars = true
+
+# ============================================================
+# KV 命名空间：连接 Git 自动部署时「自动创建 + 自动绑定」
+# ============================================================
+# 关键点：这里【只写 binding，不写 id】。
+# 省略 id 会触发 Wrangler 的 Automatic Provisioning（自动资源置备）：
+#   1) 部署时自动在账号下创建一个 KV 命名空间，名字规则为
+#      <Worker 名>-<binding 名小写>  →  cloudflare-chat-kv
+#   2) 自动把它绑定到 Worker，代码里用 env.KV 即可访问
+#   3) 该 id 不会写回仓库，只存在于 Cloudflare 控制台
+#
+# 首次部署成功后，建议去 Dashboard → Workers & Pages → KV 复制该 id，
+# 取消下面 id 那一行的注释并填入，让后续部署完全确定、不再触发置备逻辑。
+#
+# 如果暂时用不到 Telegram 机器人的模型记忆功能，可以整段删掉 ——
+# 代码中所有 KV 调用都有 `if (env.KV)` 保护，缺少绑定不会导致运行时报错。
+[[kv_namespaces]]
+binding = "KV"
+# id = "首次部署后从控制台 KV 页面复制粘贴到这里"

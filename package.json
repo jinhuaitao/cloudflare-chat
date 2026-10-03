@@ -1,0 +1,9 @@
+{
+  "name": "cloudflare-chat",
+  "version": "6.0.0",
+  "private": true,
+  "description": "Cloudflare Worker 上的多通道 AI 对话前端 + Telegram 机器人",
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
