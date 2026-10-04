@@ -179,6 +179,53 @@ https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=https://<你的Work
 
 ---
 
+# 第六步：PWA（已内置，无需配置）
+
+前端已具备完整的 PWA 能力，可以像原生 App 一样安装到桌面 / 主屏幕，并支持离线打开。
+
+| 能力 | 实现 |
+| --- | --- |
+| Web App Manifest | `GET /manifest.webmanifest`，`display: standalone`，含 192/512 + maskable 图标 |
+| Service Worker | `GET /sw.js`，挂在根路径，`Service-Worker-Allowed: /`、`Cache-Control: no-cache` |
+| 图标 | `GET /icon-192.png`、`/icon-512.png`、`/icon-maskable-512.png` |
+| 健康探针 | `GET /healthz`，供前端与 SW 判断服务端是否可达 |
+| 安装入口 | 侧边栏左下角的下载图标，浏览器判定可安装后自动出现 |
+| 离线提示 | 顶部橙色横幅，断网时滑入，恢复后自动滑出 |
+
+**图标以 base64 内嵌在 `_worker.js` 里，运行时解码**，不引入任何静态资源文件 —— 这样「单文件 Worker、无额外构建产物、直接连 Git 部署」的方式完全不受影响。
+
+### 缓存策略
+
+| 请求类型 | 策略 |
+| --- | --- |
+| 页面导航（`/`） | network-first，断网回退到缓存的应用外壳 |
+| 同源静态资源（图标 / manifest） | cache-first |
+| 第三方 CDN（marked、highlight.js、Google Fonts） | stale-while-revalidate |
+| `/api/*`、`/tg-webhook` | **完全放行，绝不缓存** |
+| `/healthz` | **完全放行，绝不缓存**（关键，见下） |
+
+> `/healthz` 必须显式绕过缓存。若 SW 缓存了它，探针会被缓存应答 → 永远「探测成功」→ 离线横幅的自动重连逻辑形同虚设。
+
+### 缓存版本号自动跟随代码变化
+
+缓存名形如 `cloudflare-chat-<hash>`，其中 `<hash>` 是**页面 + SW 源码的内容哈希**，在 Worker 里实时计算（`getPwaVersion()`）。
+
+好处：只要改了前端页面或 SW，版本号自动变化 → 浏览器触发 SW 更新 → `activate` 里清掉旧缓存。因为它是纯函数（只依赖源码文本），isolate 重启后依然稳定，不会导致 SW 反复更新。**你不需要手动维护版本号。**
+
+### 怎么验证安装成功
+
+- **Chrome / Edge（桌面）**：地址栏右侧出现安装图标，或侧边栏左下角的下载按钮。
+- **Android Chrome**：菜单 →「安装应用」/「添加到主屏幕」。
+- **iOS Safari**：分享 →「添加到主屏幕」（走 `apple-touch-icon` 与 `apple-mobile-web-app-*` meta，无需 manifest 也能装）。
+
+安装后以独立窗口运行，不再显示浏览器地址栏。
+
+### 离线能力的边界
+
+离线时**只能打开应用外壳**（界面、历史会话、已缓存的主题与图标都在），但**对话本身仍然需要网络** —— `/api/chat` 是实时接口，不缓存。断网时发送消息会失败，此时顶部横幅会提示，并在网络恢复后自动消失。
+
+---
+
 # 常见问题
 
 **部署日志报 `Missing id` 或要求交互式输入**
@@ -229,6 +276,27 @@ const rx = p => p.split('@').join(BS);   // 用 @ 占位，运行时展开成反
 ```
 
 **验证方式**：不要直接对 `_worker.js` 源码做语法检查 —— 那样读的是模板源码，看不出转义问题。必须**先让 Worker 跑一次 `GET /` 拿到求值后的 HTML**，再对其中 `<script>` 的内容做检查与实测。
+
+**PWA：侧边栏没有出现安装按钮**
+
+安装按钮由浏览器的 `beforeinstallprompt` 事件驱动，只有满足全部条件才会触发：
+
+1. 通过 **HTTPS** 访问（`*.workers.dev` 自带 HTTPS；`localhost` / `127.0.0.1` 也算安全上下文）；
+2. `/manifest.webmanifest` 返回 200 且含 `name`、`start_url`、`display: standalone`、至少一个 192px 以上的图标；
+3. `/sw.js` 能成功注册且 scope 为 `/`；
+4. 该站点尚未被安装过。
+
+任一条不满足按钮就不会出现 —— 此时仍可用浏览器菜单里的「安装应用」或 iOS 的「添加到主屏幕」。
+
+**PWA：离线时界面能打开，但发消息没反应**
+
+这是预期行为。离线只保证**应用外壳**可加载（界面、历史会话、主题、图标），对话走的 `/api/chat` 是实时接口，不缓存也不该缓存。顶部横幅会提示断网，网络恢复后自动消失，重发即可。
+
+**PWA：改了前端，用户看到的还是旧页面**
+
+正常情况下不需要处理 —— 缓存版本号由页面 + SW 的内容哈希自动生成，代码一变缓存名就变，SW 更新后旧缓存会在 `activate` 阶段清除。
+
+如果仍然看到旧内容，通常是浏览器还持有旧的 Service Worker 在等待激活。手动处理：DevTools → Application → Service Workers → 勾选 **Update on reload**，或点 **Unregister** 后刷新。也可以在 Application → Storage 里 **Clear site data** 彻底重置。
 
 ---
 
