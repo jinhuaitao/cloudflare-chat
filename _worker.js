@@ -539,6 +539,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
       display: flex; align-items: center; padding: 10px; border-radius: 10px; transition: all 0.2s; 
     }
     .theme-toggle:hover { background: var(--hover-bg); color: var(--brand-color); transform: scale(1.05); }
+    .theme-toggle.active { color: var(--brand-color); background: var(--hover-bg); }
 
     .sidebar-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 99; backdrop-filter: blur(4px); opacity: 0; transition: opacity 0.3s; }
 
@@ -638,6 +639,21 @@ const HTML_CONTENT = `<!DOCTYPE html>
       font-size: 12px; transition: all 0.2s; padding: 6px 10px; border-radius: 6px; font-weight: 500;
     }
     .copy-btn:hover { color: #ffffff; background: rgba(255,255,255,0.1); }
+
+    /* ===== 消息朗读按钮 ===== */
+    .msg-actions { display: flex; gap: 8px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
+    .speak-btn {
+      background: transparent; border: 1px solid var(--glass-border); color: var(--text-secondary);
+      cursor: pointer; display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
+      padding: 6px 12px; border-radius: 10px; transition: all 0.2s ease; font-weight: 500;
+      font-family: inherit; line-height: 1;
+    }
+    .speak-btn:hover { color: var(--brand-color); border-color: var(--brand-color); background: var(--hover-bg); }
+    .speak-btn.speaking { color: var(--brand-color); border-color: var(--brand-color); background: var(--hover-bg); }
+    .speak-btn.speaking svg { animation: speakPulse 1s infinite ease-in-out; }
+    .speak-btn svg { flex-shrink: 0; }
+    @keyframes speakPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+    .tts-warn { font-size: 12px; color: #ef4444; margin-top: 8px; }
     .code-wrapper pre { background: transparent !important; margin: 0 !important; padding: 20px; overflow-x: auto; border-radius: 0; box-shadow: none; max-width: 100%; }
     .code-wrapper pre code { background: transparent; padding: 0; color: #e2e8f0; font-size: 14px; line-height: 1.6; font-family: 'SFMono-Regular', Consolas, monospace; word-break: normal; }
 
@@ -851,6 +867,9 @@ const HTML_CONTENT = `<!DOCTYPE html>
         <button class="theme-toggle" id="settingsToggle" title="系统设置">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
         </button>
+        <button class="theme-toggle" id="ttsToggle" title="自动朗读回复">
+          <svg id="ttsIcon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path><path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path></svg>
+        </button>
         <button class="theme-toggle" id="themeToggle" title="切换主题">
           <svg id="themeIcon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
         </button>
@@ -956,6 +975,136 @@ const HTML_CONTENT = `<!DOCTYPE html>
     });
   });
 
+  // ===== 语音朗读（Web Speech API，浏览器原生，无需任何 API Key）=====
+  const TTS_AUTO_KEY = 'tts_auto';
+  let autoSpeak = localStorage.getItem(TTS_AUTO_KEY) === '1';
+  let activeSpeakBtn = null;
+
+  const SPEAK_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path><path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path></svg>';
+
+  function updateTtsToggleUI() {
+    const btn = document.getElementById('ttsToggle');
+    if (btn) {
+      btn.classList.toggle('active', autoSpeak);
+      btn.title = autoSpeak ? '自动朗读：已开启（点击关闭）' : '自动朗读：已关闭（点击开启）';
+    }
+  }
+
+  // 把 Markdown / 代码块清理成适合朗读的纯文本
+  // ⚠️ 本段位于外层模板字符串内部，存在「两层转义」：
+  //    模板字符串吃掉一层反斜杠，浏览器解析 JS 字符串字面量再吃掉一层。
+  //    因此这里【完全不写反斜杠】，一律用字符码拼接，避免正则被破坏。
+  function cleanForSpeech(text) {
+    if (!text) return '';
+    const BT = String.fromCharCode(96);  // 反引号
+    const BS = String.fromCharCode(92);  // 反斜杠
+    const NL = String.fromCharCode(10);  // 换行
+    const TAB = String.fromCharCode(9);
+    // 用 @ 占位，展开成反斜杠；这样源码里不出现任何反斜杠
+    const rx = function (p) { return p.split('@').join(BS); };
+
+    const rules = [
+      [BT + BT + BT + rx('[@s@S]*?') + BT + BT + BT, 'g', ' （代码块已省略） '],
+      [BT + '([^' + BT + ']*)' + BT, 'g', '$1'],
+      [rx('!@[[^@]]*@]@([^)]*@)'), 'g', ' （图片） '],
+      [rx('@[([^@]]*)@]@([^)]*@)'), 'g', '$1'],
+      [rx('^@s{0,3}#{1,6}@s*'), 'gm', ''],
+      [rx('^@s{0,3}>@s?'), 'gm', ''],
+      [rx('(@*@*|__)(.*?)@1'), 'g', '$2'],
+      [rx('(@*|_)(.*?)@1'), 'g', '$2'],
+      [rx('^@s*[-*+]@s+'), 'gm', ''],
+      [rx('^@s*@d+@.@s+'), 'gm', ''],
+      [rx('@|'), 'g', ' '],
+      ['^[-=]{3,}$', 'gm', ' '],
+      [rx('^[@s:-]*[-:][@s:-]*$'), 'gm', ''],
+      ['[ ' + TAB + ']{2,}', 'g', ' '],
+      [rx('@n{3,}'), 'g', NL + NL]
+    ];
+
+    let out = String(text);
+    for (let i = 0; i < rules.length; i++) {
+      try {
+        out = out.replace(new RegExp(rules[i][0], rules[i][1]), rules[i][2]);
+      } catch (e) { /* 单条规则异常不影响其余 */ }
+    }
+    return out.trim();
+  }
+
+  // 是否包含中日韩字符（用于选择朗读语言）
+  function containsCJK(text) {
+    const re = new RegExp('[' + String.fromCharCode(0x4e00) + '-' + String.fromCharCode(0x9fff) + ']');
+    return re.test(text);
+  }
+
+  function getBubbleText(bubble) {
+    const box = bubble.querySelector('.message-text') || bubble;
+    return (box.innerText || box.textContent || '').trim();
+  }
+
+  function stopSpeaking() {
+    if (window.speechSynthesis) {
+      try { window.speechSynthesis.cancel(); } catch (e) {}
+    }
+    if (activeSpeakBtn) {
+      activeSpeakBtn.classList.remove('speaking');
+      const span = activeSpeakBtn.querySelector('span');
+      if (span) span.textContent = '朗读';
+      activeSpeakBtn = null;
+    }
+  }
+
+  function toggleSpeak(btn, bubble) {
+    if (btn.classList.contains('speaking')) { stopSpeaking(); return; }
+
+    if (!('speechSynthesis' in window) || typeof SpeechSynthesisUtterance === 'undefined') {
+      alert('当前浏览器不支持语音朗读，请使用 Chrome / Edge / Safari 较新版本。');
+      return;
+    }
+
+    stopSpeaking();
+
+    const text = cleanForSpeech(getBubbleText(bubble));
+    if (!text) return;
+
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.lang = containsCJK(text) ? 'zh-CN' : 'en-US';
+    utter.rate = 1;
+    utter.pitch = 1;
+
+    const reset = () => {
+      if (activeSpeakBtn === btn) {
+        btn.classList.remove('speaking');
+        const span = btn.querySelector('span');
+        if (span) span.textContent = '朗读';
+        activeSpeakBtn = null;
+      }
+    };
+    utter.onend = reset;
+    utter.onerror = reset;
+
+    activeSpeakBtn = btn;
+    btn.classList.add('speaking');
+    const span = btn.querySelector('span');
+    if (span) span.textContent = '停止';
+
+    window.speechSynthesis.speak(utter);
+  }
+
+  // 给每条 AI 消息挂上「朗读」按钮（幂等，可重复调用）
+  function ensureSpeakButton(bubble) {
+    if (!bubble || bubble.querySelector('.msg-actions')) return;
+    const actions = document.createElement('div');
+    actions.className = 'msg-actions';
+    const btn = document.createElement('button');
+    btn.className = 'speak-btn';
+    btn.type = 'button';
+    btn.title = '朗读这条回复';
+    btn.innerHTML = SPEAK_ICON + '<span>朗读</span>';
+    btn.addEventListener('click', () => toggleSpeak(btn, bubble));
+    actions.appendChild(btn);
+    bubble.appendChild(actions);
+  }
+
   const STORAGE_KEY = 'nvidia_ai_sessions';
   let sessions = JSON.parse(localStorage.getItem(STORAGE_KEY)) || [];
   let currentSessionId = null;
@@ -1040,6 +1189,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
   }
 
   function switchSession(id) {
+    stopSpeaking();
     currentSessionId = id;
     const currentSession = sessions.find(s => s.id === id);
     if (currentSession && currentSession.model) {
@@ -1149,6 +1299,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
         bubble.innerHTML = '<div class="message-text markdown-body">' + marked.parse(content) + '</div>';
         bubble.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
       }
+      ensureSpeakButton(bubble);
     } else {
       bubble.innerText = content; 
     }
@@ -1171,6 +1322,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
       renderSessionList();
     }
     
+    stopSpeaking();
     emptyState.style.display = 'none'; 
     userInput.value = ''; 
     userInput.style.height = 'auto';
@@ -1309,6 +1461,12 @@ const HTML_CONTENT = `<!DOCTYPE html>
       tBox.innerHTML = marked.parse(aiContent);
       tBox.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
       scrollArea.scrollTop = scrollArea.scrollHeight;
+
+      // 自动朗读（若已在左下角开启）
+      if (autoSpeak && aiContent && aiContent.trim()) {
+        const sb = bubble.querySelector('.speak-btn');
+        if (sb) toggleSpeak(sb, bubble);
+      }
       
       currentSession.messages.push({ role: 'assistant', content: aiContent }); 
       saveSessions();
@@ -1410,6 +1568,22 @@ const HTML_CONTENT = `<!DOCTYPE html>
   });
 
   document.getElementById('newChatBtn').addEventListener('click', createNewSession);
+
+  // 左下角「自动朗读」开关
+  const ttsToggleBtn = document.getElementById('ttsToggle');
+  if (ttsToggleBtn) {
+    ttsToggleBtn.addEventListener('click', () => {
+      autoSpeak = !autoSpeak;
+      localStorage.setItem(TTS_AUTO_KEY, autoSpeak ? '1' : '0');
+      if (!autoSpeak) stopSpeaking();
+      updateTtsToggleUI();
+    });
+  }
+  updateTtsToggleUI();
+
+  // 页面关闭 / 切换标签页时停止朗读
+  window.addEventListener('beforeunload', stopSpeaking);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) stopSpeaking(); });
   
   init();
 </script>
