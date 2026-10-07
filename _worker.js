@@ -23,7 +23,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.6.7';
+const APP_VERSION = '6.6.8';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -181,6 +181,7 @@ function tgTrimHistory(history, env) {
 //
 //   kb/agent_mem_<chatId>   知识库索引：长期记忆 JSON 数组 [{fact, ts, file}]（唯一可信源）
 //   kb/mem/<chatId>/*.md    知识库镜像：每条记忆一个 Markdown 文件（frontmatter + 正文），供控制台浏览
+//   kb/docs/<标题>.md       知识库文档：save_doc 工具写入的长篇 Markdown（全局共享）
 //   tg_hist_<chatId>         Telegram 对话历史（根目录，保持原样）
 //   tg_user_<chatId>         用户模型选择（根目录，保持原样）
 //   agent_mode_<chatId>      Agent 开关（根目录，保持原样）
@@ -293,7 +294,7 @@ async function tgClearHistory(env, chatId) {
 
 // ==================== Telegram Agent：工具定义 ====================
 // 全部工具零密钥、零成本：DuckDuckGo（搜索）、任意网页抓取、自研计算器、
-// Open-Meteo（天气）、Intl（时间）、R2（长期记忆）。
+// Open-Meteo（天气）、Intl（时间）、R2（长期记忆）、R2（知识库文档）。
 function getAgentTools() {
   return [
     {
@@ -369,6 +370,22 @@ function getAgentTools() {
           required: ['fact']
         }
       }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'save_doc',
+        description: '把长篇内容保存为知识库文档，真实写入 R2 的 kb/docs/ 文件夹（文件名取自标题）。仅在用户明确要求保存文档（"保存成文档/存到知识库/生成知识库文件"）时调用；简短的个人信息用 remember，不要用它；不要主动为普通回答生成文档。只有本工具返回成功，才可以告诉用户"已保存/已生成"；失败或没调用时绝不声称已保存。',
+        parameters: {
+          type: 'object',
+          properties: {
+            title: { type: 'string', description: '文档标题，用作文件名，如"甲骨文云ARM放货知识库"' },
+            content: { type: 'string', description: 'Markdown 格式的正文' },
+            source: { type: 'string', description: '可选：原文链接，会记入文件头' }
+          },
+          required: ['title', 'content']
+        }
+      }
     }
   ];
 }
@@ -388,6 +405,7 @@ async function execAgentTool(name, args, env, chatId) {
         case 'get_time': return toolGetTime(args.timezone);
         case 'get_weather': return await toolGetWeather(args.city);
         case 'remember': return await agentSaveMemory(env, chatId, args.fact);
+        case 'save_doc': return await toolSaveDoc(env, chatId, args);
         default: return '未知工具: ' + name;
       }
     })();
@@ -624,6 +642,33 @@ async function agentForgetMemory(env, chatId, keyword) {
   return { removed };
 }
 
+// ==================== 知识库文档（v6.6.8）：save_doc 工具 ====================
+// 真实写入 R2 的 kb/docs/<标题>.md。文件名由标题清洗得到（去掉 / \ : * ? " < > | #
+// 与控制字符，中文保留；空格转下划线），超长截断；标题被洗空时用时间戳兜底。
+function kbDocSlug(title) {
+  let s = String(title || '').trim()
+    .replace(/[\/\\:*?"<>|#\x00-\x1f\x7f]/g, '')
+    .replace(/\s+/g, '_')
+    .slice(0, 80);
+  if (!s) s = 'doc_' + Date.now().toString(36);
+  return s;
+}
+async function toolSaveDoc(env, chatId, args) {
+  args = args || {};
+  const title = String(args.title || '').trim().slice(0, 80);
+  let content = String(args.content || '');
+  if (!title) return '标题为空，未保存';
+  if (!content.trim()) return '内容为空，未保存';
+  if (content.length > 100000) content = content.slice(0, 100000) + '\n\n> （内容过长，仅保存前 10 万字符）';
+  const key = KB_PREFIX + 'docs/' + kbDocSlug(title) + '.md';
+  const head = '---\ntitle: "' + title.replace(/"/g, '') + '"\nsaved_at: ' + new Date().toISOString()
+    + '\nchat_id: "' + kbSafeChatId(chatId) + '"'
+    + (args.source ? '\nsource: ' + String(args.source).slice(0, 500) : '')
+    + '\n---\n\n';
+  await storePut(env, key, head + content);
+  return '已保存为知识库文档：' + key + '（' + content.length + ' 字符）';
+}
+
 // 获取 Agent 模式开关（默认开启）
 async function agentGetMode(env, chatId) {
   if (tgAgentModeCache.has(chatId)) return tgAgentModeCache.get(chatId);
@@ -664,7 +709,7 @@ function buildAgentSystemPrompt(memories, query) {
   p += '当前时间：' + timeStr + '（北京时间）。\n\n';
   p += '【工作方式】\n'
     + '1. 意图判断：闲聊、简单问答、你知识范围内的稳定知识——直接回答，绝不调用工具。工具是稀缺资源，能不用就不用。\n'
-    + '2. 工具选择：需要最新/实时信息（新闻、价格、赛事等）→ web_search，可换多个关键词搜索；想深入了解某条结果 → web_fetch 读原文；任何精确计算 → calculate（不要心算）；天气 → get_weather；时间 → get_time；用户明确告知的长期事实（偏好、生日、项目、城市等）→ remember。\n'
+    + '2. 工具选择：需要最新/实时信息（新闻、价格、赛事等）→ web_search，可换多个关键词搜索；想深入了解某条结果 → web_fetch 读原文；任何精确计算 → calculate（不要心算）；天气 → get_weather；时间 → get_time；用户明确告知的长期事实（偏好、生日、项目、城市等）→ remember；用户明确要求把长内容存成文档 → save_doc。\n'
     + '3. 多步规划：允许先搜索再抓取、先计算再汇总，一次可并行调用多个工具；但每次只规划接下来 1-2 步，拿到结果再决定下一步，不要一次规划过长链条。\n'
     + '4. 诚实：工具没给的信息绝不编造；搜索无结果就直说。\n'
     + '5. 语言：默认用中文回答（用户用其他语言时跟随用户语言）。\n'
@@ -697,6 +742,7 @@ function buildAgentSystemPrompt(memories, query) {
   p += '【重要规则】\n'
     + '- 需要用户私密或实时信息时必须用工具核实，不要凭空猜测。\n'
     + '- remember 只用于用户明确要求记住的长期事实，不要把临时对话内容存进去。\n'
+    + '- save_doc 是唯一能写知识库文档的途径：只有它返回成功，才可以告诉用户"已保存/已生成文档"；没有调用成功就不许声称。长文档用 save_doc，不要用 remember 硬塞。\n'
     + '- 同一工具用相同参数反复调用没有意义：换关键词/换思路，仍无进展就基于已有信息直接回答。\n'
     + '- 当你觉得已经掌握足够信息，直接给出最终答案，不要为了调用工具而调用工具。';
   return p;
@@ -858,6 +904,7 @@ function describeToolCall(name, args) {
     case 'get_weather': return '🌤 正在查询天气：' + (args.city || '');
     case 'get_time': return '🕐 正在获取时间…';
     case 'remember': return '🧠 正在记住…';
+    case 'save_doc': return '💾 正在保存文档：' + (args.title || '');
     default: return '⚙️ 正在调用：' + name;
   }
 }
@@ -1218,7 +1265,7 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
 }
 
 // ==================== Web 端 Agent（v6.6.0） ====================
-// 与 Telegram 共用 tgAgentChat（含 6 个零密钥工具 + 长期记忆），
+// 与 Telegram 共用 tgAgentChat（含 7 个零密钥工具 + 长期记忆），
 // 记忆命名空间为 web_<sessionId>，与 Telegram 完全隔离。
 // 进度通过 SSE 自定义事件推送：{"agent_progress": "..."} / {"agent_error": "..."}，
 // 正文走标准 OpenAI delta 事件，最后 data: [DONE] 结束。
@@ -1488,7 +1535,7 @@ export default {
 
                 await tgApi('sendMessage', {
                   chat_id: chatId,
-                  text: "⚙️ **请选择对话要使用的 AI 模型:**\n\n_支持多轮对话（最近 " + (parseInt(env.TG_HISTORY_ROUNDS || '10', 10) || 10) + " 轮），发送 /clear 可清空上下文。_\n\n🤖 **Agent 模式**（默认开启）：我会自主规划、调用工具（🔍 联网搜索、📄 网页读取、🧮 精确计算、🌤 天气、🕐 时间），并用 🧠 长期记住你告诉我的事。发送 /agent 可切换为普通对话模式，/help 查看全部命令。",
+                  text: "⚙️ **请选择对话要使用的 AI 模型:**\n\n_支持多轮对话（最近 " + (parseInt(env.TG_HISTORY_ROUNDS || '10', 10) || 10) + " 轮），发送 /clear 可清空上下文。_\n\n🤖 **Agent 模式**（默认开启）：我会自主规划、调用工具（🔍 联网搜索、📄 网页读取、🧮 精确计算、🌤 天气、🕐 时间），并用 🧠 长期记住你告诉我的事、用 💾 保存你让我存的知识库文档。发送 /agent 可切换为普通对话模式，/help 查看全部命令。",
                   parse_mode: "Markdown",
                   reply_markup: { inline_keyboard }
                 });
@@ -1512,7 +1559,7 @@ export default {
                     + "/memory —— 查看长期记忆\n"
                     + "/forget 关键词 —— 删除包含关键词的记忆\n"
                     + "任务太长被暂停时，发送「继续」可接着做\n\n"
-                    + "Agent 模式下我会自主规划、调用工具（🔍 搜索、📄 网页、🧮 计算、🌤 天气、🕐 时间），并长期记住你告诉我的事。"
+                    + "Agent 模式下我会自主规划、调用工具（🔍 搜索、📄 网页、🧮 计算、🌤 天气、🕐 时间），长期记住你告诉我的事，还能用 💾 保存知识库文档（比如：把这篇文章存成知识库文档）。"
                     + "\n\n📌 当前版本 v" + APP_VERSION + "（R2 持久化 · 长期记忆无上限）"
                 });
                 return;
@@ -1553,7 +1600,7 @@ export default {
                 await tgApi('sendMessage', {
                   chat_id: chatId,
                   text: !cur
-                    ? "🤖 **Agent 模式已开启**\n\n我会自主规划、调用工具（🔍 联网搜索、📄 网页读取、🧮 精确计算、🌤 天气、🕐 时间），并长期记住你告诉我的重要信息。"
+                    ? "🤖 **Agent 模式已开启**\n\n我会自主规划、调用工具（🔍 联网搜索、📄 网页读取、🧮 精确计算、🌤 天气、🕐 时间），长期记住你告诉我的重要信息，还能用 💾 把长内容保存为知识库文档。"
                     : "💬 **已切换为普通对话模式**\n\n单轮问答，不调用工具、不使用长期记忆。如需 Agent 能力再发送 /agent 切回。",
                   parse_mode: "Markdown"
                 });
