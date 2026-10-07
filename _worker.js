@@ -23,7 +23,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.7.0';
+const APP_VERSION = '6.7.1';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -679,14 +679,33 @@ async function agentForgetMemory(env, chatId, keyword) {
 
 // ==================== 知识库文档（v6.6.8）：save_doc 工具 ====================
 // 真实写入 R2 的 kb/docs/<标题>.md。文件名由标题清洗得到（去掉 / \ : * ? " < > | #
-// 与控制字符，中文保留；空格转下划线），超长截断；标题被洗空时用时间戳兜底。
+// 与控制字符，中文保留；空格直接去掉——避免"甲骨文云 ARM"与"甲骨文云ARM"生成两个文件），
+// 超长截断；标题被洗空时用时间戳兜底。
 function kbDocSlug(title) {
   let s = String(title || '').trim()
     .replace(/[\/\\:*?"<>|#\x00-\x1f\x7f]/g, '')
-    .replace(/\s+/g, '_')
+    .replace(/\s+/g, '')
     .slice(0, 80);
   if (!s) s = 'doc_' + Date.now().toString(36);
   return s;
+}
+// 按原文链接查找已保存的文档（读每篇前 800 字节的 frontmatter，range GET 很便宜）
+// 链接归一化：去首尾空格、去末尾斜杠、小写。返回 {key, title} 或 null
+async function kbFindDocBySource(env, source) {
+  const norm = u => String(u || '').trim().replace(/\/+$/, '').toLowerCase();
+  const target = norm(source);
+  if (!target || !env.R2) return null;
+  const keys = await kbListDocKeys(env);
+  for (const k of keys) {
+    try {
+      const obj = await env.R2.get(k, { range: { offset: 0, length: 800 } });
+      if (!obj) continue;
+      const head = await obj.text();
+      const m = head.match(/^source:\s*(\S+)/m);
+      if (m && norm(m[1]) === target) return { key: k, title: kbDocTitleOf(k) };
+    } catch (e) {}
+  }
+  return null;
 }
 async function toolSaveDoc(env, chatId, args) {
   args = args || {};
@@ -696,6 +715,14 @@ async function toolSaveDoc(env, chatId, args) {
   if (!content.trim()) return '内容为空，未保存';
   if (content.length > 100000) content = content.slice(0, 100000) + '\n\n> （内容过长，仅保存前 10 万字符）';
   const key = KB_PREFIX + 'docs/' + kbDocSlug(title) + '.md';
+  // 同链接去重：该网址已保存为另一篇文档时拒绝，避免一个网址产生两个 md 文件
+  // （标题完全相同时走下面的覆盖更新，不受影响）
+  if (args.source) {
+    const dup = await kbFindDocBySource(env, args.source);
+    if (dup && dup.key !== key) {
+      return '该链接已保存为知识库文档《' + dup.title + '》，未重复保存。如需更新内容，请用完全相同的标题"' + dup.title + '"重新保存以覆盖，或先用 delete_doc 删除旧文档。';
+    }
+  }
   // 同名覆盖即更新：提前告知是新建还是覆盖
   let existed = false;
   try { existed = !!(env.R2 && await env.R2.head(key)); } catch (e) {}
@@ -855,7 +882,7 @@ function buildAgentSystemPrompt(memories, query) {
   p += '当前时间：' + timeStr + '（北京时间）。\n\n';
   p += '【工作方式】\n'
     + '1. 意图判断：闲聊、简单问答、你知识范围内的稳定知识——直接回答，绝不调用工具。工具是稀缺资源，能不用就不用。\n'
-    + '2. 工具选择：需要最新/实时信息（新闻、价格、赛事等）→ web_search，可换多个关键词搜索；想深入了解某条结果 → web_fetch 读原文；任何精确计算 → calculate（不要心算）；天气 → get_weather；时间 → get_time；用户明确告知的长期事实（偏好、生日、项目、城市等）→ remember；用户明确要求把长内容存成文档 → save_doc（同名覆盖即更新）；用户明确要求删除文档 → delete_doc；用户问题可能涉及知识库文档主题 → 先 list_docs 看标题，有相关再 read_doc 细读（标题想不起来时 read_doc 会自动搜正文），文档内容优先引用并注明"据知识库文档《xxx》"。\n'
+    + '2. 工具选择：需要最新/实时信息（新闻、价格、赛事等）→ web_search，可换多个关键词搜索；想深入了解某条结果 → web_fetch 读原文；任何精确计算 → calculate（不要心算）；天气 → get_weather；时间 → get_time；用户明确告知的长期事实（偏好、生日、项目、城市等）→ remember；用户明确要求把长内容存成文档 → save_doc（同名覆盖即更新；同一网址只保存一次，勿换标题重复保存）；用户明确要求删除文档 → delete_doc；用户问题可能涉及知识库文档主题 → 先 list_docs 看标题，有相关再 read_doc 细读（标题想不起来时 read_doc 会自动搜正文），文档内容优先引用并注明"据知识库文档《xxx》"。\n'
     + '3. 多步规划：允许先搜索再抓取、先计算再汇总，一次可并行调用多个工具；但每次只规划接下来 1-2 步，拿到结果再决定下一步，不要一次规划过长链条。\n'
     + '4. 诚实：工具没给的信息绝不编造；搜索无结果就直说。\n'
     + '5. 语言：默认用中文回答（用户用其他语言时跟随用户语言）。\n'
