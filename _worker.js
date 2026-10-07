@@ -23,7 +23,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.6.3';
+const APP_VERSION = '6.7.0';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -977,6 +977,482 @@ async function handleWebAgent(env, body) {
   return new Response(stream, { headers: SSE_HEADERS });
 }
 
+// ==================== 微信 ClawBot 通道（v6.7.0） ====================
+// 通过微信官方 ClawBot 插件接入（微信 → 我 → 设置 → 插件 → ClawBot），
+// 走腾讯 iLink Bot HTTP API（https://ilinkai.weixin.qq.com），与 Telegram 通道并存。
+// 协议为自研实现（参考 MIT 开源实现学到的公开协议细节）。
+//
+//   绑定：浏览器打开 GET /wx 扫码。二维码内容在浏览器端本地渲染，绑定凭证不出浏览器。
+//         后端流程：POST /ilink/bot/get_bot_qrcode?bot_type=3 取码 →
+//                   轮询 GET /ilink/bot/get_qrcode_status → confirmed 后 token 存 R2。
+//   收消息：cron 每分钟触发 scheduled → POST /ilink/bot/getupdates（cursor 增量拉取）。
+//   发消息：POST /ilink/bot/sendmessage（携带最新 context_token）。
+//   Agent：复用 Telegram 整套管线（历史 / 长期记忆 / 断点续做 / 模型选择），
+//          chatId 命名空间为 wx_<senderId>，在微信里发「继续」同样可以断点续做。
+//
+// v1 限制：cron 轮询带来最多约 1 分钟的消息延迟；仅支持文本与语音转写，
+// 图片/文件/视频只转占位描述；Agent 执行中无实时进度（微信不支持编辑已发消息）。
+// 灰度说明：ClawBot 插件需要较新版微信（iOS 8.0.70+ / 安卓 8.0.68+），部分账号暂不可见。
+// R2 必需：绑定 token、cursor、白名单都存在 R2，未绑定 R2 时微信通道不可用。
+
+const WX_ILINK_BASE = 'https://ilinkai.weixin.qq.com';
+const WX_APP_VERSION = '132102';
+const WX_CHANNEL_VERSION = '2.4.6';
+const WX_BOT_AGENT = 'QclawLogin/1.0';
+const WX_BIND_KEY = 'wx_bind';
+const WX_LOGIN_KEY = 'wx_login';
+const WX_POLL_LOCK_KEY = 'wx_poll_lock';
+const WX_REPLY_CHUNK = 1500;
+
+// ---- iLink 协议基础 ----
+function wxHeaders(token, hasBody) {
+  const h = {
+    'iLink-App-Id': 'bot',
+    'iLink-App-ClientVersion': WX_APP_VERSION,
+  };
+  if (hasBody) {
+    h['Content-Type'] = 'application/json';
+    h['AuthorizationType'] = 'ilink_bot_token';
+    const b = new Uint8Array(4);
+    crypto.getRandomValues(b);
+    let s = '';
+    for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+    h['X-WECHAT-UIN'] = btoa(s);
+  }
+  if (token) h['Authorization'] = 'Bearer ' + token;
+  return h;
+}
+
+async function wxApi(baseUrl, method, endpoint, body, token, timeoutMs) {
+  const url = String(baseUrl || WX_ILINK_BASE).replace(/\/+$/, '') + endpoint;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs > 0 ? timeoutMs : 15000);
+  try {
+    const res = await fetch(url, {
+      method,
+      headers: wxHeaders(token, body !== undefined),
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal: ctrl.signal,
+    });
+    const text = await res.text().catch(() => '');
+    if (!res.ok) throw new Error('iLink HTTP ' + res.status);
+    return JSON.parse(text);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function wxGetBind(env) {
+  try {
+    const raw = await storeGet(env, WX_BIND_KEY);
+    if (!raw) return null;
+    const b = JSON.parse(raw);
+    return (b && b.token) ? b : null;
+  } catch (e) { return null; }
+}
+async function wxSaveBind(env, b) { await storePut(env, WX_BIND_KEY, JSON.stringify(b)); }
+
+// ---- 扫码绑定：状态机纯归约（可单测） ----
+// 输入当前 login 与 get_qrcode_status 响应，输出 {login, bind, done}；
+// bind 非空表示绑定成功。done=true 时调用方应清理登录态。
+function wxLoginReducer(login, resp) {
+  const status = resp && resp.status;
+  const base = Object.assign({}, login);
+  if (status === 'wait') {
+    return { login: Object.assign(base, { phase: 'waiting', message: '请用微信扫码' }), bind: null, done: false };
+  }
+  if (status === 'scaned') {
+    return { login: Object.assign(base, { phase: 'scanned', message: '已扫码，请在微信中确认' }), bind: null, done: false };
+  }
+  if (status === 'need_verifycode') {
+    return { login: Object.assign(base, { phase: 'need_code', message: '请输入微信中显示的验证码' }), bind: null, done: false };
+  }
+  if (status === 'verify_code_blocked') {
+    return { login: Object.assign(base, { phase: 'error', message: '验证码错误次数过多，请重新生成二维码' }), bind: null, done: true };
+  }
+  if (status === 'expired') {
+    return { login: Object.assign(base, { phase: 'expired', message: '二维码已过期，请重新生成' }), bind: null, done: true };
+  }
+  if (status === 'scaned_but_redirect') {
+    const host = String(resp.redirect_host || '').replace(/^https?:\/\//, '').replace(/\/+$/, '');
+    if (host) base.baseUrl = 'https://' + host;
+    return { login: Object.assign(base, { phase: 'scanned', message: '已切换节点，等待确认…' }), bind: null, done: false };
+  }
+  if (status === 'binded_redirect') {
+    return { login: Object.assign(base, { phase: 'error', message: '该 bot 已绑定到其他实例，请先解绑' }), bind: null, done: true };
+  }
+  if (status === 'confirmed') {
+    const accountId = resp.ilink_bot_id, token = resp.bot_token;
+    if (typeof accountId === 'string' && accountId && typeof token === 'string' && token) {
+      const baseUrl = String(resp.baseurl || base.baseUrl || WX_ILINK_BASE).replace(/\/+$/, '');
+      return {
+        login: null,
+        bind: { accountId, token, baseUrl, cursor: '', allowedSenders: [], notified: {}, createdAt: Date.now() },
+        done: true,
+      };
+    }
+    return { login: Object.assign(base, { phase: 'error', message: '确认响应缺少账号或 token' }), bind: null, done: true };
+  }
+  return { login: base, bind: null, done: false }; // 未知状态：保持现状
+}
+
+async function wxStartLogin(env) {
+  // 4 分钟内已有未使用的码：直接复用，避免频繁刷码
+  try {
+    const raw = await storeGet(env, WX_LOGIN_KEY);
+    if (raw) {
+      const old = JSON.parse(raw);
+      if (old && old.qrContent && Date.now() - (old.createdAt || 0) < 4 * 60 * 1000 &&
+          (old.phase === 'waiting' || old.phase === 'scanned')) {
+        return { qrContent: old.qrContent, reused: true };
+      }
+    }
+  } catch (e) {}
+  const resp = await wxApi(WX_ILINK_BASE, 'POST', '/ilink/bot/get_bot_qrcode?bot_type=3', { local_token_list: [] }, undefined, 15000);
+  const qrcode = resp && resp.qrcode, qrContent = resp && resp.qrcode_img_content;
+  if (typeof qrcode !== 'string' || !qrcode || typeof qrContent !== 'string' || !qrContent) {
+    throw new Error('取二维码失败：' + JSON.stringify(resp).slice(0, 200));
+  }
+  await storePut(env, WX_LOGIN_KEY, JSON.stringify({
+    qrcode, qrContent, phase: 'waiting', message: '请用微信扫码',
+    baseUrl: WX_ILINK_BASE, createdAt: Date.now(),
+  }));
+  return { qrContent, reused: false };
+}
+
+async function wxCheckLogin(env, code) {
+  let login = null;
+  try {
+    const raw = await storeGet(env, WX_LOGIN_KEY);
+    login = raw ? JSON.parse(raw) : null;
+  } catch (e) {}
+  const bound = await wxGetBind(env);
+  if (bound) {
+    if (login) { try { await storeDelete(env, WX_LOGIN_KEY); } catch (e) {} }
+    return { bound: true, phase: 'confirmed', message: '已绑定：' + bound.accountId, accountId: bound.accountId };
+  }
+  if (!login || !login.qrcode) return { bound: false, phase: 'idle', message: '未绑定' };
+  if (Date.now() - (login.createdAt || 0) > 10 * 60 * 1000) {
+    try { await storeDelete(env, WX_LOGIN_KEY); } catch (e) {}
+    return { bound: false, phase: 'expired', message: '二维码已过期，请重新生成' };
+  }
+  let resp = null;
+  try {
+    let ep = '/ilink/bot/get_qrcode_status?qrcode=' + encodeURIComponent(login.qrcode);
+    if (login.phase === 'need_code' && code) ep += '&verify_code=' + encodeURIComponent(code);
+    resp = await wxApi(login.baseUrl || WX_ILINK_BASE, 'GET', ep, undefined, undefined, 15000);
+  } catch (e) {
+    return { bound: false, phase: login.phase || 'waiting', message: (login.message || '等待扫码') + '（状态查询失败，重试中…）' };
+  }
+  const r = wxLoginReducer(login, resp);
+  if (r.bind) {
+    await wxSaveBind(env, r.bind);
+    try { await storeDelete(env, WX_LOGIN_KEY); } catch (e) {}
+    return { bound: true, phase: 'confirmed', message: '绑定成功：' + r.bind.accountId, accountId: r.bind.accountId };
+  }
+  if (r.done) {
+    try { await storeDelete(env, WX_LOGIN_KEY); } catch (e) {}
+    return { bound: false, phase: r.login.phase, message: r.login.message };
+  }
+  await storePut(env, WX_LOGIN_KEY, JSON.stringify(r.login));
+  return { bound: false, phase: r.login.phase, message: r.login.message };
+}
+
+// ---- 入站消息解析（纯函数，可单测） ----
+function wxExtractText(msg) {
+  const items = (msg && Array.isArray(msg.item_list)) ? msg.item_list : [];
+  const parts = [];
+  for (const item of items) {
+    if (!item || typeof item !== 'object') continue;
+    if (item.type === 1 && item.text_item && typeof item.text_item.text === 'string' && item.text_item.text) {
+      parts.push(item.text_item.text);
+    } else if (item.type === 3 && item.voice_item && typeof item.voice_item.text === 'string' && item.voice_item.text) {
+      parts.push('[语音转写] ' + item.voice_item.text); // iLink 自带语音转文字
+    } else if (item.type === 2) {
+      parts.push('[图片]'); // v1 不做图片下载解密，仅占位
+    } else if (item.type === 4) {
+      const n = item.file_item && item.file_item.file_name;
+      parts.push(n ? '[文件：' + n + ']' : '[文件]');
+    } else if (item.type === 5) {
+      parts.push('[视频]');
+    }
+  }
+  // 防伪造身份头：把正文里的 "[微信" 全角化，避免与系统拼接的前缀混淆
+  return parts.join('\n').replace(/\[微信/g, '［微信').trim();
+}
+
+// ---- 出站：Markdown 轻量清洗 + 分片（纯函数，可单测） ----
+function wxStripMarkdown(s) {
+  let t = String(s || '');
+  t = t.replace(/```\w*\n?([\s\S]*?)```/g, '$1');
+  t = t.replace(/`([^`]+)`/g, '$1');
+  t = t.replace(/\*\*([^*]+)\*\*/g, '$1');
+  t = t.replace(/__([^_]+)__/g, '$1');
+  t = t.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1（$2）');
+  t = t.replace(/^#{1,6}\s+/gm, '');
+  t = t.replace(/^>\s?/gm, '');
+  t = t.replace(/^(\s*)[-*]\s+/gm, '$1• ');
+  return t;
+}
+
+function wxChunkText(text, maxLen) {
+  const s = String(text || '');
+  if (s.length <= maxLen) return [s];
+  const out = [];
+  let i = 0;
+  while (i < s.length) {
+    let end = Math.min(i + maxLen, s.length);
+    if (end < s.length) {
+      const nl = s.lastIndexOf('\n', end);
+      if (nl > i + 300) end = nl + 1;
+    }
+    out.push(s.slice(i, end));
+    i = end;
+  }
+  return out;
+}
+
+async function wxSendText(env, bind, toUserId, contextToken, text) {
+  const chunks = wxChunkText(wxStripMarkdown(text), WX_REPLY_CHUNK);
+  for (const chunk of chunks) {
+    const body = {
+      msg: {
+        from_user_id: '',
+        to_user_id: toUserId,
+        client_id: 'wxout-' + (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(36).slice(2)),
+        message_type: 2,
+        message_state: 2,
+        item_list: [{ type: 1, text_item: { text: chunk } }],
+        ...(contextToken ? { context_token: contextToken } : {}),
+      },
+      base_info: { channel_version: WX_CHANNEL_VERSION, bot_agent: WX_BOT_AGENT },
+    };
+    const resp = await wxApi(bind.baseUrl, 'POST', '/ilink/bot/sendmessage', body, bind.token, 15000);
+    if (resp && resp.ret && resp.ret !== 0) throw new Error('sendmessage ret=' + resp.ret + ' ' + (resp.errmsg || ''));
+  }
+}
+
+// ---- 微信对话主流程：复用 Telegram Agent 管线 ----
+const wxNoopApi = async () => ({ ok: true }); // typing 心跳在微信通道空转
+
+async function wxChatTurn(env, bind, senderId, text, contextToken) {
+  const chatId = 'wx_' + senderId; // 命名空间隔离：历史/记忆/断点/模型选择全部独立
+  const t = String(text || '').trim();
+  const reply = async (s) => { await wxSendText(env, bind, senderId, contextToken, s); };
+
+  if (t === '/clear' || t === '/new') {
+    await tgClearHistory(env, chatId);
+    await agentClearResumeState(env, chatId);
+    await reply('🗑️ 已清空本会话的上下文与断点。');
+    return;
+  }
+
+  const useAgent = await agentGetMode(env, chatId); // 默认开启
+  let history = await tgGetHistory(env, chatId);
+  history.push({ role: 'user', content: t });
+  let targetModelId = null;
+  try { targetModelId = await storeGet(env, 'tg_user_' + chatId); } catch (e) {}
+
+  let replyText = null;
+  if (!useAgent) {
+    // 普通模式：单轮问答（与 Telegram 普通模式一致）
+    const cfg = buildAIRequest(env, targetModelId, history, false);
+    if (cfg.error) { await reply('⚠️ ' + cfg.error); return; }
+    try {
+      const resp = await fetch(cfg.apiUrl, {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + cfg.currentApiKey, 'Content-Type': 'application/json' },
+        body: JSON.stringify(cfg.payload),
+        signal: AbortSignal.timeout(60000),
+      });
+      if (!resp.ok) { await reply('⚠️ 上游接口报错（' + resp.status + '），请稍后再试。'); return; }
+      const data = await resp.json().catch(() => null);
+      const content = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+      replyText = content || '（空回复）';
+    } catch (e) {
+      await reply('⚠️ 上游接口请求失败，请稍后再试。');
+      return;
+    }
+  } else {
+    // Agent 模式：与 Telegram 共用 tgAgentChat（含 6 工具 + 长期记忆 + 断点续做）
+    let budgetMs = parseInt(env.WX_AGENT_BUDGET_MS || '90000', 10);
+    if (!(budgetMs >= 10000)) budgetMs = 90000;
+    if (budgetMs > 240000) budgetMs = 240000;
+    const agentOpts = { maxRuntimeMs: budgetMs, resumeKey: tgAgentResumeKey(chatId) };
+    const wantResume = /^继续/.test(t);
+    const resumeState = wantResume ? await agentLoadResumeState(env, chatId) : null;
+    if (!resumeState) await agentClearResumeState(env, chatId);
+    const runTurn = (allowTools) => resumeState
+      ? tgAgentResume(env, wxNoopApi, chatId, {
+          targetModelId: resumeState.targetModelId || targetModelId,
+          allowTools, messages: resumeState.messages,
+        }, null, agentOpts)
+      : tgAgentChat(env, wxNoopApi, chatId, targetModelId, history, allowTools, null, agentOpts);
+    let r;
+    try {
+      r = await runTurn(true);
+      if (r.fallback) r = await runTurn(false); // 模型不支持工具调用时退化为纯对话
+    } catch (e) {
+      r = { error: '⚠️ Agent 执行出错：' + (e && e.message ? e.message : String(e)) };
+    }
+    if (r.error) {
+      replyText = r.error;
+    } else {
+      replyText = r.text;
+      if (!r.isImage && replyText) {
+        history.push({ role: 'assistant', content: replyText });
+        history = tgTrimHistory(history, env);
+        await tgSaveHistory(env, chatId, history);
+      }
+      // 正常完成（非暂停）后清理断点；暂停时新状态已在内部保存，发「继续」可接续
+      if (!r.paused) await agentClearResumeState(env, chatId);
+    }
+  }
+  if (replyText) await reply(replyText);
+}
+
+async function wxHandleInbound(env, bind, msg) {
+  const sender = String((msg && (msg.from_user_id || msg.from_user)) || 'unknown');
+  const contextToken = (msg && typeof msg.context_token === 'string' && msg.context_token) ? msg.context_token : null;
+  if (sender === 'unknown') return;
+  // TOFU 白名单：绑定后第一个发消息的人成为唯一信任发送者，其余丢弃并提示一次
+  if (!bind.allowedSenders.includes(sender)) {
+    if (bind.allowedSenders.length === 0) {
+      bind.allowedSenders = [sender];
+      await wxSaveBind(env, bind);
+    } else {
+      bind.notified = bind.notified || {};
+      if (!bind.notified[sender]) {
+        bind.notified[sender] = 1;
+        await wxSaveBind(env, bind);
+        try {
+          await wxSendText(env, bind, sender, contextToken,
+            '（微信助手）你的账号不在允许名单里，这条消息没有处理。\n你的微信 ID：' + sender + '\n如需开通，请联系绑定者。');
+        } catch (e) {}
+      }
+      return;
+    }
+  }
+  const text = wxExtractText(msg);
+  if (!text) return;
+  await wxChatTurn(env, bind, sender, text, contextToken);
+}
+
+// ---- cron 轮询入口 ----
+async function wxCronTick(env) {
+  const bind = await wxGetBind(env);
+  if (!bind) return { ok: false, reason: 'not-bound' };
+  // 防重叠：90 秒内的 tick 直接跳过（cron 每分钟一次，正常不会重叠）
+  try {
+    const lockRaw = await storeGet(env, WX_POLL_LOCK_KEY);
+    if (lockRaw && Date.now() - parseInt(lockRaw, 10) < 90000) return { ok: false, reason: 'overlap-skip' };
+  } catch (e) {}
+  await storePut(env, WX_POLL_LOCK_KEY, String(Date.now()));
+  let resp;
+  try {
+    resp = await wxApi(bind.baseUrl, 'POST', '/ilink/bot/getupdates', {
+      get_updates_buf: bind.cursor || '',
+      base_info: { channel_version: WX_CHANNEL_VERSION, bot_agent: WX_BOT_AGENT },
+    }, bind.token, 25000);
+  } catch (e) {
+    return { ok: false, reason: 'poll-error: ' + (e && e.message ? e.message : String(e)) };
+  }
+  const msgs = resp && Array.isArray(resp.msgs) ? resp.msgs : [];
+  let n = 0;
+  for (const m of msgs) {
+    if (!m || typeof m !== 'object') continue;
+    try { await wxHandleInbound(env, bind, m); }
+    catch (e) { console.log('微信消息处理异常:', e); }
+    n++;
+  }
+  if (typeof resp.get_updates_buf === 'string' && resp.get_updates_buf) {
+    bind.cursor = resp.get_updates_buf;
+    await wxSaveBind(env, bind);
+  }
+  return { ok: true, count: n };
+}
+
+// ---- 绑定页 ----
+const WX_BIND_HTML = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">' +
+'<meta name="viewport" content="width=device-width,initial-scale=1">' +
+'<title>微信 ClawBot 绑定</title>' +
+'<style>body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;' +
+'background:#0f1115;color:#e8eaf0;display:flex;justify-content:center;padding:40px 16px;margin:0}' +
+'.card{background:#171a21;border:1px solid #2a2e3a;border-radius:12px;padding:28px;max-width:420px;width:100%}' +
+'h2{margin:0 0 8px;font-size:20px}p{color:#9aa0b0;font-size:14px;line-height:1.7}' +
+'button{background:#07c160;color:#fff;border:0;border-radius:8px;padding:10px 18px;font-size:15px;cursor:pointer;margin:6px 6px 0 0}' +
+'button.ghost{background:#2a2e3a}button:disabled{opacity:.5;cursor:default}' +
+'input{width:100%;box-sizing:border-box;background:#0f1115;border:1px solid #2a2e3a;color:#e8eaf0;' +
+'border-radius:8px;padding:10px;font-size:15px;margin:8px 0}' +
+'#qr{display:flex;justify-content:center;margin:16px 0;min-height:240px;align-items:center}' +
+'#qr img{border-radius:8px;background:#fff;padding:8px}' +
+'.phase{text-align:center;color:#07c160;font-size:14px;min-height:22px}' +
+'.err{color:#ff6b6b}.ok{color:#07c160}' +
+'textarea{width:100%;box-sizing:border-box;height:80px;background:#0f1115;color:#9aa0b0;' +
+'border:1px solid #2a2e3a;border-radius:8px;font-size:12px;margin-top:8px}</style></head><body>' +
+'<div class="card"><h2>微信 ClawBot 绑定</h2>' +
+'<p>通过微信官方 ClawBot 插件接入（微信 → 我 → 设置 → 插件 → ClawBot）。' +
+'二维码在你的浏览器里本地生成，绑定凭证不会经过第三方。</p>' +
+'<div id="authBox" style="display:none"><p>本站点设置了访问口令：</p>' +
+'<input id="pwd" type="password" placeholder="输入访问口令" autocomplete="off">' +
+'<button id="btnAuth">确定</button></div>' +
+'<div id="main" style="display:none">' +
+'<p id="status"></p>' +
+'<div id="qr" style="display:none"></div><p class="phase" id="phase"></p>' +
+'<div id="codeBox" style="display:none"><input id="code" placeholder="微信中显示的验证码" autocomplete="off">' +
+'<button id="btnCode">提交验证码</button></div>' +
+'<div><button id="btnQr">生成二维码</button>' +
+'<button id="btnUnbind" class="ghost" style="display:none">解绑</button></div>' +
+'<div id="qrFallback" style="display:none"><p>二维码库加载失败，请勿使用第三方在线工具生成（会泄露绑定凭证）。可复制下面内容用可信工具生成二维码：</p>' +
+'<textarea id="qrText" readonly></textarea></div>' +
+'</div></div>' +
+'<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>' +
+'<script>(function(){' +
+'var token=localStorage.getItem("wx_access_token")||"";' +
+'function api(path,opt){opt=opt||{};var h={"X-Access-Token":token};' +
+'return fetch(path,{method:opt.method||"GET",headers:h}).then(function(r){' +
+'if(r.status===401){document.getElementById("authBox").style.display="block";' +
+'document.getElementById("main").style.display="none";throw new Error("auth");}' +
+'return r.json();});}' +
+'function setPhase(t,cls){var e=document.getElementById("phase");e.textContent=t;e.className="phase "+(cls||"");}' +
+'var pollTimer=null;' +
+'function stopPoll(){if(pollTimer){clearInterval(pollTimer);pollTimer=null;}}' +
+'function refresh(){api("/api/wx/status").then(function(st){' +
+'document.getElementById("main").style.display="block";' +
+'var s=document.getElementById("status");' +
+'if(st.bound){stopPoll();s.innerHTML=\'<span class="ok">● 已绑定：\' + st.accountId + "</span>";' +
+'document.getElementById("qr").style.display="none";document.getElementById("qrFallback").style.display="none";' +
+'document.getElementById("btnQr").style.display="none";document.getElementById("codeBox").style.display="none";' +
+'document.getElementById("btnUnbind").style.display="inline-block";setPhase("在微信里给 微信ClawBot 发消息即可开始对话","");return;}' +
+'s.innerHTML="未绑定";document.getElementById("btnUnbind").style.display="none";' +
+'document.getElementById("btnQr").style.display="inline-block";' +
+'if(st.phase==="need_code"){document.getElementById("codeBox").style.display="block";}' +
+'else{document.getElementById("codeBox").style.display="none";}' +
+'setPhase(st.message||"","");' +
+'if(st.phase==="waiting"||st.phase==="scanned"||st.phase==="need_code"){if(!pollTimer){pollTimer=setInterval(refresh,2500);}}' +
+'else{stopPoll();}' +
+'}).catch(function(e){if(e&&e.message!=="auth")setPhase("状态查询失败","err");});}' +
+'document.getElementById("btnQr").onclick=function(){var b=this;b.disabled=true;setPhase("正在生成二维码…","");' +
+'api("/api/wx/qrcode").then(function(r){b.disabled=false;' +
+'if(r.bound){refresh();return;}' +
+'var qrBox=document.getElementById("qr");qrBox.style.display="flex";qrBox.innerHTML="";' +
+'if(typeof QRCode!=="undefined"){new QRCode(qrBox,{text:r.qrContent,width:240,height:240});' +
+'document.getElementById("qrFallback").style.display="none";}' +
+'else{document.getElementById("qrFallback").style.display="block";document.getElementById("qrText").value=r.qrContent;}' +
+'setPhase("请用微信扫码（微信 → 我 → 设置 → 插件 → ClawBot → 扫一扫）","");' +
+'stopPoll();pollTimer=setInterval(refresh,2500);' +
+'}).catch(function(){b.disabled=false;setPhase("二维码生成失败，请重试","err");});};' +
+'document.getElementById("btnCode").onclick=function(){var c=document.getElementById("code").value.trim();' +
+'if(!c)return;api("/api/wx/status?code="+encodeURIComponent(c)).then(function(){refresh();});};' +
+'document.getElementById("btnUnbind").onclick=function(){if(!confirm("确定解绑微信 ClawBot 吗？"))return;' +
+'api("/api/wx/unbind",{method:"POST"}).then(function(){location.reload();});};' +
+'document.getElementById("btnAuth").onclick=function(){token=document.getElementById("pwd").value;' +
+'localStorage.setItem("wx_access_token",token);document.getElementById("authBox").style.display="none";refresh();};' +
+'refresh();})();</script></body></html>';
+
+// 供 node 单测导入（Worker 运行时无影响）
+export { wxExtractText, wxStripMarkdown, wxChunkText, wxLoginReducer, wxHeaders };
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -1024,6 +1500,41 @@ export default {
       const webChatId = 'web_' + sid;
       tgAgentMemCache.delete(webChatId);
       await storeDelete(env, 'agent_mem_' + webChatId);
+      return new Response(JSON.stringify({ ok: true }), { headers: CORS_HEADERS });
+    }
+
+    // ================= 微信 ClawBot 通道（v6.7.0） =================
+    if (url.pathname === '/wx' || url.pathname === '/wx/') {
+      const denied = denyUnauthorized(env, request);
+      if (denied) return denied;
+      return new Response(WX_BIND_HTML, { headers: HTML_HEADERS });
+    }
+    if (request.method === 'GET' && url.pathname === '/api/wx/qrcode') {
+      const denied = denyUnauthorized(env, request);
+      if (denied) return denied;
+      const bound = await wxGetBind(env);
+      if (bound) {
+        return new Response(JSON.stringify({ bound: true, accountId: bound.accountId }), { headers: CORS_HEADERS });
+      }
+      try {
+        const r = await wxStartLogin(env);
+        return new Response(JSON.stringify({ bound: false, qrContent: r.qrContent }), { headers: CORS_HEADERS });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: '取二维码失败：' + (e && e.message ? e.message : String(e)) }),
+          { status: 500, headers: CORS_HEADERS });
+      }
+    }
+    if (request.method === 'GET' && url.pathname === '/api/wx/status') {
+      const denied = denyUnauthorized(env, request);
+      if (denied) return denied;
+      const st = await wxCheckLogin(env, url.searchParams.get('code') || '');
+      return new Response(JSON.stringify(st), { headers: CORS_HEADERS });
+    }
+    if (request.method === 'POST' && url.pathname === '/api/wx/unbind') {
+      const denied = denyUnauthorized(env, request);
+      if (denied) return denied;
+      try { await storeDelete(env, WX_BIND_KEY); } catch (e) {}
+      try { await storeDelete(env, WX_LOGIN_KEY); } catch (e) {}
       return new Response(JSON.stringify({ ok: true }), { headers: CORS_HEADERS });
     }
 
@@ -1490,6 +2001,16 @@ export default {
     }
 
     return new Response('Not Found', { status: 404 });
+  },
+
+  // 微信 ClawBot 通道（v6.7.0）：cron 每分钟触发，轮询 iLink 收消息。
+  // 需在 wrangler.toml 配 [triggers] crons；不用微信可删除该段，fetch 不受影响。
+  async scheduled(event, env, ctx) {
+    try {
+      await wxCronTick(env);
+    } catch (e) {
+      console.log('微信 cron 异常:', e);
+    }
   }
 };
 
