@@ -1,6 +1,6 @@
 # Cloudflare-Chat
 
-基于 Cloudflare Workers 的多通道 AI 对话前端 + Telegram 机器人。单文件 Worker（`_worker.js`），通过 `wrangler.toml` 声明式配置，支持连接 GitHub 仓库自动构建部署。当前版本 v6.8.0。
+基于 Cloudflare Workers 的多通道 AI 对话前端 + Telegram 机器人。单文件 Worker（`_worker.js`），通过 `wrangler.toml` 声明式配置，支持连接 GitHub 仓库自动构建部署。当前版本 v6.8.1。
 
 ## 功能一览
 
@@ -367,7 +367,9 @@ const rx = p => p.split('@').join(BS);   // 用 @ 占位，运行时展开成反
 
 - **`/api/chat` 支持访问口令**：配置环境变量 `ACCESS_PASSWORD` 即生效，未配置则保持开放。部署在公开域名上时建议务必配置，见第三步的「访问口令」小节。
 - **`/api/chat` 按 IP 限流**：默认每 IP 每分钟 60 次（`RATE_LIMIT_PER_MIN` 可调，设 0 关闭），多一层防刷。
-- **`/tg-webhook` 来源校验**：配置 `TG_WEBHOOK_SECRET` 后，只接受 `setWebhook` 时传入相同 `secret_token` 的请求。未配置时保持开放（兼容旧部署），公开使用时强烈建议配置。
+- **`/tg-webhook` 来源校验**：配置 `TG_WEBHOOK_SECRET` 后，只接受 `setWebhook` 时传入相同 `secret_token` 的请求。**未配置时任何人都能 POST 伪造 update、烧你的 API 配额并污染知识库**（兼容旧部署才保持开放）；公开使用时必须配置。未配置时服务端会在日志里打一次 ⚠️ 告警（`wrangler tail` 可见）。
+- **Telegram 聊天白名单（v6.8.1 新增）**：配置 `TG_ALLOWED_CHAT_IDS`（逗号分隔的 chat id，只填你自己的）后，机器人只响应名单内的聊天，其他一律静默忽略。个人自用强烈建议配置——否则任何陌生人私聊机器人都能烧你的 key。
+- **Agent `web_fetch` 的 SSRF 防护（v6.8.1 新增）**：拦截内网 / 本机回环 / 链路本地（169.254.x）/ 云元数据地址及 `localhost` 等危险主机名，防止 Worker 被当成代理。但 Workers 拿不到底层 DNS，DNS 重绑定类攻击仍需在前置 WAF 层封堵。
 - **AI 回复经 XSS 清洗**：前端所有 AI 生成内容先经 Markdown 渲染，再过 DOMPurify 白名单清洗后才插入页面；CDN 加载失败时降级为纯文本显示。
 - **CORS 为 `*`**：`Access-Control-Allow-Origin: *` 允许任意站点调用你的接口。如果只在自己的域名下使用，建议收紧为实际域名。
 - **API Key 只存在于服务端**：密钥通过环境变量注入，不会下发到浏览器，前端只能看到模型名称。
@@ -381,13 +383,14 @@ const rx = p => p.split('@').join(BS);   // 用 @ 占位，运行时展开成反
 | 变量 | 说明 | 默认值 |
 |---|---|---|
 | `TG_WEBHOOK_SECRET` | Telegram webhook 校验密钥，见第四步 | 未配置=不校验 |
+| `TG_ALLOWED_CHAT_IDS` | Telegram 聊天白名单（逗号分隔），只响应名单内的聊天 | 未配置=开放 |
 | `TG_HISTORY_ROUNDS` | 机器人记住的最近对话轮数（最大 30） | `10` |
 | `MAX_TOKENS` | `/api/chat` 与机器人共用的 `max_tokens`（上限 32000） | `4096` |
 | `RATE_LIMIT_PER_MIN` | 每 IP 每分钟 `/api/chat` 限额，`0` 关闭 | `60` |
 | `AGENT_MAX_STEPS` | Agent 单轮任务最大推理步数（上限 12） | `6` |
 | `AGENT_TIMEOUT_MS` | Agent 单轮任务总超时（毫秒） | `240000`（4 分钟） |
 | `AGENT_TOOL_TIMEOUT_MS` | 单个工具最长执行时间（毫秒） | `30000`（30 秒） |
-| `AGENT_CONTEXT_BUDGET` | Agent 单轮任务上下文字符预算，超预算裁剪本轮旧 tool 轮次 | `24000` |
+| `AGENT_CONTEXT_BUDGET` | Agent 单轮任务上下文字符预算，超预算裁剪本轮旧 tool 轮次（v6.8.1 起断点续做「继续」时也会裁剪，不再无限增长） | `24000` |
 | `TG_API_TIMEOUT_MS` | Telegram Bot API 单次调用超时（毫秒） | `15000`（15 秒） |
 | `TG_WEBHOOK_BUDGET_MS` | webhook 内 Agent 单轮预算（毫秒），10 秒 ~ 240 秒 | `55000`（55 秒） |
 

@@ -1,6 +1,21 @@
 // 全局内存缓存（L1 缓存）
 const tgUserModels = new Map();
 
+// v6.8.1 有界内存缓存：isolate 常驻时 Map 只增不减会缓慢泄漏。
+// 超过上限时淘汰最早插入的条目（Map 保持插入序）；淘汰只是丢 L1，
+// 下次自动回退读 R2，行为安全。
+const MEM_CACHE_MAX = 2000;
+function mapSetBounded(map, key, value, max) {
+  map.set(key, value);
+  const limit = max > 0 ? max : MEM_CACHE_MAX;
+  // 在 Map 迭代中删除是安全的；跳过刚写入的 key，避免误删本次写入
+  for (const k of map.keys()) {
+    if (map.size <= limit) break;
+    if (k === key) continue;
+    map.delete(k);
+  }
+}
+
 // 优化：不再校验 env 的引用，因为 Worker 生命周期内环境变量是恒定的
 let cachedConfig = null; 
 
@@ -23,7 +38,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.8.0';
+const APP_VERSION = '6.8.1';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -152,6 +167,8 @@ const tgHistories = new Map();
 // key 为 Telegram update_id，value 为首次见到时间戳；
 // 去重窗口 10 分钟，每次 webhook 顺手清理过期条目，Map 不会无限增长。
 const seenUpdateIds = new Map();
+// v6.8.1：TG_WEBHOOK_SECRET 缺失告警，每个 isolate 只打一次
+let warnedNoWebhookSecret = false;
 function tgHistoryKey(chatId) { return 'tg_hist_' + chatId; }
 function tgTrimHistory(history, env) {
   let maxRounds = parseInt(env.TG_HISTORY_ROUNDS || '10', 10);
@@ -279,13 +296,13 @@ async function tgGetHistory(env, chatId) {
   if (raw) {
     try {
       const h = JSON.parse(raw);
-      if (Array.isArray(h)) { tgHistories.set(chatId, h); return h; }
+      if (Array.isArray(h)) { mapSetBounded(tgHistories, chatId, h); return h; }
     } catch (e) {}
   }
   return [];
 }
 async function tgSaveHistory(env, chatId, history) {
-  tgHistories.set(chatId, history);
+  mapSetBounded(tgHistories, chatId, history);
   await storePut(env, tgHistoryKey(chatId), JSON.stringify(history));
 }
 async function tgClearHistory(env, chatId) {
@@ -502,9 +519,70 @@ async function toolWebSearch(query, count) {
   } finally { clearTimeout(timer); }
 }
 
+// ==================== SSRF 防护（v6.8.1） ====================
+// web_fetch 的目标 URL 来自模型输出（可被用户 prompt 间接操控），必须拦截
+// 内网 / 本机 / 云元数据地址，防止 Worker 被当成代理去探测内网或借出口 IP 攻击第三方。
+// Workers 拿不到底层 DNS，做两层拦截：
+//  1) 字面量私网 IP —— WHATWG URL 解析会自动把十进制/十六进制/八进制写法归一化为
+//     点分十进制（如 http://2130706433/ → 127.0.0.1、http://0x7f.0.0.1/ → 127.0.0.1），
+//     因此只需判断归一化后的 hostname；
+//  2) 危险主机名（localhost、各类云元数据服务域名）。
+// 残余风险：DNS 重绑定（域名先解析到公网、TTL 过期后指向内网）。Workers 无法在建连时
+// 做二次校验，如需彻底封堵请在前置 WAF / 出站代理层限制。
+function isBlockedFetchHost(hostname) {
+  const h = String(hostname || '').toLowerCase();
+  if (!h) return true;
+  // —— 危险主机名 ——
+  if (h === 'localhost' || h.endsWith('.localhost')) return true;
+  if (h === 'metadata.google.internal' || h.endsWith('.metadata.google.internal')) return true;
+  if (h === 'instance-data' || h === 'instance-data.compute.internal') return true;
+  if (h === 'metadata.azure.internal' || h === 'metadata') return true;
+  if (h === '169.254.169.254.nip.io' || h.endsWith('.169.254.169.254.nip.io')) return true;
+  // —— IPv4 私网段 ——
+  const v4 = h.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (v4) {
+    const b = [+v4[1], +v4[2], +v4[3], +v4[4]];
+    if (b.some(n => n > 255)) return true; // 越界收尾，宁可拦截
+    if (b[0] === 10) return true;                          // 10.0.0.0/8
+    if (b[0] === 127) return true;                         // 127.0.0.0/8 回环
+    if (b[0] === 169 && b[1] === 254) return true;          // 169.254.0.0/16（含云元数据）
+    if (b[0] === 172 && b[1] >= 16 && b[1] <= 31) return true; // 172.16.0.0/12
+    if (b[0] === 192 && b[1] === 168) return true;          // 192.168.0.0/16
+    if (b[0] === 0) return true;                           // 0.0.0.0/8
+    if (b[0] === 100 && b[1] >= 64 && b[1] <= 127) return true; // 100.64.0.0/10
+    if (b[0] === 192 && b[1] === 0 && b[2] === 2) return true;   // TEST-NET-1
+    if (b[0] === 198 && b[1] === 51 && b[2] === 100) return true; // TEST-NET-2
+    if (b[0] === 203 && b[1] === 0 && b[2] === 113) return true;  // TEST-NET-3
+    return false;
+  }
+  // —— IPv6（hostname 可能带方括号） ——
+  const h6 = h.replace(/^\[|\]$/g, '');
+  if (h6.indexOf(':') !== -1) {
+    // 内嵌点分十进制的 IPv4 映射地址，如 ::ffff:127.0.0.1 → 按 IPv4 再判一次
+    const tail = h6.slice(h6.lastIndexOf(':') + 1);
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(tail)) return isBlockedFetchHost(tail);
+    const flat = h6.replace(/:/g, '');
+    if (flat === '1') return true;            // ::1 回环
+    if (/^fe[89ab]/.test(flat)) return true;  // fe80::/10 链路本地
+    if (/^(fc|fd)/.test(flat)) return true;   // fc00::/7 唯一本地
+    if (flat.startsWith('ffff') && flat.length >= 12) { // ::ffff:a.b.c.d 纯十六进制形式
+      const hex = flat.slice(-8);
+      const b = [];
+      for (let k = 0; k < 8; k += 2) b.push(parseInt(hex.slice(k, k + 2), 16));
+      return isBlockedFetchHost(b.join('.'));
+    }
+    return false;
+  }
+  return false;
+}
+
 async function toolWebFetch(url) {
   url = String(url || '').trim();
   if (!/^https?:\/\//i.test(url)) return 'URL 非法，仅支持 http/https';
+  // v6.8.1 SSRF 防护：先解析 hostname 再放行
+  let fetchHost = '';
+  try { fetchHost = new URL(url).hostname; } catch (e) { return 'URL 非法，仅支持 http/https'; }
+  if (isBlockedFetchHost(fetchHost)) return '该地址禁止抓取（内网 / 本机 / 云元数据地址）';
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 15000);
   try {
@@ -568,7 +646,10 @@ function toolCalculate(expr) {
       let j = i;
       while (j < s.length && /[0-9.]/.test(s[j])) j++;
       if (j === i) throw new Error('意外的字符: ' + s[i]);
-      const n = parseFloat(s.slice(i, j)); i = j;
+      // v6.8.1：校验数字格式，防止 "5..3" 被 parseFloat 静默截断成 5
+      const numStr = s.slice(i, j);
+      if (!/^(\d+\.?\d*|\.\d+)$/.test(numStr)) throw new Error('数字格式非法: ' + numStr);
+      const n = parseFloat(numStr); i = j;
       if (!isFinite(n)) throw new Error('数字非法');
       return n;
     }
@@ -638,7 +719,7 @@ async function agentGetMemories(env, chatId) {
       await storePut(env, agentMemKey(chatId), JSON.stringify(arr));
     }
   } catch (e) {}
-  tgAgentMemCache.set(chatId, arr);
+  mapSetBounded(tgAgentMemCache, chatId, arr);
   return arr;
 }
 
@@ -652,7 +733,7 @@ async function agentSaveMemory(env, chatId, fact) {
   arr.push(m);
   // v6.4.1 起彻底不限条数：R2 单对象可达 5TB，且每次 prompt 只按预算注入，
   // 条数增长不影响 token 成本；remember 需用户明确要求才会触发，无失控风险。
-  tgAgentMemCache.set(chatId, arr);
+  mapSetBounded(tgAgentMemCache, chatId, arr);
   await storePut(env, kbMemDir(chatId) + m.file, kbMemMarkdown(chatId, fact, m.ts));
   await storePut(env, agentMemKey(chatId), JSON.stringify(arr));
   return '已记住：' + fact + '（共' + arr.length + '条）';
@@ -671,7 +752,7 @@ async function agentForgetMemory(env, chatId, keyword) {
     for (const m of arr) {
       if (!keptSet.has(m) && m && m.file) files.push(kbMemDir(chatId) + m.file);
     }
-    tgAgentMemCache.set(chatId, kept);
+    mapSetBounded(tgAgentMemCache, chatId, kept);
     await storePut(env, agentMemKey(chatId), JSON.stringify(kept));
     if (files.length) await kbDeleteKeys(env, files);
   }
@@ -901,12 +982,12 @@ async function agentGetMode(env, chatId) {
   let on = true; // 默认开启 Agent 模式
   const v = await storeGet(env, 'agent_mode_' + chatId);
   on = v !== '0';
-  tgAgentModeCache.set(chatId, on);
+  mapSetBounded(tgAgentModeCache, chatId, on);
   return on;
 }
 
 async function agentSetMode(env, chatId, on) {
-  tgAgentModeCache.set(chatId, on);
+  mapSetBounded(tgAgentModeCache, chatId, on);
   await storePut(env, 'agent_mode_' + chatId, on ? '1' : '0');
 }
 
@@ -1196,23 +1277,30 @@ async function tgAgentResume(env, tgApi, chatId, saved, onProgress, opts) {
   const allowTools = !!saved.allowTools;
   const tools = allowTools ? getAgentTools() : null;
   const deadline = tgAgentDeadline(env, opts);
+  // v6.8.1：把首次运行时的 loopStartIdx 带回来，裁剪才能触及之前各段的老轮次，
+  // 否则多段「继续」会让上下文无限增长；老版本存档无此字段则回退为旧行为
+  const baseLoopStartIdx = (typeof saved.loopStartIdx === 'number' && saved.loopStartIdx >= 0) ? saved.loopStartIdx : undefined;
   return await tgAgentRunLoop(env, tgApi, chatId, saved.targetModelId, saved.messages, tools, allowTools, onProgress, deadline,
-    (opts && opts.resumeKey) || null, true);
+    (opts && opts.resumeKey) || null, true, baseLoopStartIdx);
 }
 
-async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume) {
+async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume, baseLoopStartIdx) {
   const maxSteps = agentLimits(env).maxSteps;
   const lastAssistantText = () => {
     const f = [...messages].reverse().find(m => m.role === 'assistant' && m.content);
     return f ? f.content : '';
   };
   // 超时暂停：保存循环状态，用户发「继续」即恢复。无 R2 时退化为直接终结。
+  // v6.8.1：保存前先按上下文预算裁剪本轮老轮次（trim 只删 loopStartIdx 之后的消息，
+  // 该下标本身不受影响，可原样存档），否则多段「继续」会让存档与发送量无限增长。
   const pauseForResume = async () => {
     const t = stripDSMLBlocks(lastAssistantText());
     let saved = false;
     if (resumeKey) {
       saved = await agentSaveResumeState(env, chatId, {
-        v: 1, savedAt: Date.now(), chatId, targetModelId, allowTools, messages
+        v: 1, savedAt: Date.now(), chatId, targetModelId, allowTools,
+        messages: trimAgentMessages(messages, loopStartIdx, ctxBudget),
+        loopStartIdx: loopStartIdx
       });
     }
     if (saved) {
@@ -1228,8 +1316,11 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
   }, 20000);
   try {
   // 本轮循环在 messages 中的起始下标：上下文裁剪只动这之后的消息，
-  // system 与历史对话永不裁剪；断点续存（R2）保存的是完整 messages
-  const loopStartIdx = messages.length;
+  // system 与历史对话永不裁剪。「继续」时传入首次运行的下标，老轮次也可被裁剪，
+  // 防止多段续做让上下文无限增长。
+  const loopStartIdx = (typeof baseLoopStartIdx === 'number' && baseLoopStartIdx >= 0)
+    ? Math.min(baseLoopStartIdx, messages.length)
+    : messages.length;
   // 上下文预算（字符数，env AGENT_CONTEXT_BUDGET 可配，默认 24000）
   let ctxBudget = parseInt(env.AGENT_CONTEXT_BUDGET || '24000', 10);
   if (!(ctxBudget > 0)) ctxBudget = 24000;
@@ -1364,11 +1455,13 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
   } finally {
     clearInterval(heartbeat);
   }
-  // 步数用尽：同样保存进度，允许「继续」
+  // 步数用尽：同样保存进度，允许「继续」（保存前先裁剪，见 pauseForResume 注释）
   const t = stripDSMLBlocks(lastAssistantText());
   if (resumeKey) {
     const saved = await agentSaveResumeState(env, chatId, {
-      v: 1, savedAt: Date.now(), chatId, targetModelId, allowTools, messages
+      v: 1, savedAt: Date.now(), chatId, targetModelId, allowTools,
+      messages: trimAgentMessages(messages, loopStartIdx, ctxBudget),
+      loopStartIdx: loopStartIdx
     });
     if (saved) {
       return { text: '⏸️ 推理步数已用尽，进度已保存，发送「继续」让我接着做。' + (t ? '\n\n已产出：\n' + t : ''), usedTools: true, paused: true };
@@ -1704,6 +1797,11 @@ export default {
         if (!safeEqual(got, env.TG_WEBHOOK_SECRET)) {
           return new Response('Forbidden', { status: 403 });
         }
+      } else if (env.TG_BOT_TOKEN && !warnedNoWebhookSecret) {
+        // v6.8.1：未配置 TG_WEBHOOK_SECRET 时 /tg-webhook 完全开放，任何人可伪造 update
+        // 烧你的 API 配额、污染知识库；这里打一次日志提醒（wrangler tail 可见）
+        warnedNoWebhookSecret = true;
+        console.log('⚠️ [cloudflare-chat] 未配置 TG_WEBHOOK_SECRET，/tg-webhook 处于开放状态；强烈建议配置 secret_token 并用 setWebhook 重新绑定，同时可配 TG_ALLOWED_CHAT_IDS 白名单只允许自己的聊天。');
       }
 
       try {
@@ -1730,16 +1828,27 @@ export default {
             const { models: modelObjList } = getChannelConfig(env);
             if (modelObjList.length === 0) return;
 
+            // v6.8.1 聊天白名单（可选）：配置 TG_ALLOWED_CHAT_IDS（逗号分隔的数字 ID）后，
+            // 只响应名单内的聊天，其他一律静默忽略（仍返回 OK，避免 Telegram 反复重发）。
+            // 不配置则保持原有开放行为。个人自用强烈建议配置，只填自己的 chat id。
+            const allowedChatIds = parseCommaSeparated(env.TG_ALLOWED_CHAT_IDS);
+            const isChatAllowed = (cid) => !allowedChatIds.length || allowedChatIds.indexOf(String(cid)) !== -1;
+
             if (update.callback_query) {
               const cb = update.callback_query;
-              const chatId = cb.message.chat.id;
+              // inline 模式的回调没有 message，直接回包消掉 loading 状态后忽略
+              const chatId = cb.message && cb.message.chat ? cb.message.chat.id : undefined;
+              if (chatId === undefined || !isChatAllowed(chatId)) {
+                try { await tgApi('answerCallbackQuery', { callback_query_id: cb.id }).catch(() => {}); } catch (e) {}
+                return;
+              }
               const data = cb.data;
 
               if (data.startsWith('M:')) {
                 const index = parseInt(data.substring(2), 10);
                 if (modelObjList[index]) {
                   const selected = modelObjList[index];
-                  tgUserModels.set(chatId, selected.id);
+                  mapSetBounded(tgUserModels, chatId, selected.id);
                   await storePut(env, `tg_user_${chatId}`, selected.id);
 
                   await tgApi('sendMessage', {
@@ -1756,9 +1865,13 @@ export default {
 
             if (update.message && update.message.text) {
               const chatId = update.message.chat.id;
+              if (!isChatAllowed(chatId)) return; // 不在白名单：静默忽略
               const userText = update.message.text;
 
-              if (userText.startsWith('/start') || userText.startsWith('/model')) {
+              // v6.8.1：精确匹配命令，避免 /startfoo 之类被误判；
+              // 兼容群组里的 /start@botname 写法
+              const isCmd = (t, cmd) => t === cmd || t.startsWith(cmd + ' ') || t.startsWith(cmd + '@');
+              if (isCmd(userText, '/start') || isCmd(userText, '/model')) {
                 const inline_keyboard = modelObjList.map((model, index) => {
                   return [{ text: model.name, callback_data: `M:${index}` }];
                 });
@@ -3417,11 +3530,16 @@ const HTML_CONTENT = `<!DOCTYPE html>
             // 结束标记：兼容 data:[DONE]（无空格）写法
             if (line.slice(5).trim() === '[DONE]') { gotDone = true; continue; }
             // v6.6.0 Agent 事件：进度展示 / 错误（错误直接抛给外层统一处理，不自动重试，避免工具重复执行）
+            // v6.8.1：先做子串快速过滤，再要求整行是合法 JSON 且真的携带对应字段，
+            // 避免 AI 正文恰好包含 "agent_progress" 子串时整行被误吞
             if (line.indexOf('"agent_progress"') > 0 || line.indexOf('"agent_error"') > 0) {
+              let handledAsAgentEvent = false;
               try {
                 const adata = JSON.parse(line.slice(5).trim());
-                if (adata.agent_progress) { showAgentProgress(adata.agent_progress); continue; }
-                if (adata.agent_error) {
+                if (adata && adata.agent_progress !== undefined) {
+                  showAgentProgress(adata.agent_progress);
+                  handledAsAgentEvent = true;
+                } else if (adata && adata.agent_error !== undefined) {
                   const ae = new Error(adata.agent_error);
                   ae.name = 'AgentError';
                   throw ae;
@@ -3429,7 +3547,8 @@ const HTML_CONTENT = `<!DOCTYPE html>
               } catch (e) {
                 if (e && e.name === 'AgentError') throw e;
               }
-              continue;
+              if (handledAsAgentEvent) continue;
+              // 不是真正的 Agent 事件 → 回落到下面的普通 SSE 解析，不吞行
             }
             try {
               const data = JSON.parse(line.slice(5).trim());
@@ -3524,7 +3643,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
       } else {
         if (aiContent || reasoningContent) {
           // 字符串拼接替换模板字符串，彻底规避 CF 编辑器转义 Bug
-          tBox.innerHTML = safeHtml(aiContent) + '<br><br><span style="color: #ef4444; font-size: 13px; font-weight: 500;">(⚠️ 网络连接中断，已保留当前生成的内容。错误: ' + error.message + ')</span>';
+          tBox.innerHTML = safeHtml(aiContent) + '<br><br><span style="color: #ef4444; font-size: 13px; font-weight: 500;">(⚠️ 网络连接中断，已保留当前生成的内容。错误: ' + escapeHtml(error.message) + ')</span>';
           currentSession.messages.push({ role: 'assistant', content: aiContent });
           if (rBox && reasoningContent) rBox.remove(); 
         } else {
