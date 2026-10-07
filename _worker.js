@@ -23,7 +23,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.7.2';
+const APP_VERSION = '6.7.3';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -1214,6 +1214,7 @@ function wxChunkText(text, maxLen) {
 
 async function wxSendText(env, bind, toUserId, contextToken, text) {
   const chunks = wxChunkText(wxStripMarkdown(text), WX_REPLY_CHUNK);
+  const rets = [];
   for (const chunk of chunks) {
     const body = {
       msg: {
@@ -1228,8 +1229,14 @@ async function wxSendText(env, bind, toUserId, contextToken, text) {
       base_info: { channel_version: WX_CHANNEL_VERSION, bot_agent: WX_BOT_AGENT },
     };
     const resp = await wxApi(bind.baseUrl, 'POST', '/ilink/bot/sendmessage', body, bind.token, 15000);
-    if (resp && resp.ret && resp.ret !== 0) throw new Error('sendmessage ret=' + resp.ret + ' ' + (resp.errmsg || ''));
+    const ret = resp ? resp.ret : undefined;
+    rets.push(ret === undefined ? null : ret);
+    // v6.7.3：ret 可能是数字 0 也可能是字符串 "0"，都视为成功；缺失时保持旧行为（不抛错）
+    if (ret !== undefined && ret !== 0 && String(ret) !== '0') {
+      throw new Error('sendmessage ret=' + ret + ' ' + (resp.errmsg || ''));
+    }
   }
+  return { chunks: chunks.length, rets };
 }
 
 // ---- 微信对话主流程：复用 Telegram Agent 管线 ----
@@ -1238,13 +1245,19 @@ const wxNoopApi = async () => ({ ok: true }); // typing 心跳在微信通道空
 async function wxChatTurn(env, bind, senderId, text, contextToken) {
   const chatId = 'wx_' + senderId; // 命名空间隔离：历史/记忆/断点/模型选择全部独立
   const t = String(text || '').trim();
-  const reply = async (s) => { await wxSendText(env, bind, senderId, contextToken, s); };
+  // v6.7.3：记录回复明细供诊断（replyPreview / sendInfo），调用方透传
+  let lastReplyText = null, sendInfo = null;
+  const reply = async (s) => {
+    lastReplyText = s;
+    sendInfo = await wxSendText(env, bind, senderId, contextToken, s);
+  };
+  const turnInfo = () => ({ replyPreview: String(lastReplyText || '').slice(0, 120), send: sendInfo });
 
   if (t === '/clear' || t === '/new') {
     await tgClearHistory(env, chatId);
     await agentClearResumeState(env, chatId);
     await reply('🗑️ 已清空本会话的上下文与断点。');
-    return;
+    return turnInfo();
   }
 
   const useAgent = await agentGetMode(env, chatId); // 默认开启
@@ -1257,7 +1270,7 @@ async function wxChatTurn(env, bind, senderId, text, contextToken) {
   if (!useAgent) {
     // 普通模式：单轮问答（与 Telegram 普通模式一致）
     const cfg = buildAIRequest(env, targetModelId, history, false);
-    if (cfg.error) { await reply('⚠️ ' + cfg.error); return; }
+    if (cfg.error) { await reply('⚠️ ' + cfg.error); return turnInfo(); }
     try {
       const resp = await fetch(cfg.apiUrl, {
         method: 'POST',
@@ -1265,13 +1278,13 @@ async function wxChatTurn(env, bind, senderId, text, contextToken) {
         body: JSON.stringify(cfg.payload),
         signal: AbortSignal.timeout(60000),
       });
-      if (!resp.ok) { await reply('⚠️ 上游接口报错（' + resp.status + '），请稍后再试。'); return; }
+      if (!resp.ok) { await reply('⚠️ 上游接口报错（' + resp.status + '），请稍后再试。'); return turnInfo(); }
       const data = await resp.json().catch(() => null);
       const content = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
       replyText = content || '（空回复）';
     } catch (e) {
       await reply('⚠️ 上游接口请求失败，请稍后再试。');
-      return;
+      return turnInfo();
     }
   } else {
     // Agent 模式：与 Telegram 共用 tgAgentChat（含 6 工具 + 长期记忆 + 断点续做）
@@ -1309,6 +1322,7 @@ async function wxChatTurn(env, bind, senderId, text, contextToken) {
     }
   }
   if (replyText) await reply(replyText);
+  return turnInfo();
 }
 
 async function wxHandleInbound(env, bind, msg) {
@@ -1330,12 +1344,12 @@ async function wxHandleInbound(env, bind, msg) {
             '（微信助手）你的账号不在允许名单里，这条消息没有处理。\n你的微信 ID：' + sender + '\n如需开通，请联系绑定者。');
         } catch (e) {}
       }
-      return;
+      return { dropped: true, reason: 'not-allowlisted' };
     }
   }
   const text = wxExtractText(msg);
-  if (!text) return;
-  await wxChatTurn(env, bind, sender, text, contextToken);
+  if (!text) return { dropped: true, reason: 'empty-text' };
+  return await wxChatTurn(env, bind, sender, text, contextToken);
 }
 
 // ---- cron 轮询入口 ----
@@ -1365,8 +1379,8 @@ async function wxCronTick(env, debug) {
     if (!m || typeof m !== 'object') continue;
     const sender = String((m && (m.from_user_id || m.from_user)) || 'unknown');
     try {
-      await wxHandleInbound(env, bind, m);
-      if (debug) dbgMsgs.push({ sender, ok: true, textPreview: wxExtractText(m).slice(0, 120) });
+      const turn = await wxHandleInbound(env, bind, m);
+      if (debug) dbgMsgs.push({ sender, ok: true, textPreview: wxExtractText(m).slice(0, 120), turn: turn || null });
     } catch (e) {
       console.log('微信消息处理异常:', e);
       if (debug) dbgMsgs.push({ sender, ok: false, error: String((e && e.message) || e).slice(0, 200) });
