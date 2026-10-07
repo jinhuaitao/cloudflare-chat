@@ -23,7 +23,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.7.0';
+const APP_VERSION = '6.7.1';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -1504,9 +1504,9 @@ export default {
     }
 
     // ================= 微信 ClawBot 通道（v6.7.0） =================
+    // v6.7.1 修复：/wx 页面本身不鉴权（页面无敏感数据），否则用户只能看到裸 JSON；
+    // 真正敏感的 /api/wx/* 照常鉴权，页面 JS 在 401 时会弹出密码框。
     if (url.pathname === '/wx' || url.pathname === '/wx/') {
-      const denied = denyUnauthorized(env, request);
-      if (denied) return denied;
       return new Response(WX_BIND_HTML, { headers: HTML_HEADERS });
     }
     if (request.method === 'GET' && url.pathname === '/api/wx/qrcode') {
