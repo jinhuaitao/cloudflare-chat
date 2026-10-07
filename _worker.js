@@ -23,7 +23,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.6.2';
+const APP_VERSION = '6.6.3';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -148,6 +148,10 @@ function hitRateLimit(request, env) {
 
 // ======= Telegram 多轮对话历史（内存 L1 + R2 L2） =======
 const tgHistories = new Map();
+// update_id 去重缓存（v6.6.3 起改用内存，不再写 R2）：
+// key 为 Telegram update_id，value 为首次见到时间戳；
+// 去重窗口 10 分钟，每次 webhook 顺手清理过期条目，Map 不会无限增长。
+const seenUpdateIds = new Map();
 function tgHistoryKey(chatId) { return 'tg_hist_' + chatId; }
 function tgTrimHistory(history, env) {
   let maxRounds = parseInt(env.TG_HISTORY_ROUNDS || '10', 10);
@@ -1457,21 +1461,19 @@ export default {
           }
         }
 
-        // update_id 去重：同一 update 10 分钟内只处理一次。
-        // 处理改为在请求内等待完成，响应变慢时 Telegram 可能重发 update，
-        // 去重可避免重复执行 Agent / 重复发送回复。R2 未绑定时自动跳过去重。
+        // update_id 去重（v6.6.3 起改用内存，不再写 R2，避免 tg_update_* 无上限堆积）：
+        // 同一 update 10 分钟内只处理一次。处理改为在请求内等待完成，
+        // 响应变慢时 Telegram 可能重发 update，去重可避免重复执行 Agent / 重复发送回复。
         try {
           const uid = update && update.update_id;
           if (uid !== undefined && uid !== null) {
-            const seenKey = 'tg_update_' + uid;
-            const seenRaw = await storeGet(env, seenKey);
-            let dup = false;
-            if (seenRaw) {
-              const seenAt = parseInt(seenRaw, 10);
-              if (seenAt > 0 && Date.now() - seenAt < 600000) dup = true;
+            const now = Date.now();
+            // 顺手清理过期条目（>10 分钟），防止 Map 无限增长
+            for (const [k, t] of seenUpdateIds) {
+              if (now - t > 600000) seenUpdateIds.delete(k);
             }
-            if (dup) return new Response('OK', { status: 200 });
-            await storePut(env, seenKey, String(Date.now()));
+            if (seenUpdateIds.has(uid)) return new Response('OK', { status: 200 });
+            seenUpdateIds.set(uid, now);
           }
         } catch (e) {}
 

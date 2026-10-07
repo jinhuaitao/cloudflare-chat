@@ -2,7 +2,13 @@
 
 基于 Cloudflare Workers 的多通道 AI 对话前端 + Telegram 机器人。单文件 Worker（`_worker.js`），通过 `wrangler.toml` 声明式配置，支持连接 GitHub 仓库自动构建部署。
 
-> 当前版本：**v6.6.2**（见下方更新日志）
+> 当前版本：**v6.6.3**（见下方更新日志）
+
+## v6.6.3 更新日志
+
+- **修复 R2 文件无上限堆积**：v6.4.3 引入的 `update_id` 去重每次都在 R2 新建一个 `tg_update_<update_id>` 对象且永不删除（每条 Telegram 消息 +1 个文件）。v6.6.3 起去重改用**内存 Map**（10 分钟窗口，过期条目每次顺手清理），不再写 R2
+  - 附带一次性清理脚本 `cleanup-tg-update-keys.sh`，用 `wrangler r2 object` 按前缀批量删除历史堆积的 `tg_update_*` 对象（默认 dry-run，先看数量再确认删除）
+  - 注意：内存去重在极端跨实例重发下可能漏判一次（退化为 v6.4.3 之前的行为），属于可接受的折中
 
 ## v6.6.2 更新日志
 
