@@ -23,7 +23,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.6.9';
+const APP_VERSION = '6.7.0';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -399,10 +399,22 @@ function getAgentTools() {
       type: 'function',
       function: {
         name: 'read_doc',
-        description: '按标题关键词读取一篇知识库文档的全文（超 8000 字截断并标注）。query 给标题或关键词，模糊匹配；找不到时会返回现有标题列表。读到相关内容后优先引用，并注明"据知识库文档《xxx》"。',
+        description: '按标题关键词读取一篇知识库文档的全文（超 8000 字截断并标注）。query 给标题或关键词，模糊匹配；标题想不起来时会自动改搜正文并返回关键词附近片段；找不到时会返回现有标题列表。读到相关内容后优先引用，并注明"据知识库文档《xxx》"。',
         parameters: {
           type: 'object',
           properties: { query: { type: 'string', description: '文档标题或关键词，如"甲骨文ARM"' } },
+          required: ['query']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'delete_doc',
+        description: '删除一篇知识库文档（R2 kb/docs/）。仅在用户明确要求删除文档时调用；query 给标题或关键词模糊匹配，找不到会返回现有标题列表。删除不可逆，调用前确保用户意图明确。',
+        parameters: {
+          type: 'object',
+          properties: { query: { type: 'string', description: '文档标题或关键词' } },
           required: ['query']
         }
       }
@@ -428,6 +440,7 @@ async function execAgentTool(name, args, env, chatId) {
         case 'save_doc': return await toolSaveDoc(env, chatId, args);
         case 'list_docs': return await toolListDocs(env);
         case 'read_doc': return await toolReadDoc(env, args);
+        case 'delete_doc': return await toolDeleteDoc(env, args);
         default: return '未知工具: ' + name;
       }
     })();
@@ -683,42 +696,64 @@ async function toolSaveDoc(env, chatId, args) {
   if (!content.trim()) return '内容为空，未保存';
   if (content.length > 100000) content = content.slice(0, 100000) + '\n\n> （内容过长，仅保存前 10 万字符）';
   const key = KB_PREFIX + 'docs/' + kbDocSlug(title) + '.md';
+  // 同名覆盖即更新：提前告知是新建还是覆盖
+  let existed = false;
+  try { existed = !!(env.R2 && await env.R2.head(key)); } catch (e) {}
   const head = '---\ntitle: "' + title.replace(/"/g, '') + '"\nsaved_at: ' + new Date().toISOString()
     + '\nchat_id: "' + kbSafeChatId(chatId) + '"'
     + (args.source ? '\nsource: ' + String(args.source).slice(0, 500) : '')
     + '\n---\n\n';
   await storePut(env, key, head + content);
-  return '已保存为知识库文档：' + key + '（' + content.length + ' 字符）';
+  return '已保存为知识库文档：' + key + '（' + content.length + ' 字符' + (existed ? '，已覆盖旧版本' : '，新建') + '）';
 }
 
-// 列出 kb/docs/ 下全部文档标题（分页取全量）
-async function kbListDocKeys(env) {
-  const keys = [];
-  if (!env.R2) return keys;
+// 列出 kb/docs/ 下全部文档对象（分页取全量）
+async function kbListDocObjects(env) {
+  const objs = [];
+  if (!env.R2) return objs;
   try {
     const prefix = KB_PREFIX + 'docs/';
     let cursor;
     do {
       const listed = await env.R2.list({ prefix: prefix, limit: 1000, cursor: cursor });
-      for (const o of (listed.objects || [])) keys.push(o.key);
+      for (const o of (listed.objects || [])) objs.push(o);
       cursor = listed.truncated ? listed.cursor : undefined;
     } while (cursor);
   } catch (e) {}
-  return keys;
+  return objs;
+}
+async function kbListDocKeys(env) {
+  return (await kbListDocObjects(env)).map(o => o.key);
 }
 function kbDocTitleOf(key) {
   let t = String(key || '').slice((KB_PREFIX + 'docs/').length);
   if (t.endsWith('.md')) t = t.slice(0, -3);
   return t;
 }
+// 标题模糊匹配：精确相等 > 包含匹配（大小写不敏感），返回 key 或 null
+function kbFindDocKey(keys, query) {
+  const q = String(query || '').trim().toLowerCase();
+  if (!q || !keys || !keys.length) return null;
+  return keys.find(k => kbDocTitleOf(k).toLowerCase() === q)
+    || keys.find(k => kbDocTitleOf(k).toLowerCase().indexOf(q) !== -1)
+    || null;
+}
+function kbFmtSize(b) {
+  b = b || 0;
+  return b >= 1048576 ? (b / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(b / 1024)) + ' KB';
+}
+function kbFmtDate(d) {
+  try { return new Date(d).toISOString().slice(0, 10); } catch (e) { return ''; }
+}
 async function toolListDocs(env) {
   if (!env.R2) return 'R2 未绑定，无法读取知识库文档';
-  const keys = await kbListDocKeys(env);
-  if (!keys.length) return '知识库文档为空（kb/docs/ 下暂无文档，可用 save_doc 保存）';
-  return '知识库文档（共' + keys.length + '篇）：\n' +
-    keys.map((k, i) => (i + 1) + '. ' + kbDocTitleOf(k)).join('\n');
+  let objs;
+  try { objs = await kbListDocObjects(env); } catch (e) { return '读取文档列表失败'; }
+  if (!objs.length) return '知识库文档为空（kb/docs/ 下暂无文档，可用 save_doc 保存）';
+  return '知识库文档（共' + objs.length + '篇）：\n' +
+    objs.map((o, i) => (i + 1) + '. ' + kbDocTitleOf(o.key) + '（' + kbFmtSize(o.size) + '，' + kbFmtDate(o.uploaded) + '）').join('\n');
 }
-// 按标题关键词模糊读取一篇文档：精确相等 > 包含匹配；找不到返回现有标题列表
+// 按标题关键词读取一篇文档；标题无命中时自动改搜正文并返回关键词附近片段
 async function toolReadDoc(env, args) {
   args = args || {};
   const query = String(args.query || '').trim();
@@ -726,22 +761,58 @@ async function toolReadDoc(env, args) {
   if (!env.R2) return 'R2 未绑定，无法读取知识库文档';
   const keys = await kbListDocKeys(env);
   if (!keys.length) return '知识库文档为空（kb/docs/ 下暂无文档）';
+  const hit = kbFindDocKey(keys, query);
+  if (hit) {
+    try {
+      const obj = await env.R2.get(hit);
+      if (!obj) return '文档读取失败：' + kbDocTitleOf(hit);
+      let text = await obj.text();
+      const MAX = 8000;
+      let note = '';
+      if (text.length > MAX) { text = text.slice(0, MAX); note = '\n\n> （文档过长，仅显示前 8000 字符）'; }
+      return '【知识库文档《' + kbDocTitleOf(hit) + '》】\n' + text + note;
+    } catch (e) { return '文档读取失败：' + kbDocTitleOf(hit); }
+  }
+  // 标题无命中 → 全文关键词检索（最多查 30 篇，防长尾延迟）
+  const snippet = await kbSearchDocBody(env, keys.slice(0, 30), query);
+  if (snippet) return snippet;
+  return '未找到标题或正文包含"' + query + '"的文档。现有文档：\n' +
+    keys.map(k => '- ' + kbDocTitleOf(k)).join('\n');
+}
+// 全文关键词检索：逐篇读正文，返回首个命中的关键词上下文片段
+async function kbSearchDocBody(env, keys, query) {
   const q = query.toLowerCase();
-  const hit = keys.find(k => kbDocTitleOf(k).toLowerCase() === q)
-    || keys.find(k => kbDocTitleOf(k).toLowerCase().indexOf(q) !== -1);
+  for (const k of keys) {
+    try {
+      const obj = await env.R2.get(k);
+      if (!obj) continue;
+      const text = await obj.text();
+      const idx = text.toLowerCase().indexOf(q);
+      if (idx === -1) continue;
+      const start = Math.max(0, idx - 600), end = Math.min(text.length, idx + query.length + 600);
+      let frag = text.slice(start, end);
+      if (start > 0) frag = '…' + frag;
+      if (end < text.length) frag = frag + '…';
+      return '【知识库文档《' + kbDocTitleOf(k) + '》· 正文关键词命中】\n' + frag +
+        '\n\n> （仅显示关键词附近片段；用 read_doc 以完整标题「' + kbDocTitleOf(k) + '」可读全文）';
+    } catch (e) {}
+  }
+  return null;
+}
+async function toolDeleteDoc(env, args) {
+  args = args || {};
+  const query = String(args.query || '').trim();
+  if (!query) return '请给出要删除的文档标题关键词';
+  if (!env.R2) return 'R2 未绑定，无法删除知识库文档';
+  const keys = await kbListDocKeys(env);
+  if (!keys.length) return '知识库文档为空，无需删除';
+  const hit = kbFindDocKey(keys, query);
   if (!hit) {
     return '未找到标题包含"' + query + '"的文档。现有文档：\n' +
       keys.map(k => '- ' + kbDocTitleOf(k)).join('\n');
   }
-  try {
-    const obj = await env.R2.get(hit);
-    if (!obj) return '文档读取失败：' + kbDocTitleOf(hit);
-    let text = await obj.text();
-    const MAX = 8000;
-    let note = '';
-    if (text.length > MAX) { text = text.slice(0, MAX); note = '\n\n> （文档过长，仅显示前 8000 字符）'; }
-    return '【知识库文档《' + kbDocTitleOf(hit) + '》】\n' + text + note;
-  } catch (e) { return '文档读取失败：' + kbDocTitleOf(hit); }
+  try { await env.R2.delete(hit); } catch (e) { return '删除失败：' + kbDocTitleOf(hit); }
+  return '已删除知识库文档《' + kbDocTitleOf(hit) + '》';
 }
 
 // 获取 Agent 模式开关（默认开启）
@@ -784,7 +855,7 @@ function buildAgentSystemPrompt(memories, query) {
   p += '当前时间：' + timeStr + '（北京时间）。\n\n';
   p += '【工作方式】\n'
     + '1. 意图判断：闲聊、简单问答、你知识范围内的稳定知识——直接回答，绝不调用工具。工具是稀缺资源，能不用就不用。\n'
-    + '2. 工具选择：需要最新/实时信息（新闻、价格、赛事等）→ web_search，可换多个关键词搜索；想深入了解某条结果 → web_fetch 读原文；任何精确计算 → calculate（不要心算）；天气 → get_weather；时间 → get_time；用户明确告知的长期事实（偏好、生日、项目、城市等）→ remember；用户明确要求把长内容存成文档 → save_doc；用户问题可能涉及知识库文档主题 → 先 list_docs 看标题，有相关再 read_doc 细读，文档内容优先引用并注明"据知识库文档《xxx》"。\n'
+    + '2. 工具选择：需要最新/实时信息（新闻、价格、赛事等）→ web_search，可换多个关键词搜索；想深入了解某条结果 → web_fetch 读原文；任何精确计算 → calculate（不要心算）；天气 → get_weather；时间 → get_time；用户明确告知的长期事实（偏好、生日、项目、城市等）→ remember；用户明确要求把长内容存成文档 → save_doc（同名覆盖即更新）；用户明确要求删除文档 → delete_doc；用户问题可能涉及知识库文档主题 → 先 list_docs 看标题，有相关再 read_doc 细读（标题想不起来时 read_doc 会自动搜正文），文档内容优先引用并注明"据知识库文档《xxx》"。\n'
     + '3. 多步规划：允许先搜索再抓取、先计算再汇总，一次可并行调用多个工具；但每次只规划接下来 1-2 步，拿到结果再决定下一步，不要一次规划过长链条。\n'
     + '4. 诚实：工具没给的信息绝不编造；搜索无结果就直说。\n'
     + '5. 语言：默认用中文回答（用户用其他语言时跟随用户语言）。\n'
@@ -983,6 +1054,7 @@ function describeToolCall(name, args) {
     case 'save_doc': return '💾 正在保存文档：' + (args.title || '');
     case 'list_docs': return '📚 正在查看知识库文档…';
     case 'read_doc': return '📖 正在读取文档：' + (args.query || '');
+    case 'delete_doc': return '🗑️ 正在删除文档：' + (args.query || '');
     default: return '⚙️ 正在调用：' + name;
   }
 }
@@ -1636,6 +1708,7 @@ export default {
                     + "/clear —— 清空当前对话上下文\n"
                     + "/memory —— 查看长期记忆\n"
                     + "/forget 关键词 —— 删除包含关键词的记忆\n"
+                    + "/kb —— 知识库总览（文档列表 + 记忆统计）\n"
                     + "任务太长被暂停时，发送「继续」可接着做\n\n"
                     + "Agent 模式下我会自主规划、调用工具（🔍 搜索、📄 网页、🧮 计算、🌤 天气、🕐 时间），长期记住你告诉我的事，还能用 💾 保存、📚 查阅知识库文档（比如：把这篇文章存成知识库文档；问知识库里的问题我会优先查文档）。"
                     + "\n\n📌 当前版本 v" + APP_VERSION + "（R2 持久化 · 长期记忆无上限）"
@@ -1654,6 +1727,18 @@ export default {
                   for (let s = 0; s < text.length; s += 4000) {
                     await tgApi('sendMessage', { chat_id: chatId, text: text.slice(s, s + 4000) });
                   }
+                }
+                return;
+              }
+
+              if (userText === '/kb') {
+                const mems = await agentGetMemories(env, chatId);
+                let text = '📚 知识库总览\n\n';
+                text += '🧠 长期记忆：共' + mems.length + '条（/memory 查看，/forget 关键词 删除）\n\n';
+                text += await toolListDocs(env);
+                text += '\n\n💾 保存文档：对我说"把…存成知识库文档"；🗑️ 删文档：说"删除知识库文档《标题》"';
+                for (let s = 0; s < text.length; s += 4000) {
+                  await tgApi('sendMessage', { chat_id: chatId, text: text.slice(s, s + 4000) });
                 }
                 return;
               }
