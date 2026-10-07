@@ -23,7 +23,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.6.8';
+const APP_VERSION = '6.6.9';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -294,7 +294,7 @@ async function tgClearHistory(env, chatId) {
 
 // ==================== Telegram Agent：工具定义 ====================
 // 全部工具零密钥、零成本：DuckDuckGo（搜索）、任意网页抓取、自研计算器、
-// Open-Meteo（天气）、Intl（时间）、R2（长期记忆）、R2（知识库文档）。
+// Open-Meteo（天气）、Intl（时间）、R2（长期记忆）、R2（知识库文档存取）。
 function getAgentTools() {
   return [
     {
@@ -386,6 +386,26 @@ function getAgentTools() {
           required: ['title', 'content']
         }
       }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'list_docs',
+        description: '列出知识库文档（R2 kb/docs/ 下所有文档的标题）。用户问题可能涉及之前保存的文档主题时，先调用它确认有没有相关文档；有则用 read_doc 细读。',
+        parameters: { type: 'object', properties: {} }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'read_doc',
+        description: '按标题关键词读取一篇知识库文档的全文（超 8000 字截断并标注）。query 给标题或关键词，模糊匹配；找不到时会返回现有标题列表。读到相关内容后优先引用，并注明"据知识库文档《xxx》"。',
+        parameters: {
+          type: 'object',
+          properties: { query: { type: 'string', description: '文档标题或关键词，如"甲骨文ARM"' } },
+          required: ['query']
+        }
+      }
     }
   ];
 }
@@ -406,6 +426,8 @@ async function execAgentTool(name, args, env, chatId) {
         case 'get_weather': return await toolGetWeather(args.city);
         case 'remember': return await agentSaveMemory(env, chatId, args.fact);
         case 'save_doc': return await toolSaveDoc(env, chatId, args);
+        case 'list_docs': return await toolListDocs(env);
+        case 'read_doc': return await toolReadDoc(env, args);
         default: return '未知工具: ' + name;
       }
     })();
@@ -669,6 +691,59 @@ async function toolSaveDoc(env, chatId, args) {
   return '已保存为知识库文档：' + key + '（' + content.length + ' 字符）';
 }
 
+// 列出 kb/docs/ 下全部文档标题（分页取全量）
+async function kbListDocKeys(env) {
+  const keys = [];
+  if (!env.R2) return keys;
+  try {
+    const prefix = KB_PREFIX + 'docs/';
+    let cursor;
+    do {
+      const listed = await env.R2.list({ prefix: prefix, limit: 1000, cursor: cursor });
+      for (const o of (listed.objects || [])) keys.push(o.key);
+      cursor = listed.truncated ? listed.cursor : undefined;
+    } while (cursor);
+  } catch (e) {}
+  return keys;
+}
+function kbDocTitleOf(key) {
+  let t = String(key || '').slice((KB_PREFIX + 'docs/').length);
+  if (t.endsWith('.md')) t = t.slice(0, -3);
+  return t;
+}
+async function toolListDocs(env) {
+  if (!env.R2) return 'R2 未绑定，无法读取知识库文档';
+  const keys = await kbListDocKeys(env);
+  if (!keys.length) return '知识库文档为空（kb/docs/ 下暂无文档，可用 save_doc 保存）';
+  return '知识库文档（共' + keys.length + '篇）：\n' +
+    keys.map((k, i) => (i + 1) + '. ' + kbDocTitleOf(k)).join('\n');
+}
+// 按标题关键词模糊读取一篇文档：精确相等 > 包含匹配；找不到返回现有标题列表
+async function toolReadDoc(env, args) {
+  args = args || {};
+  const query = String(args.query || '').trim();
+  if (!query) return '请给出要读取的文档标题关键词';
+  if (!env.R2) return 'R2 未绑定，无法读取知识库文档';
+  const keys = await kbListDocKeys(env);
+  if (!keys.length) return '知识库文档为空（kb/docs/ 下暂无文档）';
+  const q = query.toLowerCase();
+  const hit = keys.find(k => kbDocTitleOf(k).toLowerCase() === q)
+    || keys.find(k => kbDocTitleOf(k).toLowerCase().indexOf(q) !== -1);
+  if (!hit) {
+    return '未找到标题包含"' + query + '"的文档。现有文档：\n' +
+      keys.map(k => '- ' + kbDocTitleOf(k)).join('\n');
+  }
+  try {
+    const obj = await env.R2.get(hit);
+    if (!obj) return '文档读取失败：' + kbDocTitleOf(hit);
+    let text = await obj.text();
+    const MAX = 8000;
+    let note = '';
+    if (text.length > MAX) { text = text.slice(0, MAX); note = '\n\n> （文档过长，仅显示前 8000 字符）'; }
+    return '【知识库文档《' + kbDocTitleOf(hit) + '》】\n' + text + note;
+  } catch (e) { return '文档读取失败：' + kbDocTitleOf(hit); }
+}
+
 // 获取 Agent 模式开关（默认开启）
 async function agentGetMode(env, chatId) {
   if (tgAgentModeCache.has(chatId)) return tgAgentModeCache.get(chatId);
@@ -709,7 +784,7 @@ function buildAgentSystemPrompt(memories, query) {
   p += '当前时间：' + timeStr + '（北京时间）。\n\n';
   p += '【工作方式】\n'
     + '1. 意图判断：闲聊、简单问答、你知识范围内的稳定知识——直接回答，绝不调用工具。工具是稀缺资源，能不用就不用。\n'
-    + '2. 工具选择：需要最新/实时信息（新闻、价格、赛事等）→ web_search，可换多个关键词搜索；想深入了解某条结果 → web_fetch 读原文；任何精确计算 → calculate（不要心算）；天气 → get_weather；时间 → get_time；用户明确告知的长期事实（偏好、生日、项目、城市等）→ remember；用户明确要求把长内容存成文档 → save_doc。\n'
+    + '2. 工具选择：需要最新/实时信息（新闻、价格、赛事等）→ web_search，可换多个关键词搜索；想深入了解某条结果 → web_fetch 读原文；任何精确计算 → calculate（不要心算）；天气 → get_weather；时间 → get_time；用户明确告知的长期事实（偏好、生日、项目、城市等）→ remember；用户明确要求把长内容存成文档 → save_doc；用户问题可能涉及知识库文档主题 → 先 list_docs 看标题，有相关再 read_doc 细读，文档内容优先引用并注明"据知识库文档《xxx》"。\n'
     + '3. 多步规划：允许先搜索再抓取、先计算再汇总，一次可并行调用多个工具；但每次只规划接下来 1-2 步，拿到结果再决定下一步，不要一次规划过长链条。\n'
     + '4. 诚实：工具没给的信息绝不编造；搜索无结果就直说。\n'
     + '5. 语言：默认用中文回答（用户用其他语言时跟随用户语言）。\n'
@@ -743,6 +818,7 @@ function buildAgentSystemPrompt(memories, query) {
     + '- 需要用户私密或实时信息时必须用工具核实，不要凭空猜测。\n'
     + '- remember 只用于用户明确要求记住的长期事实，不要把临时对话内容存进去。\n'
     + '- save_doc 是唯一能写知识库文档的途径：只有它返回成功，才可以告诉用户"已保存/已生成文档"；没有调用成功就不许声称。长文档用 save_doc，不要用 remember 硬塞。\n'
+    + '- 知识库优先：read_doc 读到的文档内容优先于通用知识和训练记忆引用，引用时注明"据知识库文档《标题》"。\n'
     + '- 同一工具用相同参数反复调用没有意义：换关键词/换思路，仍无进展就基于已有信息直接回答。\n'
     + '- 当你觉得已经掌握足够信息，直接给出最终答案，不要为了调用工具而调用工具。';
   return p;
@@ -905,6 +981,8 @@ function describeToolCall(name, args) {
     case 'get_time': return '🕐 正在获取时间…';
     case 'remember': return '🧠 正在记住…';
     case 'save_doc': return '💾 正在保存文档：' + (args.title || '');
+    case 'list_docs': return '📚 正在查看知识库文档…';
+    case 'read_doc': return '📖 正在读取文档：' + (args.query || '');
     default: return '⚙️ 正在调用：' + name;
   }
 }
@@ -1265,7 +1343,7 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
 }
 
 // ==================== Web 端 Agent（v6.6.0） ====================
-// 与 Telegram 共用 tgAgentChat（含 7 个零密钥工具 + 长期记忆），
+// 与 Telegram 共用 tgAgentChat（含 9 个零密钥工具 + 长期记忆），
 // 记忆命名空间为 web_<sessionId>，与 Telegram 完全隔离。
 // 进度通过 SSE 自定义事件推送：{"agent_progress": "..."} / {"agent_error": "..."}，
 // 正文走标准 OpenAI delta 事件，最后 data: [DONE] 结束。
@@ -1535,7 +1613,7 @@ export default {
 
                 await tgApi('sendMessage', {
                   chat_id: chatId,
-                  text: "⚙️ **请选择对话要使用的 AI 模型:**\n\n_支持多轮对话（最近 " + (parseInt(env.TG_HISTORY_ROUNDS || '10', 10) || 10) + " 轮），发送 /clear 可清空上下文。_\n\n🤖 **Agent 模式**（默认开启）：我会自主规划、调用工具（🔍 联网搜索、📄 网页读取、🧮 精确计算、🌤 天气、🕐 时间），并用 🧠 长期记住你告诉我的事、用 💾 保存你让我存的知识库文档。发送 /agent 可切换为普通对话模式，/help 查看全部命令。",
+                  text: "⚙️ **请选择对话要使用的 AI 模型:**\n\n_支持多轮对话（最近 " + (parseInt(env.TG_HISTORY_ROUNDS || '10', 10) || 10) + " 轮），发送 /clear 可清空上下文。_\n\n🤖 **Agent 模式**（默认开启）：我会自主规划、调用工具（🔍 联网搜索、📄 网页读取、🧮 精确计算、🌤 天气、🕐 时间），并用 🧠 长期记住你告诉我的事、用 💾📚 存取知识库文档。发送 /agent 可切换为普通对话模式，/help 查看全部命令。",
                   parse_mode: "Markdown",
                   reply_markup: { inline_keyboard }
                 });
@@ -1559,7 +1637,7 @@ export default {
                     + "/memory —— 查看长期记忆\n"
                     + "/forget 关键词 —— 删除包含关键词的记忆\n"
                     + "任务太长被暂停时，发送「继续」可接着做\n\n"
-                    + "Agent 模式下我会自主规划、调用工具（🔍 搜索、📄 网页、🧮 计算、🌤 天气、🕐 时间），长期记住你告诉我的事，还能用 💾 保存知识库文档（比如：把这篇文章存成知识库文档）。"
+                    + "Agent 模式下我会自主规划、调用工具（🔍 搜索、📄 网页、🧮 计算、🌤 天气、🕐 时间），长期记住你告诉我的事，还能用 💾 保存、📚 查阅知识库文档（比如：把这篇文章存成知识库文档；问知识库里的问题我会优先查文档）。"
                     + "\n\n📌 当前版本 v" + APP_VERSION + "（R2 持久化 · 长期记忆无上限）"
                 });
                 return;
@@ -1600,7 +1678,7 @@ export default {
                 await tgApi('sendMessage', {
                   chat_id: chatId,
                   text: !cur
-                    ? "🤖 **Agent 模式已开启**\n\n我会自主规划、调用工具（🔍 联网搜索、📄 网页读取、🧮 精确计算、🌤 天气、🕐 时间），长期记住你告诉我的重要信息，还能用 💾 把长内容保存为知识库文档。"
+                    ? "🤖 **Agent 模式已开启**\n\n我会自主规划、调用工具（🔍 联网搜索、📄 网页读取、🧮 精确计算、🌤 天气、🕐 时间），长期记住你告诉我的重要信息，还能用 💾 保存、📚 查阅知识库文档。"
                     : "💬 **已切换为普通对话模式**\n\n单轮问答，不调用工具、不使用长期记忆。如需 Agent 能力再发送 /agent 切回。",
                   parse_mode: "Markdown"
                 });
