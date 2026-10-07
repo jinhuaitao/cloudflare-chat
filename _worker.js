@@ -1743,7 +1743,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
           <svg id="themeIcon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
         </button>
       </div>
-      <div style="font-size: 12px; color: var(--text-secondary); font-weight: 600; white-space: nowrap; flex-shrink: 0;">Pro v6.0</div>
+      <div style="font-size: 12px; color: var(--text-secondary); font-weight: 600; white-space: nowrap; flex-shrink: 0;">V6.3</div>
     </div>
   </div>
 
