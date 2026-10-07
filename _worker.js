@@ -476,8 +476,8 @@ async function agentSaveMemory(env, chatId, fact) {
   if (!fact) return '内容为空，未保存';
   if (arr.some(m => m.fact === fact)) return '已记住过，无需重复保存';
   arr.push({ fact, ts: Date.now() });
-  // R2 存储近乎无限，不再限制记忆条数；仅保留极宽松的单对象保护
-  while (arr.length > 2000) arr.shift();
+  // v6.4.1 起彻底不限条数：R2 单对象可达 5TB，且每次 prompt 只按预算注入，
+  // 条数增长不影响 token 成本；remember 需用户明确要求才会触发，无失控风险。
   tgAgentMemCache.set(chatId, arr);
   await storePut(env, 'agent_mem_' + chatId, JSON.stringify(arr));
   return '已记住：' + fact + '（共' + arr.length + '条）';
@@ -546,9 +546,9 @@ function buildAgentSystemPrompt(memories, query) {
   if (memories.length) {
     const qTokens = memoryTokens(query);
     const scored = memories.map((m) => {
-      const fTokens = memoryTokens(m.fact);
+      const fSet = new Set(memoryTokens(m.fact)); // Set 查找 O(1)，记忆量大也不慢
       let score = 0;
-      for (const t of qTokens) if (fTokens.indexOf(t) >= 0) score += t.length >= 2 ? 2 : 1;
+      for (const t of qTokens) if (fSet.has(t)) score += t.length >= 2 ? 2 : 1;
       return { m, score };
     });
     scored.sort((a, b) => (b.score - a.score) || ((b.m.ts || 0) - (a.m.ts || 0)));
@@ -1887,7 +1887,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
           <svg id="themeIcon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
         </button>
       </div>
-      <div style="font-size: 12px; color: var(--text-secondary); font-weight: 600; white-space: nowrap; flex-shrink: 0;">V6.4</div>
+      <div style="font-size: 12px; color: var(--text-secondary); font-weight: 600; white-space: nowrap; flex-shrink: 0;">V6.41</div>
     </div>
   </div>
 
