@@ -23,7 +23,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.4.4';
+const APP_VERSION = '6.5.0';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -615,6 +615,45 @@ function describeToolCall(name, args) {
   }
 }
 
+// ==================== Agent 断点续做 ====================
+// webhook 内单轮预算约 55 秒（Telegram 约 60 秒无响应会重发 update；
+// 客户端断开后 worker 会被 cancel，靠"不断开赌长连接"是不可靠的）。
+// 预算耗尽不再终结任务，而是把 ReAct 循环的 messages 存到 R2，
+// 用户发「继续」即用全新预算接着跑，超长任务可分多段完成。
+function tgAgentResumeKey(chatId) { return 'tg_agent_' + chatId; }
+async function agentSaveResumeState(env, chatId, state) {
+  if (!env.R2) return false;
+  try {
+    await storePut(env, tgAgentResumeKey(chatId), JSON.stringify(state));
+    return true;
+  } catch (e) { return false; }
+}
+async function agentLoadResumeState(env, chatId) {
+  const raw = await storeGet(env, tgAgentResumeKey(chatId));
+  if (!raw) return null;
+  try {
+    const s = JSON.parse(raw);
+    if (!s || !Array.isArray(s.messages) || !s.messages.length) return null;
+    // 30 分钟过期：太旧的任务上下文已无意义
+    if (Date.now() - (s.savedAt || 0) > 30 * 60 * 1000) {
+      await agentClearResumeState(env, chatId);
+      return null;
+    }
+    return s;
+  } catch (e) { return null; }
+}
+async function agentClearResumeState(env, chatId) {
+  try { await storeDelete(env, tgAgentResumeKey(chatId)); } catch (e) {}
+}
+
+function tgAgentDeadline(env, opts) {
+  let timeoutMs = agentLimits(env).timeoutMs;
+  // webhook 场景传入 maxRuntimeMs：HTTP 响应必须在 Telegram 因超时重发 update
+  // 之前返回（约 60 秒），取两者较小值，避免整体预算形同虚设
+  if (opts && opts.maxRuntimeMs > 0 && opts.maxRuntimeMs < timeoutMs) timeoutMs = opts.maxRuntimeMs;
+  return Date.now() + timeoutMs;
+}
+
 async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTools, onProgress, opts) {
   const query = history.length ? String(history[history.length - 1].content || '') : '';
   const memories = await agentGetMemories(env, chatId);
@@ -623,15 +662,39 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
   const messages = [{ role: 'system', content: systemPrompt }];
   for (const m of history) messages.push({ role: m.role, content: m.content });
 
-  let maxSteps = agentLimits(env).maxSteps;
-  let timeoutMs = agentLimits(env).timeoutMs;
-  // webhook 场景传入 maxRuntimeMs：HTTP 响应必须在 Telegram 因超时重发 update
-  // 之前返回（约 60 秒），取两者较小值，避免整体预算形同虚设
-  if (opts && opts.maxRuntimeMs > 0 && opts.maxRuntimeMs < timeoutMs) timeoutMs = opts.maxRuntimeMs;
-  const deadline = Date.now() + timeoutMs;
+  const deadline = tgAgentDeadline(env, opts);
+  return await tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline,
+    (opts && opts.resumeKey) || null, false);
+}
+
+// 「继续」入口：messages 里已包含 system + 历史，直接接着跑
+async function tgAgentResume(env, tgApi, chatId, saved, onProgress, opts) {
+  const allowTools = !!saved.allowTools;
+  const tools = allowTools ? getAgentTools() : null;
+  const deadline = tgAgentDeadline(env, opts);
+  return await tgAgentRunLoop(env, tgApi, chatId, saved.targetModelId, saved.messages, tools, allowTools, onProgress, deadline,
+    (opts && opts.resumeKey) || null, true);
+}
+
+async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume) {
+  const maxSteps = agentLimits(env).maxSteps;
   const lastAssistantText = () => {
     const f = [...messages].reverse().find(m => m.role === 'assistant' && m.content);
     return f ? f.content : '';
+  };
+  // 超时暂停：保存循环状态，用户发「继续」即恢复。无 R2 时退化为直接终结。
+  const pauseForResume = async () => {
+    const t = lastAssistantText();
+    let saved = false;
+    if (resumeKey) {
+      saved = await agentSaveResumeState(env, chatId, {
+        v: 1, savedAt: Date.now(), chatId, targetModelId, allowTools, messages
+      });
+    }
+    if (saved) {
+      return { text: '⏸️ 任务较长，已暂停并保存进度，发送「继续」让我接着做。' + (t ? '\n\n已产出：\n' + t : ''), usedTools: true, paused: true };
+    }
+    return { text: '（本次任务超时，已停止）' + (t ? '\n\n' + t : ''), usedTools: true };
   };
 
   // typing 心跳：长推理 / 长工具调用期间每 20 秒刷新一次"正在输入"，
@@ -641,13 +704,11 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
   }, 20000);
   try {
   for (let step = 0; step < maxSteps; step++) {
-    if (Date.now() > deadline) {
-      const t = lastAssistantText();
-      return { text: '（本次任务超时，已停止）' + (t ? '\n\n' + t : ''), usedTools: true };
-    }
+    if (Date.now() > deadline) return await pauseForResume();
+    const stepLabel = '🤖 Agent 思考中' + (isResume ? '（继续）' : '') + '（第 ' + (step + 1) + ' 步）…';
     // 每步开始先报进度：LLM 长思考时用户也能看到活着
     if (typeof onProgress === 'function') {
-      try { await onProgress('🤖 Agent 思考中（第 ' + (step + 1) + ' 步）…'); } catch (e) {}
+      try { await onProgress(stepLabel); } catch (e) {}
     }
     // 长推理时保持 typing 状态不消失
     try { tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {}); } catch (e) {}
@@ -669,14 +730,11 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
     } catch (e) {
       // 中断分类：AbortSignal.timeout() 抛的是 TimeoutError（不是 AbortError），
       // 两种都可能是"上游 hung 住"或"我们自己的整体预算耗尽"。用 deadline 区分：
-      // 预算耗尽 -> 返回已有进展的可见提示（而不是报错）；否则 -> 上游超时提示。
+      // 预算耗尽 -> 暂停并保存进度（可「继续」）；否则 -> 上游超时提示。
       const nm = e && e.name ? String(e.name) : '';
       const msg = String((e && e.message) || '');
       const aborted = nm === 'AbortError' || nm === 'TimeoutError' || /abort/i.test(msg);
-      if (aborted && Date.now() >= deadline - 2000) {
-        const t = lastAssistantText();
-        return { text: '（本次任务超时，已停止）' + (t ? '\n\n' + t : ''), usedTools: true };
-      }
+      if (aborted && Date.now() >= deadline - 2000) return await pauseForResume();
       if (aborted) return { error: '上游响应超时，请重试或换个问法' };
       return { error: '网络错误：' + (msg || String(e)) };
     }
@@ -711,7 +769,7 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
           try { a = JSON.parse(fn.arguments || '{}'); } catch (e) {}
           return describeToolCall(fn.name || 'unknown', a);
         });
-        await onProgress('🤖 Agent 思考中（第 ' + (step + 1) + ' 步）…\n' + descs.join('\n'), true);
+        await onProgress(stepLabel + '\n' + descs.join('\n'), true);
       } catch (e) {}
     }
 
@@ -737,7 +795,16 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
   } finally {
     clearInterval(heartbeat);
   }
+  // 步数用尽：同样保存进度，允许「继续」
   const t = lastAssistantText();
+  if (resumeKey) {
+    const saved = await agentSaveResumeState(env, chatId, {
+      v: 1, savedAt: Date.now(), chatId, targetModelId, allowTools, messages
+    });
+    if (saved) {
+      return { text: '⏸️ 推理步数已用尽，进度已保存，发送「继续」让我接着做。' + (t ? '\n\n已产出：\n' + t : ''), usedTools: true, paused: true };
+    }
+  }
   return { text: t || '（思考步数已用尽，请换个问法重试）', usedTools: true };
 }
 
@@ -1065,6 +1132,7 @@ export default {
 
               if (userText === '/clear' || userText === '/new') {
                 await tgClearHistory(env, chatId);
+                await agentClearResumeState(env, chatId);
                 await tgApi('sendMessage', { chat_id: chatId, text: "🧹 上下文已清空，可以开始新的话题了。" });
                 return;
               }
@@ -1077,7 +1145,8 @@ export default {
                     + "/agent —— 切换 Agent / 普通对话模式\n"
                     + "/clear —— 清空当前对话上下文\n"
                     + "/memory —— 查看长期记忆\n"
-                    + "/forget 关键词 —— 删除包含关键词的记忆\n\n"
+                    + "/forget 关键词 —— 删除包含关键词的记忆\n"
+                    + "任务太长被暂停时，发送「继续」可接着做\n\n"
                     + "Agent 模式下我会自主规划、调用工具（🔍 搜索、📄 网页、🧮 计算、🌤 天气、🕐 时间），并长期记住你告诉我的事。"
                     + "\n\n📌 当前版本 v" + APP_VERSION + "（R2 持久化 · 长期记忆无上限）"
                 });
@@ -1156,6 +1225,14 @@ export default {
               let replyText = null;
               let agentErr = null;
 
+              // webhook 单轮预算：Telegram 约 60 秒无响应会重发 update，
+              // 55 秒内必须返回（可用 TG_WEBHOOK_BUDGET_MS 调整，10 秒 ~ 240 秒）。
+              // 超预算的任务会暂停并保存进度，用户发「继续」即接着做。
+              let webhookBudgetMs = parseInt(env.TG_WEBHOOK_BUDGET_MS || '55000', 10);
+              if (!(webhookBudgetMs >= 10000)) webhookBudgetMs = 55000;
+              if (webhookBudgetMs > 240000) webhookBudgetMs = 240000;
+              const agentOpts = { maxRuntimeMs: webhookBudgetMs, resumeKey: tgAgentResumeKey(chatId) };
+
               if (useAgent) {
                 // Agent 模式：ReAct 多步推理 + 工具调用（进度实时编辑到 pending 消息上）
                 let lastProgressEdit = 0;
@@ -1169,11 +1246,25 @@ export default {
                     await tgApi('editMessageText', { chat_id: chatId, message_id: pendingMsgId, text: String(text).slice(0, 4000) });
                   } catch (e) {}
                 };
+                // 「继续」：恢复上次暂停的任务；新问题则清掉旧暂停状态
+                const wantResume = /^继续/.test(userText.trim());
+                let resumeState = null;
+                if (wantResume) resumeState = await agentLoadResumeState(env, chatId);
+                if (!resumeState) await agentClearResumeState(env, chatId);
+                const runAgentTurn = (allowTools) => {
+                  if (resumeState) {
+                    return tgAgentResume(env, tgApi, chatId, {
+                      targetModelId: resumeState.targetModelId || targetModelId,
+                      allowTools: allowTools,
+                      messages: resumeState.messages
+                    }, onProgress, agentOpts);
+                  }
+                  return tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTools, onProgress, agentOpts);
+                };
                 let r;
                 try {
-                  // webhook 内整体预算 55 秒：保证在 Telegram 因响应超时重发 update 之前返回 OK
-                  r = await tgAgentChat(env, tgApi, chatId, targetModelId, history, true, onProgress, { maxRuntimeMs: 55000 });
-                  if (r.fallback) r = await tgAgentChat(env, tgApi, chatId, targetModelId, history, false, onProgress, { maxRuntimeMs: 55000 });
+                  r = await runAgentTurn(true);
+                  if (r.fallback) r = await runAgentTurn(false);
                 } catch (e) {
                   // 兜底：Agent 内部任何未预期异常都转为可见错误，绝不让用户面对卡死的"思考中"
                   r = { error: '⚠️ Agent 执行出错：' + (e && e.message ? e.message : String(e)) };
@@ -1188,6 +1279,8 @@ export default {
                     history = tgTrimHistory(history, env);
                     await tgSaveHistory(env, chatId, history);
                   }
+                  // 正常完成（非暂停）后清理断点；暂停时新状态已在内部保存
+                  if (!r.paused) await agentClearResumeState(env, chatId);
                 }
               } else {
                 // 普通模式：单次问答（与旧版行为一致，不调用工具）
@@ -1990,7 +2083,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
           <svg id="themeIcon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
         </button>
       </div>
-      <div style="font-size: 12px; color: var(--text-secondary); font-weight: 600; white-space: nowrap; flex-shrink: 0;">Pro v6.0</div>
+      <div style="font-size: 12px; color: var(--text-secondary); font-weight: 600; white-space: nowrap; flex-shrink: 0;">v6.5.0</div>
     </div>
   </div>
 

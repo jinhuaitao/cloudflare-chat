@@ -2,7 +2,14 @@
 
 基于 Cloudflare Workers 的多通道 AI 对话前端 + Telegram 机器人。单文件 Worker（`_worker.js`），通过 `wrangler.toml` 声明式配置，支持连接 GitHub 仓库自动构建部署。
 
-> 当前版本：**v6.4.4**（见下方更新日志）
+> 当前版本：**v6.5.0**（见下方更新日志）
+
+## v6.5.0 更新日志
+
+- **Agent 断点续做**：webhook 单轮预算约 55 秒（Telegram 约 60 秒无响应会重发 update；客户端断开后 worker 会被官方 cancel，靠加预算赌长连接是不可靠的）。超预算的任务不再直接终结，而是**暂停并保存进度到 R2**，用户发「继续」即用全新预算接着跑 —— "抓链接详细分析"这类长任务分几段也能做完
+  - 预算耗尽、推理步数用尽时都会保存断点；「继续」可跨多轮接力；断点 30 分钟过期；新问题或 `/clear` 自动丢弃旧断点
+  - 新增环境变量 `TG_WEBHOOK_BUDGET_MS`（默认 55000，可设 10000 ~ 240000）
+- `/help` 增加「继续」说明；显示 v6.5.0
 
 ## v6.4.4 更新日志
 
@@ -434,6 +441,7 @@ const rx = p => p.split('@').join(BS);   // 用 @ 占位，运行时展开成反
 | `AGENT_TIMEOUT_MS` | Agent 单轮任务总超时（毫秒） | `240000`（4 分钟） |
 | `AGENT_TOOL_TIMEOUT_MS` | 单个工具最长执行时间（毫秒） | `30000`（30 秒） |
 | `TG_API_TIMEOUT_MS` | Telegram Bot API 单次调用超时（毫秒） | `15000`（15 秒） |
+| `TG_WEBHOOK_BUDGET_MS` | webhook 内 Agent 单轮预算（毫秒），10 秒 ~ 240 秒 | `55000`（55 秒） |
 
 ---
 
