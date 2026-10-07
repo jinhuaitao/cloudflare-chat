@@ -188,6 +188,371 @@ async function tgClearHistory(env, chatId) {
   }
 }
 
+// ==================== Telegram Agent：工具定义 ====================
+// 全部工具零密钥、零成本：DuckDuckGo（搜索）、任意网页抓取、自研计算器、
+// Open-Meteo（天气）、Intl（时间）、KV（长期记忆）。
+function getAgentTools() {
+  return [
+    {
+      type: 'function',
+      function: {
+        name: 'web_search',
+        description: '联网搜索最新信息。当问题涉及实时新闻、时事、价格、股价等时效性内容，或超出你知识范围时使用。',
+        parameters: {
+          type: 'object',
+          properties: {
+            query: { type: 'string', description: '搜索关键词' },
+            count: { type: 'integer', description: '返回条数，1-8，默认5' }
+          },
+          required: ['query']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'web_fetch',
+        description: '抓取指定网页的正文纯文本，用于总结文章、阅读文档页面。返回清理后的文本（截断）。',
+        parameters: {
+          type: 'object',
+          properties: { url: { type: 'string', description: '完整的 http(s) URL' } },
+          required: ['url']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'calculate',
+        description: '精确数学计算，支持加减乘除、乘方(^)、取余(%)、括号。复杂计算不要心算，一律用此工具。',
+        parameters: {
+          type: 'object',
+          properties: { expression: { type: 'string', description: '如 (3+5)*2^3/4' } },
+          required: ['expression']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'get_time',
+        description: '获取当前时间，可指定 IANA 时区。',
+        parameters: {
+          type: 'object',
+          properties: { timezone: { type: 'string', description: '如 Asia/Shanghai，默认 Asia/Shanghai' } }
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'get_weather',
+        description: '查询指定城市当前天气与今明两天预报。',
+        parameters: {
+          type: 'object',
+          properties: { city: { type: 'string', description: '城市名，如"北京"、"Tokyo"' } },
+          required: ['city']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'remember',
+        description: '把关于用户的重要长期信息存入记忆（如偏好、生日、项目名、常用城市）。存入后以后所有对话都会记得。',
+        parameters: {
+          type: 'object',
+          properties: { fact: { type: 'string', description: '一句话事实' } },
+          required: ['fact']
+        }
+      }
+    }
+  ];
+}
+
+async function execAgentTool(name, args, env, chatId) {
+  try {
+    switch (name) {
+      case 'web_search': return await toolWebSearch(args.query, args.count);
+      case 'web_fetch': return await toolWebFetch(args.url);
+      case 'calculate': return toolCalculate(args.expression);
+      case 'get_time': return toolGetTime(args.timezone);
+      case 'get_weather': return await toolGetWeather(args.city);
+      case 'remember': return await agentSaveMemory(env, chatId, args.fact);
+      default: return '未知工具: ' + name;
+    }
+  } catch (e) {
+    return '工具执行失败: ' + (e && e.message ? e.message : String(e));
+  }
+}
+
+async function toolWebSearch(query, count) {
+  query = String(query || '').trim();
+  if (!query) return '搜索关键词为空';
+  count = Math.min(Math.max(parseInt(count) || 5, 1), 8);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 12000);
+  try {
+    const res = await fetch('https://html.duckduckgo.com/html/?q=' + encodeURIComponent(query), {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36' },
+      signal: ctrl.signal
+    });
+    if (!res.ok) return '搜索请求失败，HTTP ' + res.status;
+    const html = await res.text();
+    const out = [];
+    const re = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+    let m;
+    while ((m = re.exec(html)) && out.length < count) {
+      let href = m[1];
+      const uddg = href.match(/[?&]uddg=([^&]+)/);
+      try { if (uddg) href = decodeURIComponent(uddg[1]); } catch (e) {}
+      const title = m[2].replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+      if (title && href && href.startsWith('http')) out.push({ title, url: href });
+    }
+    if (!out.length) return '搜索「' + query + '」无结果';
+    let text = '搜索「' + query + '」结果：\n';
+    out.forEach((r, i) => { text += (i + 1) + '. ' + r.title + '\n   ' + r.url + '\n'; });
+    return text.slice(0, 3000);
+  } catch (e) {
+    return '搜索失败: ' + (e.name === 'AbortError' ? '超时' : e.message);
+  } finally { clearTimeout(timer); }
+}
+
+async function toolWebFetch(url) {
+  url = String(url || '').trim();
+  if (!/^https?:\/\//i.test(url)) return 'URL 非法，仅支持 http/https';
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15000);
+  try {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36' },
+      signal: ctrl.signal, redirect: 'follow'
+    });
+    if (!res.ok) return '抓取失败，HTTP ' + res.status;
+    const ct = res.headers.get('content-type') || '';
+    if (/pdf|image|video|audio|octet-stream/i.test(ct)) return '不支持抓取该类型内容(' + ct + ')';
+    let html = await res.text();
+    if (html.length > 500000) html = html.slice(0, 500000);
+    const text = html
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<!--[\s\S]*?-->/g, ' ')
+      .replace(/<[^>]*>/g, ' ')
+      .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+      .replace(/\s+/g, ' ').trim();
+    if (!text) return '页面无有效文本内容';
+    return text.slice(0, 6000);
+  } catch (e) {
+    return '抓取失败: ' + (e.name === 'AbortError' ? '超时' : e.message);
+  } finally { clearTimeout(timer); }
+}
+
+// 安全计算器：递归下降解析，绝不使用 eval
+function toolCalculate(expr) {
+  try {
+    const s = String(expr || '').replace(/\s+/g, '').replace(/×/g, '*').replace(/÷/g, '/');
+    if (!s) return '表达式为空';
+    if (/[^0-9+\-*/%^().]/.test(s)) return '表达式含非法字符';
+    let i = 0;
+    function parseExpr() {
+      let v = parseTerm();
+      while (i < s.length && (s[i] === '+' || s[i] === '-')) {
+        const op = s[i++]; const r = parseTerm();
+        v = op === '+' ? v + r : v - r;
+      }
+      return v;
+    }
+    function parseTerm() {
+      let v = parseFactor();
+      while (i < s.length && (s[i] === '*' || s[i] === '/' || s[i] === '%')) {
+        const op = s[i++]; const r = parseFactor();
+        v = op === '*' ? v * r : op === '/' ? v / r : v % r;
+      }
+      return v;
+    }
+    function parseFactor() {
+      // 一元正负号优先级低于乘方：-3^2 = -(3^2) = -9
+      if (s[i] === '-') { i++; return -parseFactor(); }
+      if (s[i] === '+') { i++; return parseFactor(); }
+      let v = parsePrimary();
+      if (i < s.length && s[i] === '^') { i++; v = Math.pow(v, parseFactor()); }
+      return v;
+    }
+    function parsePrimary() {
+      if (s[i] === '(') { i++; const v = parseExpr(); if (s[i] !== ')') throw new Error('括号不匹配'); i++; return v; }
+      let j = i;
+      while (j < s.length && /[0-9.]/.test(s[j])) j++;
+      if (j === i) throw new Error('意外的字符: ' + s[i]);
+      const n = parseFloat(s.slice(i, j)); i = j;
+      if (!isFinite(n)) throw new Error('数字非法');
+      return n;
+    }
+    const v = parseExpr();
+    if (i !== s.length) throw new Error('表达式未完全解析');
+    if (!isFinite(v)) return '计算结果非法（可能除零）';
+    return '计算结果：' + String(Math.round(v * 1e10) / 1e10);
+  } catch (e) { return '计算失败: ' + e.message; }
+}
+
+function toolGetTime(timezone) {
+  const tz = String(timezone || 'Asia/Shanghai').trim() || 'Asia/Shanghai';
+  try {
+    const fmt = new Intl.DateTimeFormat('zh-CN', {
+      timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, weekday: 'long'
+    });
+    return '当前时间（' + tz + '）：' + fmt.format(new Date());
+  } catch (e) { return '时区无效: ' + tz; }
+}
+
+async function toolGetWeather(city) {
+  city = String(city || '').trim();
+  if (!city) return '城市名为空';
+  try {
+    const g = await (await fetch('https://geocoding-api.open-meteo.com/v1/search?name=' + encodeURIComponent(city) + '&count=1&language=zh&format=json')).json();
+    if (!g.results || !g.results.length) return '找不到城市：' + city;
+    const loc = g.results[0];
+    const w = await (await fetch('https://api.open-meteo.com/v1/forecast?latitude=' + loc.latitude + '&longitude=' + loc.longitude +
+      '&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m' +
+      '&daily=temperature_2m_max,temperature_2m_min,weather_code&timezone=auto&forecast_days=2')).json();
+    const wm = { 0: '晴', 1: '大致晴', 2: '多云', 3: '阴', 45: '雾', 48: '雾凇', 51: '毛毛雨', 53: '毛毛雨', 55: '毛毛雨', 61: '小雨', 63: '中雨', 65: '大雨', 71: '小雪', 73: '中雪', 75: '大雪', 80: '阵雨', 81: '阵雨', 82: '暴雨', 95: '雷阵雨' };
+    const c = w.current, d = w.daily;
+    let t = loc.name + '（' + (loc.country || '') + '）当前：' + (wm[c.weather_code] || '未知') +
+      '，' + c.temperature_2m + '°C，体感' + c.apparent_temperature + '°C，湿度' + c.relative_humidity_2m + '%，风速' + c.wind_speed_10m + 'km/h\n';
+    t += '今明两天：' + d.time.map((dt, i) => dt.slice(5) + ' ' + (wm[d.weather_code[i]] || '') + ' ' + d.temperature_2m_min[i] + '~' + d.temperature_2m_max[i] + '°C').join('；');
+    return t;
+  } catch (e) { return '天气查询失败: ' + e.message; }
+}
+
+// ==================== Telegram Agent：长期记忆 + 开关 ====================
+const tgAgentMemCache = new Map();
+const tgAgentModeCache = new Map();
+
+async function agentGetMemories(env, chatId) {
+  if (tgAgentMemCache.has(chatId)) return tgAgentMemCache.get(chatId);
+  let arr = [];
+  if (env.KV) {
+    try {
+      const raw = await env.KV.get('agent_mem_' + chatId);
+      if (raw) { const p = JSON.parse(raw); if (Array.isArray(p)) arr = p; }
+    } catch (e) {}
+  }
+  tgAgentMemCache.set(chatId, arr);
+  return arr;
+}
+
+async function agentSaveMemory(env, chatId, fact) {
+  const arr = await agentGetMemories(env, chatId);
+  fact = String(fact || '').trim().slice(0, 200);
+  if (!fact) return '内容为空，未保存';
+  if (arr.some(m => m.fact === fact)) return '已记住过，无需重复保存';
+  arr.push({ fact, ts: Date.now() });
+  while (arr.length > 50) arr.shift();
+  tgAgentMemCache.set(chatId, arr);
+  if (env.KV) { try { await env.KV.put('agent_mem_' + chatId, JSON.stringify(arr)); } catch (e) {} }
+  return '已记住：' + fact;
+}
+
+async function agentGetMode(env, chatId) {
+  if (tgAgentModeCache.has(chatId)) return tgAgentModeCache.get(chatId);
+  let on = true; // 默认开启 Agent 模式
+  if (env.KV) {
+    try { const v = await env.KV.get('agent_mode_' + chatId); on = v !== '0'; } catch (e) {}
+  }
+  tgAgentModeCache.set(chatId, on);
+  return on;
+}
+
+async function agentSetMode(env, chatId, on) {
+  tgAgentModeCache.set(chatId, on);
+  if (env.KV) { try { await env.KV.put('agent_mode_' + chatId, on ? '1' : '0'); } catch (e) {} }
+}
+
+function buildAgentSystemPrompt(memories) {
+  const now = new Date();
+  let timeStr = '';
+  try {
+    timeStr = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', dateStyle: 'full', timeStyle: 'short' }).format(now);
+  } catch (e) { timeStr = now.toISOString(); }
+  let p = '你是 Cloudflare-Chat 智能助手，一个具备自主规划、工具调用和长期记忆能力的 AI Agent。\n';
+  p += '当前时间：' + timeStr + '（北京时间）。\n';
+  if (memories.length) {
+    p += '【关于用户的长期记忆】\n' + memories.map(m => '- ' + m.fact).join('\n') + '\n';
+  }
+  p += '【工作方式】\n'
+    + '1. 先理解用户意图：简单问题直接回答，不要为了用工具而用工具。\n'
+    + '2. 需要最新信息（新闻、价格、动态）时用 web_search；需要读具体网页时用 web_fetch；精确计算用 calculate；查天气用 get_weather；查时间用 get_time。\n'
+    + '3. 可以多步规划：先搜索再抓取、先计算再汇总。工具结果返回后综合作答，绝不编造工具没给的信息。\n'
+    + '4. 用户明确告知的长期信息（偏好、生日、项目、常用城市等）用 remember 记住。\n'
+    + '5. 用中文回答，适合手机阅读：重要结论先行，简洁清晰。\n';
+  return p;
+}
+
+// ==================== Telegram Agent：主循环 ====================
+// ReAct 风格：LLM 决策 → 执行工具 → 结果回填 → 最多 MAX_STEPS 步。
+// 通道/模型不支持 tools 参数时返回 { fallback: true }，由调用方降级为普通对话。
+async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTools) {
+  const memories = await agentGetMemories(env, chatId);
+  const systemPrompt = buildAgentSystemPrompt(memories);
+  const tools = allowTools ? getAgentTools() : null;
+  const messages = [{ role: 'system', content: systemPrompt }];
+  for (const m of history) messages.push({ role: m.role, content: m.content });
+
+  const MAX_STEPS = 6;
+  for (let step = 0; step < MAX_STEPS; step++) {
+    // 长推理时保持 typing 状态不消失
+    try { tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {}); } catch (e) {}
+
+    const cfg = buildAIRequest(env, targetModelId, messages, false, tools);
+    if (cfg.error) return { error: cfg.error };
+
+    let resp;
+    try {
+      resp = await fetch(cfg.apiUrl, {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + cfg.currentApiKey, 'Content-Type': 'application/json' },
+        body: JSON.stringify(cfg.payload)
+      });
+    } catch (e) { return { error: '网络错误：' + e.message }; }
+
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => '');
+      if (allowTools && /tool/i.test(t) && step === 0) return { fallback: true };
+      return { error: 'API 报错 (' + resp.status + ')：' + String(t).slice(0, 500) };
+    }
+
+    const data = await resp.json().catch(() => null);
+    // 图片生成通道：直接返回图片链接（不走工具循环）
+    if (data && data.data && data.data[0] && data.data[0].url) {
+      return { text: '[🖼️ 点击查看生成的图片](' + data.data[0].url + ')', usedTools: false, isImage: true };
+    }
+    const msg = data && data.choices && data.choices[0] && data.choices[0].message;
+    if (!msg) return { error: 'AI 没有返回有效内容' };
+
+    const toolCalls = msg.tool_calls || [];
+    const assistantMsg = { role: 'assistant', content: msg.content || '' };
+    if (toolCalls.length) assistantMsg.tool_calls = toolCalls;
+    messages.push(assistantMsg);
+
+    if (!toolCalls.length) return { text: msg.content || '', usedTools: step > 0 };
+
+    for (const tc of toolCalls) {
+      let args = {};
+      try { args = JSON.parse((tc.function && tc.function.arguments) || '{}'); } catch (e) {}
+      const result = await execAgentTool(tc.function.name, args, env, chatId);
+      messages.push({
+        role: 'tool',
+        tool_call_id: tc.id,
+        name: tc.function.name,
+        content: String(result).slice(0, 4000)
+      });
+    }
+  }
+  const last = [...messages].reverse().find(m => m.role === 'assistant' && m.content);
+  return { text: (last && last.content) || '（思考步数已用尽，请换个问法重试）', usedTools: true };
+}
+
 // ======= 统一解析通道配置（带内存缓存） =======
 function getChannelConfig(env) {
   if (cachedConfig) {
@@ -263,7 +628,8 @@ function getChannelConfig(env) {
 }
 
 // 提取共用的 AI 请求构建逻辑 (DRY原则)
-function buildAIRequest(env, requestedModel, messagesArray, isStream) {
+// tools: 可选，OpenAI 兼容的 tools 数组（Agent 模式用）；图片通道自动忽略
+function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
   const { models, modelMap } = getChannelConfig(env);
 
   if (models.length === 0) {
@@ -299,6 +665,7 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream) {
     stream: isStream,
     max_tokens: maxTokens,
   };
+  if (tools && tools.length && !isImageAPI) payload.tools = tools;
 
   return { apiUrl, currentApiKey, payload, isImageAPI };
 }
@@ -494,7 +861,7 @@ export default {
 
                 await tgApi('sendMessage', {
                   chat_id: chatId,
-                  text: "⚙️ **请选择对话要使用的 AI 模型:**\n\n_支持多轮对话（最近 " + (parseInt(env.TG_HISTORY_ROUNDS || '10', 10) || 10) + " 轮），发送 /clear 可清空上下文。_",
+                  text: "⚙️ **请选择对话要使用的 AI 模型:**\n\n_支持多轮对话（最近 " + (parseInt(env.TG_HISTORY_ROUNDS || '10', 10) || 10) + " 轮），发送 /clear 可清空上下文。_\n\n🤖 **Agent 模式**（默认开启）：我会自主规划、调用工具（🔍 联网搜索、📄 网页读取、🧮 精确计算、🌤 天气、🕐 时间），并用 🧠 长期记住你告诉我的事。发送 /agent 可切换为普通对话模式。",
                   parse_mode: "Markdown",
                   reply_markup: { inline_keyboard }
                 });
@@ -504,6 +871,19 @@ export default {
               if (userText === '/clear' || userText === '/new') {
                 await tgClearHistory(env, chatId);
                 await tgApi('sendMessage', { chat_id: chatId, text: "🧹 上下文已清空，可以开始新的话题了。" });
+                return;
+              }
+
+              if (userText === '/agent') {
+                const cur = await agentGetMode(env, chatId);
+                await agentSetMode(env, chatId, !cur);
+                await tgApi('sendMessage', {
+                  chat_id: chatId,
+                  text: !cur
+                    ? "🤖 **Agent 模式已开启**\n\n我会自主规划、调用工具（🔍 联网搜索、📄 网页读取、🧮 精确计算、🌤 天气、🕐 时间），并长期记住你告诉我的重要信息。"
+                    : "💬 **已切换为普通对话模式**\n\n单轮问答，不调用工具、不使用长期记忆。如需 Agent 能力再发送 /agent 切回。",
+                  parse_mode: "Markdown"
+                });
                 return;
               }
 
@@ -517,8 +897,6 @@ export default {
               history.push({ role: "user", content: userText });
               history = tgTrimHistory(history, env);
 
-              const aiConfig = buildAIRequest(env, targetModelId, history, false);
-              
               const sendActionPromise = tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
               const pendingMsgPromise = tgApi('sendMessage', {
                 chat_id: chatId,
@@ -534,59 +912,87 @@ export default {
 
               const [, pendingMsgId] = await Promise.all([sendActionPromise, pendingMsgPromise]);
 
-              if (aiConfig.error) {
-                if (pendingMsgId) {
-                  tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {});
-                }
-                await tgApi('sendMessage', { chat_id: chatId, text: "⚠️ 此模型的 API 接口未配置或异常。" });
-                return;
-              }
+              // ===== Agent 主流程：自主规划 → 工具调用 → 汇总作答 =====
+              const useAgent = await agentGetMode(env, chatId);
+              let replyText = null;
+              let agentErr = null;
 
-              const { apiUrl, currentApiKey, payload } = aiConfig;
-
-              // 上游偶发中断时重试一次（深度思考时间越长越容易撞上）
-              let aiResponse = null;
-              for (let tgAttempt = 1; tgAttempt <= 2; tgAttempt++) {
-                try {
-                  aiResponse = await fetch(apiUrl, {
-                    method: 'POST',
-                    headers: {
-                      'Authorization': `Bearer ${currentApiKey}`,
-                      'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify(payload)
-                  });
-                  break;
-                } catch (e) {
-                  aiResponse = null;
-                  if (tgAttempt >= 2) throw e;
-                  await new Promise(function (r) { setTimeout(r, 1500); });
+              if (useAgent) {
+                let r = await tgAgentChat(env, tgApi, chatId, targetModelId, history, true);
+                if (r.fallback) r = await tgAgentChat(env, tgApi, chatId, targetModelId, history, false);
+                if (r.error) {
+                  agentErr = r.error;
+                } else {
+                  replyText = r.text;
+                  // 文本问答记入历史；图片生成不记（省空间）
+                  if (!r.isImage && replyText) {
+                    history.push({ role: "assistant", content: replyText });
+                    history = tgTrimHistory(history, env);
+                    await tgSaveHistory(env, chatId, history);
+                  }
+                }
+              } else {
+                // 普通模式：单次问答（与旧版行为一致，不调用工具）
+                const aiConfig = buildAIRequest(env, targetModelId, history, false);
+                if (aiConfig.error) {
+                  if (pendingMsgId) {
+                    tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {});
+                  }
+                  await tgApi('sendMessage', { chat_id: chatId, text: "⚠️ 此模型的 API 接口未配置或异常。" });
+                  return;
+                }
+                const { apiUrl, currentApiKey, payload } = aiConfig;
+                // 上游偶发中断时重试一次（深度思考时间越长越容易撞上）
+                let aiResponse = null;
+                for (let tgAttempt = 1; tgAttempt <= 2; tgAttempt++) {
+                  try {
+                    aiResponse = await fetch(apiUrl, {
+                      method: 'POST',
+                      headers: {
+                        'Authorization': `Bearer ${currentApiKey}`,
+                        'Content-Type': 'application/json',
+                      },
+                      body: JSON.stringify(payload)
+                    });
+                    break;
+                  } catch (e) {
+                    aiResponse = null;
+                    if (tgAttempt >= 2) { agentErr = '上游接口请求失败，请稍后再试。'; break; }
+                    await new Promise(function (r) { setTimeout(r, 1500); });
+                  }
+                }
+                if (!agentErr) {
+                  if (aiResponse && aiResponse.ok) {
+                    const aiData = await aiResponse.json();
+                    if (aiData.choices && aiData.choices[0]?.message) {
+                      replyText = aiData.choices[0].message.content;
+                    } else if (aiData.data && aiData.data[0]?.url) {
+                      replyText = `[🖼️ 点击查看生成的图片](${aiData.data[0].url})`;
+                    } else {
+                      replyText = "AI 没有返回有效内容。";
+                    }
+                    if (aiData.choices && aiData.choices[0]?.message && replyText) {
+                      history.push({ role: "assistant", content: replyText });
+                      history = tgTrimHistory(history, env);
+                      await tgSaveHistory(env, chatId, history);
+                    }
+                  } else {
+                    agentErr = "⚠️ AI 接口请求失败，请稍后再试。";
+                  }
                 }
               }
-              if (!aiResponse) throw new Error('上游接口请求失败');
 
               if (pendingMsgId) {
                 ctx.waitUntil(tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {}));
               }
 
-              if (aiResponse.ok) {
-                const aiData = await aiResponse.json();
-                let replyText = "AI 没有返回有效内容。";
+              if (agentErr) {
+                await tgApi('sendMessage', { chat_id: chatId, text: agentErr });
+                return;
+              }
 
-                if (aiData.choices && aiData.choices[0]?.message) {
-                  replyText = aiData.choices[0].message.content;
-                } else if (aiData.data && aiData.data[0]?.url) {
-                  replyText = `[🖼️ 点击查看生成的图片](${aiData.data[0].url})`;
-                }
-
-                // 本轮问答记入历史（图片生成只记文本提示词，不记图片 URL，省空间）
-                if (aiData.choices && aiData.choices[0]?.message) {
-                  history.push({ role: "assistant", content: replyText });
-                  history = tgTrimHistory(history, env);
-                  await tgSaveHistory(env, chatId, history);
-                }
-
-                const maxLength = 4000; 
+              if (replyText) {
+                const maxLength = 4000;
                 let startIndex = 0;
                 while (startIndex < replyText.length) {
                   let sliceLength = maxLength;
@@ -596,10 +1002,10 @@ export default {
                        sliceLength = lastNewline - startIndex;
                     }
                   }
-                  
+
                   const chunk = replyText.slice(startIndex, startIndex + sliceLength);
                   startIndex += sliceLength;
-                  
+
                   const tgRes = await tgApi('sendMessage', {
                     chat_id: chatId,
                     text: chunk,
@@ -610,8 +1016,6 @@ export default {
                     await tgApi('sendMessage', { chat_id: chatId, text: chunk });
                   }
                 }
-              } else {
-                 await tgApi('sendMessage', { chat_id: chatId, text: "⚠️ AI 接口请求失败，请稍后再试。" });
               }
             }
           } catch (err) {
