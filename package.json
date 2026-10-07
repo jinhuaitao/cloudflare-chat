@@ -1,6 +1,6 @@
 {
   "name": "cloudflare-chat",
-  "version": "6.3.0",
+  "version": "6.3.1",
   "private": true,
   "description": "Cloudflare Worker 上的多通道 AI 对话前端 + Telegram 机器人",
   "devDependencies": {

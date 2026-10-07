@@ -2,7 +2,13 @@
 
 基于 Cloudflare Workers 的多通道 AI 对话前端 + Telegram 机器人。单文件 Worker（`_worker.js`），通过 `wrangler.toml` 声明式配置，支持连接 GitHub 仓库自动构建部署。
 
-> 当前版本：**v6.3.0**（见下方更新日志）
+> 当前版本：**v6.3.1**（见下方更新日志）
+
+## v6.3.1 更新日志
+
+- **彻底移除 KV**：持久化只用 R2，删除统一存储层中的 KV 兜底与自动迁移逻辑、`wrangler.toml` 中的 `[[kv_namespaces]]` 配置及相关文档，代码更干净
+  - ⚠️ 如从 v6.2 及更早版本**直接**升级到本版且 KV 中有旧数据（模型选择、历史、记忆），旧数据不会自动迁移；如需保留，请先部署 **v6.3.0** 过渡一次（部署后用一次机器人即完成迁移），再升级到 v6.3.1
+  - 控制台的 KV 命名空间确认无用后可直接删除
 
 ## v6.3.0 更新日志
 
@@ -61,7 +67,7 @@
 10. 点击 **保存并部署** (Save and deploy)。
 
 > 项目根目录已包含 `wrangler.toml` 和 `package.json`，构建设置会被自动接管，无需额外配置。
-> `package.json` 中锁定了 `wrangler ^4.0.0`，请勿删除 —— Workers Builds 会优先使用这里声明的 Wrangler 版本，版本过旧会导致下面的 KV 自动置备失败。
+> `package.json` 中锁定了 `wrangler ^4.0.0`，请勿删除 —— Workers Builds 会优先使用这里声明的 Wrangler 版本，版本过旧会导致下面的 R2 自动置备失败。
 
 ---
 
@@ -74,7 +80,7 @@
 binding = "R2"
 ```
 
-这里**故意省略了 `bucket_name`**，与 KV 的省略 `id` 一样触发自动置备：部署时自动创建 bucket（名字以 Worker 名为前缀，如 `cloudflare-chat-r2`）并绑定，代码里用 `env.R2` 访问。
+这里**故意省略了 `bucket_name`**，省略即触发 Wrangler 的自动置备：部署时自动创建 bucket（名字以 Worker 名为前缀，如 `cloudflare-chat-r2`）并绑定，代码里用 `env.R2` 访问。
 
 ### 如何确认成功了
 
@@ -91,13 +97,9 @@ env.R2    R2 Bucket
 
 同时可以到 **R2 对象存储** 确认 bucket 已存在，并在 Worker 详情页的 **Bindings** 中看到 `R2`。
 
-### KV 兜底与自动迁移
+### 未绑定 R2 时的行为
 
-`wrangler.toml` 里同时保留了 KV 绑定（同样自动置备），作用是**兜底 + 旧数据迁移**：
-
-- 未绑定 R2 的部署：自动退化用 KV，一切正常；
-- v6.2 及更早版本的老用户：KV 里已有数据（模型选择、对话历史、Agent 记忆）会在首次读取时**自动迁移到 R2**，无需手动操作；
-- 两者都缺：退化为纯内存，isolate 重启后丢失（与旧版无 KV 时一致）。
+Telegram 机器人需要持久化（模型选择、对话历史、Agent 记忆与开关），**请务必绑定 R2**。未绑定时代码自动退化为纯内存：isolate 重启后机器人用户的模型选择、历史与记忆会丢失，但不会报错。网页端聊天不受影响（会话本来就只存浏览器本地）。
 
 ### 如果自动置备失败
 
@@ -199,7 +201,7 @@ https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=https://<你的Work
 
 ### 多轮对话
 
-机器人默认记住最近 **10 轮**对话（可通过环境变量 `TG_HISTORY_ROUNDS` 调整，最大 30；另有 12000 字符的总预算，超限自动丢弃最旧的消息）。历史同样存 KV，机器人重启不丢失。发送 `/clear` 可清空当前上下文、开启新话题。
+机器人默认记住最近 **10 轮**对话（可通过环境变量 `TG_HISTORY_ROUNDS` 调整，最大 30；另有 12000 字符的总预算，超限自动丢弃最旧的消息）。历史存 R2，机器人重启不丢失。发送 `/clear` 可清空当前上下文、开启新话题。
 
 > 注意：图片生成类模型不记入历史（只记文本问答），每次按单轮处理。
 
@@ -223,7 +225,7 @@ https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=https://<你的Work
 **记忆**：短期记忆是多轮对话历史；长期记忆是你明确告知的事实，每次对话自动注入，无需重复介绍自己。
 
 **命令**：
-- `/agent` —— 在 Agent / 普通对话模式间切换（选择保存在 KV，默认 Agent 开启）
+- `/agent` —— 在 Agent / 普通对话模式间切换（选择保存在 R2，默认 Agent 开启）
 - `/model` —— 切换模型；`/clear` —— 清空上下文
 
 **兼容性**：依赖通道/模型的原生 function calling。若你的通道不支持 `tools` 参数，机器人会自动降级为普通对话模式，不会报错（可在实时日志中看到降级）。图片生成类模型不受影响。
@@ -301,7 +303,7 @@ https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=https://<你的Work
 
 **部署日志报 `Binding at index N must have a name [code: 10052]`**
 
-`wrangler.toml` 里的 `binding` 是空字符串。binding 名不能为空，必须是 `KV`。注意这个错误还会在账号里留下一个名字畸形的孤儿命名空间，需要手动去 KV 页面删掉。
+`wrangler.toml` 里某个绑定的 `binding` 是空字符串。binding 名不能为空，R2 的必须是 `R2`。注意这个错误还可能在账号里留下一个名字畸形的孤儿 bucket，需要手动去 R2 页面删掉。
 
 **页面一直提示 API 错误 / 模型下拉框是空的**
 

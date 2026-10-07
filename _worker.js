@@ -143,7 +143,7 @@ function hitRateLimit(request, env) {
   return false;
 }
 
-// ======= Telegram 多轮对话历史（内存 L1 + KV L2） =======
+// ======= Telegram 多轮对话历史（内存 L1 + R2 L2） =======
 const tgHistories = new Map();
 function tgHistoryKey(chatId) { return 'tg_hist_' + chatId; }
 function tgTrimHistory(history, env) {
@@ -162,50 +162,27 @@ function tgTrimHistory(history, env) {
   }
   return history;
 }
-// ==================== 统一持久化层：R2 优先，KV 兜底 ====================
-// 为什么用 R2：KV 免费版每天只有 1000 次写入、单 key 限 1 次写入/秒，
-// 机器人每轮对话都要写历史，很容易撞墙。R2 无日写入上限
-// （免费版每月 100 万次 A 类操作 ≈ 每天 3.3 万次）、单对象可达 5TB，
-// 且读写强一致（KV 是最终一致，跨区同步有延迟）。
-// 兼容：已绑定 KV 的旧部署不受影响；R2 未命中但 KV 命中时自动迁移到 R2。
-// 两者都没绑定时退化为纯内存（isolate 重启丢失，与旧版无 KV 时行为一致）。
+// ==================== 持久化层：R2 ====================
+// v6.3.1 起彻底移除 KV，只用 R2：无日写入上限（免费版每月 100 万次 A 类操作）、
+// 单对象可达 5TB、读写强一致。未绑定 R2 时退化为纯内存
+// （isolate 重启丢失；Telegram 机器人需要持久化，请务必绑定 R2）。
 async function storeGet(env, key) {
-  if (env.R2) {
-    try {
-      const obj = await env.R2.get(key);
-      if (obj) return await obj.text();
-    } catch (e) {}
-    // R2 未命中 → 尝试从 KV 迁移旧数据
-    if (env.KV) {
-      try {
-        const v = await env.KV.get(key);
-        if (v != null) {
-          try { await env.R2.put(key, v); } catch (e) {}
-          return v;
-        }
-      } catch (e) {}
-    }
-    return null;
-  }
-  if (env.KV) {
-    try { return await env.KV.get(key); } catch (e) {}
-  }
+  if (!env.R2) return null;
+  try {
+    const obj = await env.R2.get(key);
+    if (obj) return await obj.text();
+  } catch (e) {}
   return null;
 }
 
 async function storePut(env, key, value) {
-  const v = String(value);
-  if (env.R2) {
-    try { await env.R2.put(key, v); return; } catch (e) {}
-  }
-  if (env.KV) {
-    try { await env.KV.put(key, v); } catch (e) {}
-  }
+  if (!env.R2) return;
+  try { await env.R2.put(key, String(value)); } catch (e) {}
 }
 
 async function storeDelete(env, key) {
-  if (env.R2) { try { await env.R2.delete(key); } catch (e) {} }
-  if (env.KV) { try { await env.KV.delete(key); } catch (e) {} }
+  if (!env.R2) return;
+  try { await env.R2.delete(key); } catch (e) {}
 }
 
 async function tgGetHistory(env, chatId) {
@@ -230,7 +207,7 @@ async function tgClearHistory(env, chatId) {
 
 // ==================== Telegram Agent：工具定义 ====================
 // 全部工具零密钥、零成本：DuckDuckGo（搜索）、任意网页抓取、自研计算器、
-// Open-Meteo（天气）、Intl（时间）、KV（长期记忆）。
+// Open-Meteo（天气）、Intl（时间）、R2（长期记忆）。
 function getAgentTools() {
   return [
     {
@@ -1743,7 +1720,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
           <svg id="themeIcon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
         </button>
       </div>
-      <div style="font-size: 12px; color: var(--text-secondary); font-weight: 600; white-space: nowrap; flex-shrink: 0;">V6.3</div>
+      <div style="font-size: 12px; color: var(--text-secondary); font-weight: 600; white-space: nowrap; flex-shrink: 0;">Pro v6.0</div>
     </div>
   </div>
 
