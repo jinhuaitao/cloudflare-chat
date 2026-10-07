@@ -3,6 +3,12 @@
 基于 Cloudflare Workers 的多通道 AI 对话前端 + Telegram 机器人。单文件 Worker（`_worker.js`），通过 `wrangler.toml` 声明式配置，支持连接 GitHub 仓库自动构建部署。
 
 
+## v6.6.6 更新日志（知识库独立文件夹）
+
+- **知识库搬入 R2 独立文件夹**：Agent 长期记忆（知识库）的 R2 key 从根目录的 `agent_mem_<chatId>` 改为 `kb/agent_mem_<chatId>`，在 R2 控制台按文件夹独立展示，便于单独浏览、备份与设置生命周期规则；其它数据（对话历史 `tg_hist_*`、模型选择 `tg_user_*`、Agent 开关 `agent_mode_*`、断点 `tg_agent_*`）保持原样不动
+  - **零停机自动迁移**：读取时先查新 key、再查旧 key，命中旧数据立即搬迁（写新 key + 删旧 key），老部署直接升级不丢任何记忆
+  - 若想一次性批量搬迁历史数据，也可用 `wrangler r2 object` 按前缀复制后删除（新版上线后懒迁移会自动完成，通常无需手动操作）
+
 ## v6.6.5 更新日志（Agent 完善）
 
 - **推理模型多轮工具连续性**：`tgAgentRunLoop` 开始保留并回传 `reasoning_content`（DeepSeek R1 等推理模型要求工具轮次之间回传推理内容，否则后续步骤会丢失上下文）。不返回该字段的模型无影响；断点续存（R2）同样保留该字段，「继续」后不断推理。

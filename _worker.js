@@ -23,7 +23,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.6.5';
+const APP_VERSION = '6.6.6';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -173,6 +173,20 @@ function tgTrimHistory(history, env) {
 // v6.3.1 起彻底移除 KV，只用 R2：无日写入上限（免费版每月 100 万次 A 类操作）、
 // 单对象可达 5TB、读写强一致。未绑定 R2 时退化为纯内存
 // （isolate 重启丢失；Telegram 机器人需要持久化，请务必绑定 R2）。
+//
+// ---------- R2 文件夹布局（v6.6.6 起） ----------
+// R2 没有真正的目录，用 key 前缀 + '/' 模拟文件夹，控制台按此展示层级。
+// 「知识库」（Agent 长期记忆）独立存放在 kb/ 文件夹下，与其它数据隔离，
+// 便于在控制台单独浏览、备份或设置生命周期规则；其余数据保持原样不动。
+//
+//   kb/agent_mem_<chatId>   知识库：Agent 长期记忆（remember 工具写入，JSON 数组）
+//   tg_hist_<chatId>         Telegram 对话历史（根目录，保持原样）
+//   tg_user_<chatId>         用户模型选择（根目录，保持原样）
+//   agent_mode_<chatId>      Agent 开关（根目录，保持原样）
+//   tg_agent_<chatId>        Agent 断点续做（根目录，保持原样）
+const KB_PREFIX = 'kb/';
+function agentMemKey(chatId) { return KB_PREFIX + 'agent_mem_' + chatId; }
+function agentMemKeyLegacy(chatId) { return 'agent_mem_' + chatId; } // v6.6.5 及更早的旧 key（根目录），仅用于兼容迁移
 async function storeGet(env, key) {
   if (!env.R2) return null;
   try {
@@ -483,7 +497,19 @@ const tgAgentModeCache = new Map();
 async function agentGetMemories(env, chatId) {
   if (tgAgentMemCache.has(chatId)) return tgAgentMemCache.get(chatId);
   let arr = [];
-  const raw = await storeGet(env, 'agent_mem_' + chatId);
+  // v6.6.6 起知识库搬入 kb/ 文件夹：先读新 key；若为空再尝试旧 key，
+  // 读到旧数据立即搬迁（写新 key + 删旧 key），老部署升级不丢记忆。
+  let raw = await storeGet(env, agentMemKey(chatId));
+  if (!raw) {
+    const legacy = await storeGet(env, agentMemKeyLegacy(chatId));
+    if (legacy) {
+      raw = legacy;
+      try {
+        await storePut(env, agentMemKey(chatId), legacy);
+        await storeDelete(env, agentMemKeyLegacy(chatId));
+      } catch (e) {}
+    }
+  }
   if (raw) {
     try { const p = JSON.parse(raw); if (Array.isArray(p)) arr = p; } catch (e) {}
   }
@@ -500,7 +526,7 @@ async function agentSaveMemory(env, chatId, fact) {
   // v6.4.1 起彻底不限条数：R2 单对象可达 5TB，且每次 prompt 只按预算注入，
   // 条数增长不影响 token 成本；remember 需用户明确要求才会触发，无失控风险。
   tgAgentMemCache.set(chatId, arr);
-  await storePut(env, 'agent_mem_' + chatId, JSON.stringify(arr));
+  await storePut(env, agentMemKey(chatId), JSON.stringify(arr));
   return '已记住：' + fact + '（共' + arr.length + '条）';
 }
 
@@ -512,7 +538,7 @@ async function agentForgetMemory(env, chatId, keyword) {
   const removed = arr.length - kept.length;
   if (removed > 0) {
     tgAgentMemCache.set(chatId, kept);
-    await storePut(env, 'agent_mem_' + chatId, JSON.stringify(kept));
+    await storePut(env, agentMemKey(chatId), JSON.stringify(kept));
   }
   return { removed };
 }
@@ -1192,7 +1218,7 @@ export default {
       return new Response(JSON.stringify({ ok: true, t: Date.now() }), { headers: HEALTH_HEADERS });
     }
 
-    // v6.6.2: 删除 Web 会话时同步清理 R2 上的 Agent 长期记忆（agent_mem_web_<sessionId>）。
+    // v6.6.2: 删除 Web 会话时同步清理 R2 上的 Agent 长期记忆（kb/agent_mem_web_<sessionId>）。
     // 注意内存缓存也要清，否则下次 remember 会把删掉的记忆从缓存里复活写回去。
     if (request.method === 'DELETE' && url.pathname === '/api/web-memory') {
       const denied = denyUnauthorized(env, request);
@@ -1204,7 +1230,7 @@ export default {
       }
       const webChatId = 'web_' + sid;
       tgAgentMemCache.delete(webChatId);
-      await storeDelete(env, 'agent_mem_' + webChatId);
+      await storeDelete(env, agentMemKey(webChatId));
       return new Response(JSON.stringify({ ok: true }), { headers: CORS_HEADERS });
     }
 
