@@ -544,14 +544,26 @@ export default {
 
               const { apiUrl, currentApiKey, payload } = aiConfig;
 
-              const aiResponse = await fetch(apiUrl, {
-                method: 'POST',
-                headers: {
-                  'Authorization': `Bearer ${currentApiKey}`, 
-                  'Content-Type': 'application/json',
-                },
-                body: JSON.stringify(payload)
-              });
+              // 上游偶发中断时重试一次（深度思考时间越长越容易撞上）
+              let aiResponse = null;
+              for (let tgAttempt = 1; tgAttempt <= 2; tgAttempt++) {
+                try {
+                  aiResponse = await fetch(apiUrl, {
+                    method: 'POST',
+                    headers: {
+                      'Authorization': `Bearer ${currentApiKey}`,
+                      'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(payload)
+                  });
+                  break;
+                } catch (e) {
+                  aiResponse = null;
+                  if (tgAttempt >= 2) throw e;
+                  await new Promise(function (r) { setTimeout(r, 1500); });
+                }
+              }
+              if (!aiResponse) throw new Error('上游接口请求失败');
 
               if (pendingMsgId) {
                 ctx.waitUntil(tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {}));
@@ -1051,6 +1063,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
     .speak-btn svg { flex-shrink: 0; }
     @keyframes speakPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
     .tts-warn { font-size: 12px; color: #ef4444; margin-top: 8px; }
+    .retry-notice { font-size: 12px; color: var(--text-secondary); margin-top: 10px; padding: 8px 12px; background: var(--hover-bg); border-radius: 10px; animation: speakPulse 1.6s infinite ease-in-out; }
     .code-wrapper pre { background: transparent !important; margin: 0 !important; padding: 20px; overflow-x: auto; border-radius: 0; box-shadow: none; max-width: 100%; }
     .code-wrapper pre code { background: transparent; padding: 0; color: #e2e8f0; font-size: 14px; line-height: 1.6; font-family: 'SFMono-Regular', Consolas, monospace; word-break: normal; }
 
@@ -1798,34 +1811,10 @@ const HTML_CONTENT = `<!DOCTYPE html>
       const reqHeaders = { 'Content-Type': 'application/json' };
       if (accessToken) reqHeaders['X-Access-Token'] = accessToken;
 
-      const response = await fetch('/api/chat', {
-        method: 'POST',
-        headers: reqHeaders,
-        body: JSON.stringify({
-          messages: currentSession.messages.slice(-MAX_SEND_MSGS),
-          model: modelSelect.value
-        }),
-        signal: currentAbortController.signal 
-      });
+      let aiContent = '';
+      let reasoningContent = '';
+      let gotDone = false; // 是否收到 SSE 正常结束标记 data: [DONE]
 
-      if (!response.ok) { 
-        const errorData = await response.json().catch(() => ({ error: '网络或服务接口错误' })); 
-        if (response.status === 401) {
-          openSettings();
-          const authErr = new Error('访问口令错误或未填写');
-          authErr.name = 'AuthError';
-          throw authErr;
-        }
-        throw new Error(errorData.error || '请求失败'); 
-      }
-      
-      const reader = response.body.getReader(); 
-      const decoder = new TextDecoder('utf-8');
-      
-      let aiContent = ''; 
-      let reasoningContent = ''; 
-      let buffer = ''; 
-      
       const rBox = bubble.querySelector('.reasoning-box');
       const tBox = bubble.querySelector('.message-text');
 
@@ -1838,7 +1827,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
         if (!force && now - lastRenderTime < 60) return;
         if (isRenderPending) return;
         isRenderPending = true;
-        
+
         requestAnimationFrame(() => {
           isRenderPending = false;
           lastRenderTime = Date.now();
@@ -1864,17 +1853,72 @@ const HTML_CONTENT = `<!DOCTYPE html>
         });
       }
 
-      while (true) {
-        const { done, value } = await reader.read(); 
-        if (done) break;
-        
-        buffer += decoder.decode(value, { stream: true });
-        let lines = buffer.split('\\n');
-        buffer = lines.pop(); 
-        
-        for (let line of lines) {
-          line = line.trim();
-          if (line.startsWith('data:') && line !== 'data: [DONE]') {
+      // 自动重试提示条（只在断流重试时短暂出现）
+      let retryNoticeEl = null;
+      function setRetryNotice(text) {
+        if (!text) {
+          if (retryNoticeEl && retryNoticeEl.parentNode) retryNoticeEl.parentNode.removeChild(retryNoticeEl);
+          retryNoticeEl = null;
+          return;
+        }
+        if (!retryNoticeEl) {
+          retryNoticeEl = document.createElement('div');
+          retryNoticeEl.className = 'retry-notice';
+          bubble.appendChild(retryNoticeEl);
+        }
+        retryNoticeEl.textContent = text;
+      }
+
+      // 重试前清空本轮残留，重新完整生成一次（避免新旧内容拼接错乱）
+      function resetStreamUI() {
+        aiContent = '';
+        reasoningContent = '';
+        gotDone = false;
+        if (rBox) { rBox.style.display = 'none'; rBox.textContent = ''; }
+        tBox.innerHTML = '';
+      }
+
+      // 单次流式请求。收到 [DONE] 返回 true；网络/鉴权等错误直接 throw。
+      // 注意：流被"静默掐断"（done=true 但无 [DONE]）不会抛错，由外层按 gotDone 判定。
+      async function runOnce() {
+        const response = await fetch('/api/chat', {
+          method: 'POST',
+          headers: reqHeaders,
+          body: JSON.stringify({
+            messages: currentSession.messages.slice(-MAX_SEND_MSGS),
+            model: modelSelect.value
+          }),
+          signal: currentAbortController.signal
+        });
+
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({ error: '网络或服务接口错误' }));
+          if (response.status === 401) {
+            openSettings();
+            const authErr = new Error('访问口令错误或未填写');
+            authErr.name = 'AuthError';
+            throw authErr;
+          }
+          throw new Error(errorData.error || '请求失败');
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          let lines = buffer.split('\\n');
+          buffer = lines.pop();
+
+          for (let line of lines) {
+            line = line.trim();
+            if (!line.startsWith('data:')) continue;
+            // 结束标记：兼容 data:[DONE]（无空格）写法
+            if (line.slice(5).trim() === '[DONE]') { gotDone = true; continue; }
             try {
               const data = JSON.parse(line.slice(5).trim());
               if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
@@ -1882,24 +1926,49 @@ const HTML_CONTENT = `<!DOCTYPE html>
               if (data.choices && data.choices[0].delta) {
                 const delta = data.choices[0].delta;
                 if (delta.reasoning_content) reasoningContent += delta.reasoning_content;
-                if (delta.content !== undefined && delta.content !== null) aiContent += delta.content; 
+                if (delta.content !== undefined && delta.content !== null) aiContent += delta.content;
                 scheduleUpdateUI();
               }
             } catch (e) {}
           }
         }
+
+        if (!gotDone && buffer.trim() && buffer.trim().startsWith('data:') && !buffer.includes('[DONE]')) {
+          try {
+            const data = JSON.parse(buffer.slice(5).trim());
+            if (data.choices && data.choices[0].delta) {
+              const delta = data.choices[0].delta;
+              if (delta.reasoning_content) reasoningContent += delta.reasoning_content;
+              if (delta.content) aiContent += delta.content;
+            }
+          } catch(e) {}
+        }
       }
-      
-      if (buffer.trim() && buffer.trim().startsWith('data:') && !buffer.includes('[DONE]')) {
+
+      // 主循环：深度思考时间越长越容易撞上边缘掐流/网络抖动，
+      // 未收到 [DONE] 即视为异常中断，指数退避后自动重试。
+      const MAX_AUTO_RETRY = 3;
+      let attempt = 0;
+      let streamError = null;
+      while (true) {
+        attempt++;
+        streamError = null;
         try {
-          const data = JSON.parse(buffer.slice(5).trim());
-          if (data.choices && data.choices[0].delta) {
-            const delta = data.choices[0].delta;
-            if (delta.reasoning_content) reasoningContent += delta.reasoning_content;
-            if (delta.content) aiContent += delta.content;
-          }
-        } catch(e) {}
+          await runOnce();
+        } catch (e) {
+          // 用户手动中止、口令问题：不重试，直接走统一错误处理
+          if (e.name === 'AbortError' || e.name === 'AuthError') { setRetryNotice(null); throw e; }
+          streamError = e;
+        }
+        if (gotDone) break;
+        if (!streamError) streamError = new Error('连接意外中断（未收到结束标记）');
+        if (attempt > MAX_AUTO_RETRY) break;
+        resetStreamUI();
+        setRetryNotice('连接意外中断，正在自动重试（第 ' + attempt + ' 次）…');
+        await new Promise(function (resolve) { setTimeout(resolve, 1200 * attempt); });
       }
+      setRetryNotice(null);
+      if (!gotDone) throw streamError;
 
       isCurrentlyStreaming = false;
       if (!reasoningContent && rBox) rBox.remove();
