@@ -23,7 +23,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.7.1';
+const APP_VERSION = '6.7.2';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -1339,7 +1339,8 @@ async function wxHandleInbound(env, bind, msg) {
 }
 
 // ---- cron 轮询入口 ----
-async function wxCronTick(env) {
+// debug=true 时返回每条消息的处理明细（供 /api/wx/diag 诊断用，不含 token）
+async function wxCronTick(env, debug) {
   const bind = await wxGetBind(env);
   if (!bind) return { ok: false, reason: 'not-bound' };
   // 防重叠：90 秒内的 tick 直接跳过（cron 每分钟一次，正常不会重叠）
@@ -1358,18 +1359,27 @@ async function wxCronTick(env) {
     return { ok: false, reason: 'poll-error: ' + (e && e.message ? e.message : String(e)) };
   }
   const msgs = resp && Array.isArray(resp.msgs) ? resp.msgs : [];
+  const dbgMsgs = [];
   let n = 0;
   for (const m of msgs) {
     if (!m || typeof m !== 'object') continue;
-    try { await wxHandleInbound(env, bind, m); }
-    catch (e) { console.log('微信消息处理异常:', e); }
+    const sender = String((m && (m.from_user_id || m.from_user)) || 'unknown');
+    try {
+      await wxHandleInbound(env, bind, m);
+      if (debug) dbgMsgs.push({ sender, ok: true, textPreview: wxExtractText(m).slice(0, 120) });
+    } catch (e) {
+      console.log('微信消息处理异常:', e);
+      if (debug) dbgMsgs.push({ sender, ok: false, error: String((e && e.message) || e).slice(0, 200) });
+    }
     n++;
   }
   if (typeof resp.get_updates_buf === 'string' && resp.get_updates_buf) {
     bind.cursor = resp.get_updates_buf;
     await wxSaveBind(env, bind);
   }
-  return { ok: true, count: n };
+  const result = { ok: true, count: n };
+  if (debug) result.debug = dbgMsgs;
+  return result;
 }
 
 // ---- 绑定页 ----
@@ -1403,6 +1413,11 @@ const WX_BIND_HTML = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf
 '<button id="btnCode">提交验证码</button></div>' +
 '<div><button id="btnQr">生成二维码</button>' +
 '<button id="btnUnbind" class="ghost" style="display:none">解绑</button></div>' +
+'<div id="diagBox" style="margin-top:16px;border-top:1px solid #2a2e3a;padding-top:12px">' +
+'<p style="margin:0 0 8px">微信发消息没反应？点下面手动拉取一次，看诊断输出：</p>' +
+'<button id="btnDiag" class="ghost">立即拉取并诊断</button>' +
+'<pre id="diagOut" style="background:#0f1115;border:1px solid #2a2e3a;border-radius:8px;' +
+'padding:10px;font-size:12px;color:#9aa0b0;white-space:pre-wrap;word-break:break-all;max-height:300px;overflow:auto"></pre></div>' +
 '<div id="qrFallback" style="display:none"><p>二维码库加载失败，请勿使用第三方在线工具生成（会泄露绑定凭证）。可复制下面内容用可信工具生成二维码：</p>' +
 '<textarea id="qrText" readonly></textarea></div>' +
 '</div></div>' +
@@ -1448,6 +1463,12 @@ const WX_BIND_HTML = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf
 'api("/api/wx/unbind",{method:"POST"}).then(function(){location.reload();});};' +
 'document.getElementById("btnAuth").onclick=function(){token=document.getElementById("pwd").value;' +
 'localStorage.setItem("wx_access_token",token);document.getElementById("authBox").style.display="none";refresh();};' +
+'document.getElementById("btnDiag").onclick=function(){var b=this;b.disabled=true;' +
+'document.getElementById("diagOut").textContent="拉取中…（最长约 30 秒）";' +
+'api("/api/wx/diag").then(function(r){b.disabled=false;' +
+'document.getElementById("diagOut").textContent=JSON.stringify(r,null,2);' +
+'}).catch(function(e){b.disabled=false;' +
+'document.getElementById("diagOut").textContent="诊断失败："+(e&&e.message?e.message:e);});};' +
 'refresh();})();</script></body></html>';
 
 // 供 node 单测导入（Worker 运行时无影响）
@@ -1536,6 +1557,27 @@ export default {
       try { await storeDelete(env, WX_BIND_KEY); } catch (e) {}
       try { await storeDelete(env, WX_LOGIN_KEY); } catch (e) {}
       return new Response(JSON.stringify({ ok: true }), { headers: CORS_HEADERS });
+    }
+    // v6.7.2：诊断接口——手动触发一次轮询并返回明细（不含 token），用于排查"发消息没反应"
+    if (request.method === 'GET' && url.pathname === '/api/wx/diag') {
+      const denied = denyUnauthorized(env, request);
+      if (denied) return denied;
+      const bind = await wxGetBind(env);
+      let tick;
+      try {
+        tick = await wxCronTick(env, true);
+      } catch (e) {
+        tick = { ok: false, reason: 'tick-throw: ' + (e && e.message ? e.message : String(e)) };
+      }
+      return new Response(JSON.stringify({
+        bind: bind ? {
+          accountId: bind.accountId,
+          baseUrl: bind.baseUrl,
+          hasCursor: !!bind.cursor,
+          senders: (bind.allowedSenders || []).length,
+        } : null,
+        tick,
+      }), { headers: CORS_HEADERS });
     }
 
     if (request.method === 'POST' && url.pathname === '/api/chat') {
@@ -2005,9 +2047,11 @@ export default {
 
   // 微信 ClawBot 通道（v6.7.0）：cron 每分钟触发，轮询 iLink 收消息。
   // 需在 wrangler.toml 配 [triggers] crons；不用微信可删除该段，fetch 不受影响。
+  // v6.7.2：tick 结果打日志，方便 wrangler tail / 控制台日志排查。
   async scheduled(event, env, ctx) {
     try {
-      await wxCronTick(env);
+      const r = await wxCronTick(env);
+      console.log('微信 cron tick:', JSON.stringify(r));
     } catch (e) {
       console.log('微信 cron 异常:', e);
     }

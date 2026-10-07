@@ -2,7 +2,11 @@
 
 基于 Cloudflare Workers 的多通道 AI 对话前端 + Telegram 机器人。单文件 Worker（`_worker.js`），通过 `wrangler.toml` 声明式配置，支持连接 GitHub 仓库自动构建部署。
 
-> 当前版本：**v6.7.1**（见下方更新日志）
+> 当前版本：**v6.7.2**（见下方更新日志）
+
+## v6.7.2 更新日志
+
+- **微信通道加诊断工具**：排查"扫码成功但发消息没反应"——`/wx` 页面新增"立即拉取并诊断"按钮（`GET /api/wx/diag`），手动触发一次轮询并返回明细（绑定状态、cursor、白名单人数、每条消息的发送者/解析预览/处理错误，不含 token）；cron tick 结果也打到 Worker 日志，方便 `wrangler tail` 查看
 
 ## v6.7.1 更新日志
 
