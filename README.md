@@ -2,7 +2,12 @@
 
 基于 Cloudflare Workers 的多通道 AI 对话前端 + Telegram 机器人。单文件 Worker（`_worker.js`），通过 `wrangler.toml` 声明式配置，支持连接 GitHub 仓库自动构建部署。
 
-> 当前版本：**v6.4.3**（见下方更新日志）
+> 当前版本：**v6.4.4**（见下方更新日志）
+
+## v6.4.4 更新日志
+
+- **修复"网络错误：The operation was aborted due to timeout"误报**：`AbortSignal.timeout()` 抛的是 `TimeoutError` 而非 `AbortError`，之前被误判为网络故障。更重要的是归因逻辑：中断发生时用整体 deadline 区分 —— 如果是**我们自己的 55 秒 webhook 预算耗尽**（比如上游深度思考太慢），现在返回可见的"（本次任务超时，已停止）"+ 已有进展，而不是吓人的"网络错误"；只有预算充足时上游真 hung 住，才提示"上游响应超时"
+- `/help` 显示 v6.4.4
 
 ## v6.4.3 更新日志
 

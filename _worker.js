@@ -23,7 +23,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.4.3';
+const APP_VERSION = '6.4.4';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -667,8 +667,18 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
         signal: AbortSignal.timeout(Math.max(15000, Math.min(180000, remainMs)))
       });
     } catch (e) {
-      if (e && e.name === 'AbortError') return { error: '上游响应超时，请重试或换个问法' };
-      return { error: '网络错误：' + e.message };
+      // 中断分类：AbortSignal.timeout() 抛的是 TimeoutError（不是 AbortError），
+      // 两种都可能是"上游 hung 住"或"我们自己的整体预算耗尽"。用 deadline 区分：
+      // 预算耗尽 -> 返回已有进展的可见提示（而不是报错）；否则 -> 上游超时提示。
+      const nm = e && e.name ? String(e.name) : '';
+      const msg = String((e && e.message) || '');
+      const aborted = nm === 'AbortError' || nm === 'TimeoutError' || /abort/i.test(msg);
+      if (aborted && Date.now() >= deadline - 2000) {
+        const t = lastAssistantText();
+        return { text: '（本次任务超时，已停止）' + (t ? '\n\n' + t : ''), usedTools: true };
+      }
+      if (aborted) return { error: '上游响应超时，请重试或换个问法' };
+      return { error: '网络错误：' + (msg || String(e)) };
     }
 
     if (!resp.ok) {
@@ -1980,7 +1990,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
           <svg id="themeIcon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
         </button>
       </div>
-      <div style="font-size: 12px; color: var(--text-secondary); font-weight: 600; white-space: nowrap; flex-shrink: 0;">v6.43</div>
+      <div style="font-size: 12px; color: var(--text-secondary); font-weight: 600; white-space: nowrap; flex-shrink: 0;">Pro v6.0</div>
     </div>
   </div>
 
