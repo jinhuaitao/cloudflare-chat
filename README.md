@@ -2,6 +2,19 @@
 
 基于 Cloudflare Workers 的多通道 AI 对话前端 + Telegram 机器人。单文件 Worker（`_worker.js`），通过 `wrangler.toml` 声明式配置，支持连接 GitHub 仓库自动构建部署。
 
+> 当前版本：**v6.1.0**（见下方更新日志）
+
+## v6.1.0 更新日志
+
+- **Telegram 机器人支持多轮对话**：最近 N 轮上下文自动存 KV（`TG_HISTORY_ROUNDS`，默认 10 轮，另有 12000 字符预算），发送 `/clear` 清空上下文
+- **Telegram webhook 来源校验**：配置 `TG_WEBHOOK_SECRET` 后只接受携带正确 `X-Telegram-Bot-Api-Secret-Token` 的请求，防伪造刷额度
+- **AI 回复 XSS 清洗**：前端所有 AI 内容渲染统一走 DOMPurify 清洗（CDN 加载，失败时降级为纯文本），复制代码按钮等交互不受影响
+- **`/api/chat` 限流**：按 IP 滑动窗口，`RATE_LIMIT_PER_MIN`（默认 60/分钟，设 0 关闭）
+- **`max_tokens` 可配**：环境变量 `MAX_TOKENS`（默认 4096，上限 32000）
+- **超长会话保护**：请求只带最近 60 条消息，本地每个会话最多存 200 条
+- **存储 key 迁移**：`nvidia_ai_sessions` → `cfchat_sessions`，旧数据自动迁移；损坏的本地数据不再导致白屏
+- 模型 `ID:显示名` 切分改用第一个冒号，显示名里可带冒号；图片模型只认 `images/generations` 地址判定
+
 ## 前置条件
 
 - 一个 Cloudflare 账号
@@ -153,13 +166,20 @@ ACCESS_PASSWORD = 你自己设定的一串口令
 
 1. 在 @BotFather 处创建机器人，拿到 Bot Token。
 2. 在 Worker 的 **设置 → 变量和机密** 中添加 `TG_BOT_TOKEN`。
-3. 重新部署，然后设置 Webhook：
+3. （强烈推荐）再添加 `TG_WEBHOOK_SECRET`，填一串自己生成的随机字符串（例如 `openssl rand -hex 24`）。配置后，Worker 只接受携带正确 `X-Telegram-Bot-Api-Secret-Token` 请求头的 webhook 调用，可防止他人伪造 Telegram 请求刷你的 API 额度。
+4. 重新部署，然后设置 Webhook（把 `<SECRET>` 换成上一步的值；若没配置 `TG_WEBHOOK_SECRET`，去掉 `&secret_token=` 部分即可）：
 
 ```
-https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=https://<你的Worker域名>/tg-webhook
+https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=https://<你的Worker域名>/tg-webhook&secret_token=<SECRET>
 ```
 
 配置完成后，在 Telegram 中向机器人发送 `/start` 或 `/model` 即可通过内联按钮切换模型。用户的模型选择会通过第二步自动创建的 KV 持久化保存。
+
+### 多轮对话
+
+机器人默认记住最近 **10 轮**对话（可通过环境变量 `TG_HISTORY_ROUNDS` 调整，最大 30；另有 12000 字符的总预算，超限自动丢弃最旧的消息）。历史同样存 KV，机器人重启不丢失。发送 `/clear` 可清空当前上下文、开启新话题。
+
+> 注意：图片生成类模型不记入历史（只记文本问答），每次按单轮处理。
 
 ---
 
@@ -303,8 +323,28 @@ const rx = p => p.split('@').join(BS);   // 用 @ 占位，运行时展开成反
 # 安全提示
 
 - **`/api/chat` 支持访问口令**：配置环境变量 `ACCESS_PASSWORD` 即生效，未配置则保持开放。部署在公开域名上时建议务必配置，见第三步的「访问口令」小节。
-- **`/tg-webhook` 未做校验**：任何人只要知道你的 Worker 域名，都可以伪造 Telegram 更新请求。建议在 `setWebhook` 时带上 `secret_token` 参数，并在 Worker 中校验 `X-Telegram-Bot-Api-Secret-Token` 请求头。
+- **`/api/chat` 按 IP 限流**：默认每 IP 每分钟 60 次（`RATE_LIMIT_PER_MIN` 可调，设 0 关闭），多一层防刷。
+- **`/tg-webhook` 来源校验**：配置 `TG_WEBHOOK_SECRET` 后，只接受 `setWebhook` 时传入相同 `secret_token` 的请求。未配置时保持开放（兼容旧部署），公开使用时强烈建议配置。
+- **AI 回复经 XSS 清洗**：前端所有 AI 生成内容先经 Markdown 渲染，再过 DOMPurify 白名单清洗后才插入页面；CDN 加载失败时降级为纯文本显示。
 - **CORS 为 `*`**：`Access-Control-Allow-Origin: *` 允许任意站点调用你的接口。如果只在自己的域名下使用，建议收紧为实际域名。
 - **API Key 只存在于服务端**：密钥通过环境变量注入，不会下发到浏览器，前端只能看到模型名称。
 
 > 关于口令强度的说明：口令以明文形式保存在浏览器 localStorage 中，并通过请求头传输（HTTPS 加密）。服务端比较采用定长实现，可避免通过响应耗时逐字节猜解。它能有效挡住扫描器和随手调用接口的人，但不宜作为对抗定向攻击的唯一防线。
+
+---
+
+# 附：新增环境变量一览（v6.1.0）
+
+| 变量 | 说明 | 默认值 |
+|---|---|---|
+| `TG_WEBHOOK_SECRET` | Telegram webhook 校验密钥，见第四步 | 未配置=不校验 |
+| `TG_HISTORY_ROUNDS` | 机器人记住的最近对话轮数（最大 30） | `10` |
+| `MAX_TOKENS` | `/api/chat` 与机器人共用的 `max_tokens`（上限 32000） | `4096` |
+| `RATE_LIMIT_PER_MIN` | 每 IP 每分钟 `/api/chat` 限额，`0` 关闭 | `60` |
+
+---
+
+# 附：杂项说明
+
+- **`tts-demo.html`**：朗读功能的独立演示页，**Worker 不提供对应路由**，直接在浏览器本地打开即可查看，不参与部署。
+- **`/a9a015a0f6e7c9ca09f4cdce4479deb3.txt`**：域名所有权验证文件（第三方平台验证用），内容固定；确认不再需要时可删除 `_worker.js` 中对应路由。

@@ -124,6 +124,70 @@ function denyUnauthorized(env, request) {
   }), { status: 401, headers: CORS_HEADERS });
 }
 
+// ======= 按 IP 滑动窗口限流（isolate 级内存，轻量防刷） =======
+// 环境变量 RATE_LIMIT_PER_MIN：每 IP 每分钟允许的 /api/chat 请求数，默认 60；设为 0 关闭。
+const rateLimitMap = new Map();
+function hitRateLimit(request, env) {
+  const perMin = parseInt(env.RATE_LIMIT_PER_MIN || '60', 10);
+  if (!(perMin > 0)) return false;
+  const ip = request.headers.get('CF-Connecting-IP')
+    || (request.headers.get('X-Forwarded-For') || '').split(',')[0].trim()
+    || 'unknown';
+  const now = Date.now();
+  let arr = rateLimitMap.get(ip) || [];
+  arr = arr.filter(t => now - t < 60000);
+  if (arr.length >= perMin) return true;
+  arr.push(now);
+  rateLimitMap.set(ip, arr);
+  if (rateLimitMap.size > 5000) rateLimitMap.clear(); // 防止 Map 无限增长
+  return false;
+}
+
+// ======= Telegram 多轮对话历史（内存 L1 + KV L2） =======
+const tgHistories = new Map();
+function tgHistoryKey(chatId) { return 'tg_hist_' + chatId; }
+function tgTrimHistory(history, env) {
+  let maxRounds = parseInt(env.TG_HISTORY_ROUNDS || '10', 10);
+  if (!(maxRounds > 0)) maxRounds = 10;
+  if (maxRounds > 30) maxRounds = 30;
+  const maxMsgs = maxRounds * 2;
+  while (history.length > maxMsgs) history.shift();
+  // 字符预算：超长历史从最旧开始丢弃，保证单次请求可控
+  const budget = 12000;
+  let total = 0;
+  for (let i = 0; i < history.length; i++) total += String(history[i].content || '').length;
+  while (history.length > 2 && total > budget) {
+    const dropped = history.shift();
+    total -= String(dropped.content || '').length;
+  }
+  return history;
+}
+async function tgGetHistory(env, chatId) {
+  if (tgHistories.has(chatId)) return tgHistories.get(chatId);
+  if (env.KV) {
+    try {
+      const raw = await env.KV.get(tgHistoryKey(chatId));
+      if (raw) {
+        const h = JSON.parse(raw);
+        if (Array.isArray(h)) { tgHistories.set(chatId, h); return h; }
+      }
+    } catch (e) {}
+  }
+  return [];
+}
+async function tgSaveHistory(env, chatId, history) {
+  tgHistories.set(chatId, history);
+  if (env.KV) {
+    try { await env.KV.put(tgHistoryKey(chatId), JSON.stringify(history)); } catch (e) {}
+  }
+}
+async function tgClearHistory(env, chatId) {
+  tgHistories.delete(chatId);
+  if (env.KV) {
+    try { await env.KV.delete(tgHistoryKey(chatId)); } catch (e) {}
+  }
+}
+
 // ======= 统一解析通道配置（带内存缓存） =======
 function getChannelConfig(env) {
   if (cachedConfig) {
@@ -140,7 +204,8 @@ function getChannelConfig(env) {
       const raw = arr[i].trim();
       if (!raw) continue;
       
-      const colonIdx = raw.lastIndexOf(':');
+      // 用第一个冒号切分：模型 ID 本身不含冒号，显示名里允许出现冒号
+      const colonIdx = raw.indexOf(':');
       const id = colonIdx > 0 ? raw.substring(0, colonIdx).trim() : raw;
       const name = colonIdx > 0 ? raw.substring(colonIdx + 1).trim() : raw;
 
@@ -216,7 +281,13 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream) {
 
   const currentApiKey = channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
   const apiUrl = channel.url;
-  const isImageAPI = apiUrl.includes('images/generations') || selectedModel.toLowerCase().includes('image');
+  // 图片模型只认 images/generations 接口地址，不再按模型名猜测，避免误伤
+  const isImageAPI = apiUrl.includes('images/generations');
+
+  // max_tokens 可配：环境变量 MAX_TOKENS，默认 4096，上限 32000
+  let maxTokens = parseInt(env.MAX_TOKENS || '4096', 10);
+  if (!(maxTokens > 0)) maxTokens = 4096;
+  if (maxTokens > 32000) maxTokens = 32000;
 
   const payload = isImageAPI ? {
     model: selectedModel,
@@ -226,7 +297,7 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream) {
     model: selectedModel,
     messages: messagesArray,
     stream: isStream,
-    max_tokens: 4096, 
+    max_tokens: maxTokens,
   };
 
   return { apiUrl, currentApiKey, payload, isImageAPI };
@@ -236,6 +307,7 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
+    // 域名所有权验证文件（某第三方平台验证用，路径与内容固定；若不再需要可删除本段）
     if (request.method === 'GET' && url.pathname === '/a9a015a0f6e7c9ca09f4cdce4479deb3.txt') {
       return new Response('b7aa7e3069358c2c18f7908a7d5815788bafd020', { headers: TEXT_HEADERS });
     }
@@ -269,6 +341,12 @@ export default {
       const denied = denyUnauthorized(env, request);
       if (denied) return denied;
 
+      if (hitRateLimit(request, env)) {
+        return new Response(JSON.stringify({ error: "请求过于频繁，请稍后再试", code: "RATE_LIMITED" }), {
+          status: 429, headers: CORS_HEADERS,
+        });
+      }
+
       try {
         let body;
         try {
@@ -284,7 +362,7 @@ export default {
 
         const { apiUrl, currentApiKey, payload, isImageAPI } = aiConfig;
 
-        const nvidiaResponse = await fetch(apiUrl, {
+        const upstreamResponse = await fetch(apiUrl, {
           method: 'POST',
           headers: {
             'Authorization': `Bearer ${currentApiKey}`, 
@@ -293,18 +371,18 @@ export default {
           body: JSON.stringify(payload)
         });
 
-        if (!nvidiaResponse.ok) {
-          const errText = await nvidiaResponse.text();
-          return new Response(JSON.stringify({ error: `API 报错 (${nvidiaResponse.status}):${errText}` }), {
-            status: nvidiaResponse.status,
+        if (!upstreamResponse.ok) {
+          const errText = await upstreamResponse.text();
+          return new Response(JSON.stringify({ error: `API 报错 (${upstreamResponse.status}):${errText}` }), {
+            status: upstreamResponse.status,
             headers: CORS_HEADERS,
           });
         }
 
         if (!isImageAPI) {
-          return new Response(nvidiaResponse.body, { headers: SSE_HEADERS });
+          return new Response(upstreamResponse.body, { headers: SSE_HEADERS });
         } else {
-          const responseData = await nvidiaResponse.json();
+          const responseData = await upstreamResponse.json();
           let imageUrlOrText = "图片生成失败或未返回格式";
           
           if (responseData.data && responseData.data[0]?.url) {
@@ -354,6 +432,16 @@ export default {
     }
 
     if (request.method === 'POST' && url.pathname === '/tg-webhook') {
+      // Webhook 来源校验：配置 TG_WEBHOOK_SECRET 后，只接受携带正确
+      // X-Telegram-Bot-Api-Secret-Token 请求头的调用（setWebhook 时传入 secret_token）。
+      // 未配置时保持开放（兼容旧部署），但强烈建议配置。
+      if (env.TG_WEBHOOK_SECRET) {
+        const got = request.headers.get('X-Telegram-Bot-Api-Secret-Token') || '';
+        if (!safeEqual(got, env.TG_WEBHOOK_SECRET)) {
+          return new Response('Forbidden', { status: 403 });
+        }
+      }
+
       try {
         const update = await request.json();
         if (!env.TG_BOT_TOKEN) return new Response('OK', { status: 200 });
@@ -406,10 +494,16 @@ export default {
 
                 await tgApi('sendMessage', {
                   chat_id: chatId,
-                  text: "⚙️ **请选择对话要使用的 AI 模型:**",
+                  text: "⚙️ **请选择对话要使用的 AI 模型:**\n\n_支持多轮对话（最近 " + (parseInt(env.TG_HISTORY_ROUNDS || '10', 10) || 10) + " 轮），发送 /clear 可清空上下文。_",
                   parse_mode: "Markdown",
                   reply_markup: { inline_keyboard }
                 });
+                return;
+              }
+
+              if (userText === '/clear' || userText === '/new') {
+                await tgClearHistory(env, chatId);
+                await tgApi('sendMessage', { chat_id: chatId, text: "🧹 上下文已清空，可以开始新的话题了。" });
                 return;
               }
 
@@ -418,7 +512,12 @@ export default {
                 try { targetModelId = await env.KV.get(`tg_user_${chatId}`); } catch(e){}
               }
 
-              const aiConfig = buildAIRequest(env, targetModelId, [{ role: "user", content: userText }], false);
+              // 多轮对话：取出历史，拼上本轮用户消息（超限自动裁剪）
+              let history = await tgGetHistory(env, chatId);
+              history.push({ role: "user", content: userText });
+              history = tgTrimHistory(history, env);
+
+              const aiConfig = buildAIRequest(env, targetModelId, history, false);
               
               const sendActionPromise = tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
               const pendingMsgPromise = tgApi('sendMessage', {
@@ -461,11 +560,18 @@ export default {
               if (aiResponse.ok) {
                 const aiData = await aiResponse.json();
                 let replyText = "AI 没有返回有效内容。";
-                
+
                 if (aiData.choices && aiData.choices[0]?.message) {
                   replyText = aiData.choices[0].message.content;
                 } else if (aiData.data && aiData.data[0]?.url) {
                   replyText = `[🖼️ 点击查看生成的图片](${aiData.data[0].url})`;
+                }
+
+                // 本轮问答记入历史（图片生成只记文本提示词，不记图片 URL，省空间）
+                if (aiData.choices && aiData.choices[0]?.message) {
+                  history.push({ role: "assistant", content: replyText });
+                  history = tgTrimHistory(history, env);
+                  await tgSaveHistory(env, chatId, history);
                 }
 
                 const maxLength = 4000; 
@@ -555,6 +661,7 @@ const PRECACHE = [
 
 const CDN_ASSETS = [
   'https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js',
+  'https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js',
   'https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/atom-one-dark.min.css',
   'https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js',
   'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap'
@@ -707,6 +814,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/atom-one-dark.min.css">
   <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 
@@ -1229,6 +1337,20 @@ const HTML_CONTENT = `<!DOCTYPE html>
   const ESCAPE_REG = /[&<>]/g;
   const escapeHtml = str => str.replace(ESCAPE_REG, m => ESCAPE_MAP[m]);
 
+  // AI 输出统一走 safeHtml：先 Markdown 渲染，再做 XSS 清洗。
+  // DOMPurify 经 CDN 加载；若加载失败则降级为"解析后取纯文本"，保证永远安全。
+  // 注意：本段在外层模板字符串内，不写反斜杠、反引号，避免两层转义破坏代码。
+  function safeHtml(mdText) {
+    var raw = '';
+    try { raw = marked.parse(mdText || ''); } catch (e) { raw = ''; }
+    try {
+      if (window.DOMPurify && window.DOMPurify.sanitize) return window.DOMPurify.sanitize(raw);
+    } catch (e) {}
+    var tmp = document.createElement('div');
+    tmp.innerHTML = raw;
+    return tmp.textContent || '';
+  }
+
   const renderer = new marked.Renderer();
   renderer.code = function(code, language) {
     const displayLang = language || 'text';
@@ -1402,8 +1524,25 @@ const HTML_CONTENT = `<!DOCTYPE html>
     bubble.appendChild(actions);
   }
 
-  const STORAGE_KEY = 'nvidia_ai_sessions';
-  let sessions = JSON.parse(localStorage.getItem(STORAGE_KEY)) || [];
+  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 key（nvidia_ai_sessions）的数据自动迁移
+  const STORAGE_KEY = 'cfchat_sessions';
+  const LEGACY_STORAGE_KEY = 'nvidia_ai_sessions';
+  const MAX_SEND_MSGS = 60;   // 每次请求最多带最近 60 条消息，避免超长会话撑爆请求体
+  const MAX_STORE_MSGS = 200; // 每个会话本地最多保留 200 条，超限从最旧开始丢弃
+  function loadSessions() {
+    try {
+      var raw = localStorage.getItem(STORAGE_KEY) || localStorage.getItem(LEGACY_STORAGE_KEY);
+      if (raw) { var arr = JSON.parse(raw); if (Array.isArray(arr)) return arr; }
+    } catch (e) {}
+    return [];
+  }
+  let sessions = loadSessions();
+  try {
+    if (!localStorage.getItem(STORAGE_KEY) && localStorage.getItem(LEGACY_STORAGE_KEY)) {
+      localStorage.setItem(STORAGE_KEY, localStorage.getItem(LEGACY_STORAGE_KEY));
+    }
+    localStorage.removeItem(LEGACY_STORAGE_KEY);
+  } catch (e) {}
   let currentSessionId = null;
 
   // /api/chat 访问口令：存在本机浏览器，随请求以 X-Access-Token 头发出
@@ -1459,7 +1598,17 @@ const HTML_CONTENT = `<!DOCTYPE html>
     renderSessionList();
   }
 
-  function saveSessions() { localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions)); }
+  function saveSessions() {
+    try {
+      for (var i = 0; i < sessions.length; i++) {
+        var msgs = sessions[i].messages;
+        if (msgs && msgs.length > MAX_STORE_MSGS) {
+          sessions[i].messages = msgs.slice(msgs.length - MAX_STORE_MSGS);
+        }
+      }
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions));
+    } catch (e) {}
+  }
 
   menuToggle.addEventListener('click', () => { sidebar.classList.toggle('open'); sidebarOverlay.classList.toggle('active'); });
   sidebarOverlay.addEventListener('click', () => { sidebar.classList.remove('open'); sidebarOverlay.classList.remove('active'); });
@@ -1593,7 +1742,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
         bubble.innerHTML = content;
       } else {
         isCurrentlyStreaming = false;
-        bubble.innerHTML = '<div class="message-text markdown-body">' + marked.parse(content) + '</div>';
+        bubble.innerHTML = '<div class="message-text markdown-body">' + safeHtml(content) + '</div>';
         bubble.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
       }
       ensureSpeakButton(bubble);
@@ -1652,9 +1801,9 @@ const HTML_CONTENT = `<!DOCTYPE html>
       const response = await fetch('/api/chat', {
         method: 'POST',
         headers: reqHeaders,
-        body: JSON.stringify({ 
-          messages: currentSession.messages,
-          model: modelSelect.value 
+        body: JSON.stringify({
+          messages: currentSession.messages.slice(-MAX_SEND_MSGS),
+          model: modelSelect.value
         }),
         signal: currentAbortController.signal 
       });
@@ -1703,7 +1852,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
           }
 
           if (aiContent || !reasoningContent) {
-            tBox.innerHTML = marked.parse(aiContent) + (isCurrentlyStreaming ? cursorHtml : '');
+            tBox.innerHTML = safeHtml(aiContent) + (isCurrentlyStreaming ? cursorHtml : '');
           } else if (reasoningContent && !aiContent) {
             tBox.innerHTML = '<div style="color: var(--brand-color); font-size: 14px; font-weight: 500;">正在深度思考... ▍</div>';
           }
@@ -1755,7 +1904,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
       isCurrentlyStreaming = false;
       if (!reasoningContent && rBox) rBox.remove();
       
-      tBox.innerHTML = marked.parse(aiContent);
+      tBox.innerHTML = safeHtml(aiContent);
       tBox.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
       scrollArea.scrollTop = scrollArea.scrollHeight;
 
@@ -1774,7 +1923,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
       
       if (error.name === 'AbortError') {
         const interruptNote = '<br><br><span style="color: var(--text-secondary); font-size: 13px; font-weight: 500;">(🛑 生成已手动中止)</span>';
-        tBox.innerHTML = marked.parse(aiContent || '已中止') + interruptNote;
+        tBox.innerHTML = safeHtml(aiContent || '已中止') + interruptNote;
         if (aiContent) currentSession.messages.push({ role: 'assistant', content: aiContent });
       } else if (error.name === 'AuthError') {
         tBox.innerHTML = '<span style="color: var(--brand-color); font-size: 15px; font-weight: 600;">需要访问口令</span>' +
@@ -1786,7 +1935,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
       } else {
         if (aiContent || reasoningContent) {
           // 字符串拼接替换模板字符串，彻底规避 CF 编辑器转义 Bug
-          tBox.innerHTML = marked.parse(aiContent) + '<br><br><span style="color: #ef4444; font-size: 13px; font-weight: 500;">(⚠️ 网络连接中断，已保留当前生成的内容。错误: ' + error.message + ')</span>';
+          tBox.innerHTML = safeHtml(aiContent) + '<br><br><span style="color: #ef4444; font-size: 13px; font-weight: 500;">(⚠️ 网络连接中断，已保留当前生成的内容。错误: ' + error.message + ')</span>';
           currentSession.messages.push({ role: 'assistant', content: aiContent });
           if (rBox && reasoningContent) rBox.remove(); 
         } else {
