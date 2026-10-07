@@ -162,30 +162,70 @@ function tgTrimHistory(history, env) {
   }
   return history;
 }
+// ==================== 统一持久化层：R2 优先，KV 兜底 ====================
+// 为什么用 R2：KV 免费版每天只有 1000 次写入、单 key 限 1 次写入/秒，
+// 机器人每轮对话都要写历史，很容易撞墙。R2 无日写入上限
+// （免费版每月 100 万次 A 类操作 ≈ 每天 3.3 万次）、单对象可达 5TB，
+// 且读写强一致（KV 是最终一致，跨区同步有延迟）。
+// 兼容：已绑定 KV 的旧部署不受影响；R2 未命中但 KV 命中时自动迁移到 R2。
+// 两者都没绑定时退化为纯内存（isolate 重启丢失，与旧版无 KV 时行为一致）。
+async function storeGet(env, key) {
+  if (env.R2) {
+    try {
+      const obj = await env.R2.get(key);
+      if (obj) return await obj.text();
+    } catch (e) {}
+    // R2 未命中 → 尝试从 KV 迁移旧数据
+    if (env.KV) {
+      try {
+        const v = await env.KV.get(key);
+        if (v != null) {
+          try { await env.R2.put(key, v); } catch (e) {}
+          return v;
+        }
+      } catch (e) {}
+    }
+    return null;
+  }
+  if (env.KV) {
+    try { return await env.KV.get(key); } catch (e) {}
+  }
+  return null;
+}
+
+async function storePut(env, key, value) {
+  const v = String(value);
+  if (env.R2) {
+    try { await env.R2.put(key, v); return; } catch (e) {}
+  }
+  if (env.KV) {
+    try { await env.KV.put(key, v); } catch (e) {}
+  }
+}
+
+async function storeDelete(env, key) {
+  if (env.R2) { try { await env.R2.delete(key); } catch (e) {} }
+  if (env.KV) { try { await env.KV.delete(key); } catch (e) {} }
+}
+
 async function tgGetHistory(env, chatId) {
   if (tgHistories.has(chatId)) return tgHistories.get(chatId);
-  if (env.KV) {
+  const raw = await storeGet(env, tgHistoryKey(chatId));
+  if (raw) {
     try {
-      const raw = await env.KV.get(tgHistoryKey(chatId));
-      if (raw) {
-        const h = JSON.parse(raw);
-        if (Array.isArray(h)) { tgHistories.set(chatId, h); return h; }
-      }
+      const h = JSON.parse(raw);
+      if (Array.isArray(h)) { tgHistories.set(chatId, h); return h; }
     } catch (e) {}
   }
   return [];
 }
 async function tgSaveHistory(env, chatId, history) {
   tgHistories.set(chatId, history);
-  if (env.KV) {
-    try { await env.KV.put(tgHistoryKey(chatId), JSON.stringify(history)); } catch (e) {}
-  }
+  await storePut(env, tgHistoryKey(chatId), JSON.stringify(history));
 }
 async function tgClearHistory(env, chatId) {
   tgHistories.delete(chatId);
-  if (env.KV) {
-    try { await env.KV.delete(tgHistoryKey(chatId)); } catch (e) {}
-  }
+  await storeDelete(env, tgHistoryKey(chatId));
 }
 
 // ==================== Telegram Agent：工具定义 ====================
@@ -432,11 +472,9 @@ const tgAgentModeCache = new Map();
 async function agentGetMemories(env, chatId) {
   if (tgAgentMemCache.has(chatId)) return tgAgentMemCache.get(chatId);
   let arr = [];
-  if (env.KV) {
-    try {
-      const raw = await env.KV.get('agent_mem_' + chatId);
-      if (raw) { const p = JSON.parse(raw); if (Array.isArray(p)) arr = p; }
-    } catch (e) {}
+  const raw = await storeGet(env, 'agent_mem_' + chatId);
+  if (raw) {
+    try { const p = JSON.parse(raw); if (Array.isArray(p)) arr = p; } catch (e) {}
   }
   tgAgentMemCache.set(chatId, arr);
   return arr;
@@ -448,25 +486,25 @@ async function agentSaveMemory(env, chatId, fact) {
   if (!fact) return '内容为空，未保存';
   if (arr.some(m => m.fact === fact)) return '已记住过，无需重复保存';
   arr.push({ fact, ts: Date.now() });
-  while (arr.length > 50) arr.shift();
+  // R2 存储近乎无限，不再限制记忆条数；仅保留极宽松的单对象保护
+  while (arr.length > 2000) arr.shift();
   tgAgentMemCache.set(chatId, arr);
-  if (env.KV) { try { await env.KV.put('agent_mem_' + chatId, JSON.stringify(arr)); } catch (e) {} }
-  return '已记住：' + fact;
+  await storePut(env, 'agent_mem_' + chatId, JSON.stringify(arr));
+  return '已记住：' + fact + '（共' + arr.length + '条）';
 }
 
 async function agentGetMode(env, chatId) {
   if (tgAgentModeCache.has(chatId)) return tgAgentModeCache.get(chatId);
   let on = true; // 默认开启 Agent 模式
-  if (env.KV) {
-    try { const v = await env.KV.get('agent_mode_' + chatId); on = v !== '0'; } catch (e) {}
-  }
+  const v = await storeGet(env, 'agent_mode_' + chatId);
+  on = v !== '0';
   tgAgentModeCache.set(chatId, on);
   return on;
 }
 
 async function agentSetMode(env, chatId, on) {
   tgAgentModeCache.set(chatId, on);
-  if (env.KV) { try { await env.KV.put('agent_mode_' + chatId, on ? '1' : '0'); } catch (e) {} }
+  await storePut(env, 'agent_mode_' + chatId, on ? '1' : '0');
 }
 
 function buildAgentSystemPrompt(memories) {
@@ -478,7 +516,18 @@ function buildAgentSystemPrompt(memories) {
   let p = '你是 Cloudflare-Chat 智能助手，一个具备自主规划、工具调用和长期记忆能力的 AI Agent。\n';
   p += '当前时间：' + timeStr + '（北京时间）。\n';
   if (memories.length) {
-    p += '【关于用户的长期记忆】\n' + memories.map(m => '- ' + m.fact).join('\n') + '\n';
+    // 存储无上限，但每次注入按字符预算取最新的，避免 prompt 过长烧 token
+    let budget = 6000;
+    const picked = [];
+    for (let i = memories.length - 1; i >= 0; i--) {
+      const f = String(memories[i].fact || '');
+      if (!f || f.length > budget) continue;
+      picked.unshift(f);
+      budget -= f.length;
+    }
+    p += '【关于用户的长期记忆】（共' + memories.length + '条' +
+      (picked.length < memories.length ? '，本次注入最近' + picked.length + '条' : '') + '）\n' +
+      picked.map(f => '- ' + f).join('\n') + '\n';
   }
   p += '【工作方式】\n'
     + '1. 先理解用户意图：简单问题直接回答，不要为了用工具而用工具。\n'
@@ -834,9 +883,7 @@ export default {
                 if (modelObjList[index]) {
                   const selected = modelObjList[index];
                   tgUserModels.set(chatId, selected.id);
-                  if (env.KV) {
-                    ctx.waitUntil(env.KV.put(`tg_user_${chatId}`, selected.id).catch(() => {}));
-                  }
+                  ctx.waitUntil(storePut(env, `tg_user_${chatId}`, selected.id));
                   
                   tgApi('sendMessage', {
                     chat_id: chatId,
@@ -888,8 +935,8 @@ export default {
               }
 
               let targetModelId = tgUserModels.get(chatId);
-              if (!targetModelId && env.KV) {
-                try { targetModelId = await env.KV.get(`tg_user_${chatId}`); } catch(e){}
+              if (!targetModelId) {
+                targetModelId = await storeGet(env, `tg_user_${chatId}`);
               }
 
               // 多轮对话：取出历史，拼上本轮用户消息（超限自动裁剪）

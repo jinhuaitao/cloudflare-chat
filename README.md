@@ -2,14 +2,22 @@
 
 基于 Cloudflare Workers 的多通道 AI 对话前端 + Telegram 机器人。单文件 Worker（`_worker.js`），通过 `wrangler.toml` 声明式配置，支持连接 GitHub 仓库自动构建部署。
 
-> 当前版本：**v6.2.0**（见下方更新日志）
+> 当前版本：**v6.3.0**（见下方更新日志）
+
+## v6.3.0 更新日志
+
+- **持久化从 KV 切换到 R2**：KV 免费版每天仅 1000 次写入、单 key 限 1 次写入/秒，机器人每轮对话都要写历史，很容易撞墙。R2 无日写入上限（免费版每月 100 万次 A 类操作）、单对象可达 5TB、读写强一致（KV 是最终一致，跨区有延迟）
+  - 新增统一存储层：R2 优先 → KV 兜底 → 纯内存；旧部署的 KV 数据首次读取时自动迁移到 R2
+  - `wrangler.toml` 同样只写 `binding` 不写 `bucket_name`，自动置备 bucket
+  - **长期记忆取消 50 条上限**（R2 近乎无限存储，仅保留 2000 条的极宽松保护）；注入上下文时按 6000 字符预算取最新的，避免 prompt 过长
+- 修正 wrangler.toml 中 R2/KV 配置注释
 
 ## v6.2.0 更新日志
 
 - **Telegram 机器人升级为 Agent**：LLM 作为核心推理引擎，自主规划 + 工具调用 + 长期记忆
   - 6 个零密钥、零成本工具：🔍 联网搜索（DuckDuckGo）、📄 网页正文抓取、🧮 精确计算（自研解析器，防注入）、🕐 时间、🌤 天气（Open-Meteo）、🧠 长期记忆（KV 持久化）
   - ReAct 循环：模型决策 → 执行工具 → 结果回填，最多 6 步；简单问题直接回答，不为用工具而用工具
-  - 长期记忆：对话中明确告知的事实自动记住（上限 50 条），之后每次对话自动注入上下文
+  - 长期记忆：对话中明确告知的事实自动记住（R2 持久化，不限条数），之后每次对话自动注入上下文
   - `/agent` 命令随时切换 Agent / 普通模式（默认 Agent 开启，选择存 KV）
   - 通道/模型不支持 function calling 时自动降级为普通对话，不报错
 - 计算器修复 `-3^2` 按数学惯例得 `-9`（指数优先级高于一元负号）
@@ -57,51 +65,49 @@
 
 ---
 
-# 第二步：KV 命名空间（自动创建 + 自动绑定，无需手动操作）
+# 第二步：R2 存储桶（自动创建 + 自动绑定，无需手动操作）
 
-**不需要去控制台手动创建 KV，也不需要手动添加绑定。** `wrangler.toml` 中已这样声明：
+**持久化首选 R2**：KV 免费版每天只有 1000 次写入、单 key 限 1 次写入/秒，而机器人每轮对话都要写历史、Agent 记忆也在增长，很容易撞墙。R2 无日写入上限（免费版每月 100 万次 A 类操作）、单对象可达 5TB、读写强一致。**不需要去控制台手动创建 bucket，也不需要手动添加绑定。** `wrangler.toml` 中已这样声明：
 
 ```toml
-[[kv_namespaces]]
-binding = "KV"
+[[r2_buckets]]
+binding = "R2"
 ```
 
-这里**故意省略了 `id`**。省略 `id` 会触发 Wrangler 的 **Automatic Provisioning（自动资源置备）**：
-
-- 部署时自动在账号下创建一个 KV 命名空间，命名规则为 `<Worker 名>-<binding 名小写>`，即 **`cloudflare-chat-kv`**；
-- 自动将其绑定到 Worker，代码中通过 `env.KV` 访问；
-- 该命名空间的 `id` **不会写回仓库**，只存在于 Cloudflare 控制台。
+这里**故意省略了 `bucket_name`**，与 KV 的省略 `id` 一样触发自动置备：部署时自动创建 bucket（名字以 Worker 名为前缀，如 `cloudflare-chat-r2`）并绑定，代码里用 `env.R2` 访问。
 
 ### 如何确认成功了
 
-部署完成后，在构建日志中应当能看到：
+部署完成后，在构建日志中应当能看到类似：
 
 ```
 The following bindings need to be provisioned:
 Binding   Resource
-env.KV    KV Namespace
+env.R2    R2 Bucket
 
-🌀 Creating new KV Namespace "cloudflare-chat-kv"...
-✨ KV provisioned 🎉
+🌀 Creating new R2 bucket "cloudflare-chat-r2"...
+✨ R2 provisioned 🎉
 ```
 
-同时可以到 **Workers & Pages → KV** 确认命名空间已存在，并在 Worker 详情页的 **Bindings** 中看到 `KV`。
+同时可以到 **R2 对象存储** 确认 bucket 已存在，并在 Worker 详情页的 **Bindings** 中看到 `R2`。
 
-### 建议：首次部署后回填 id（可选但推荐）
+### KV 兜底与自动迁移
 
-首次部署成功后，进入 **Workers & Pages → KV**，复制 `cloudflare-chat-kv` 的 id，填入 `wrangler.toml`：
+`wrangler.toml` 里同时保留了 KV 绑定（同样自动置备），作用是**兜底 + 旧数据迁移**：
+
+- 未绑定 R2 的部署：自动退化用 KV，一切正常；
+- v6.2 及更早版本的老用户：KV 里已有数据（模型选择、对话历史、Agent 记忆）会在首次读取时**自动迁移到 R2**，无需手动操作；
+- 两者都缺：退化为纯内存，isolate 重启后丢失（与旧版无 KV 时一致）。
+
+### 如果自动置备失败
+
+构建日志若提示 R2 相关错误（构建环境 Wrangler 版本过旧不支持自动置备），去控制台 **R2** 页面手动创建一个 bucket（名字如 `cloudflare-chat-r2`），然后在 `wrangler.toml` 中取消注释并填入：
 
 ```toml
-[[kv_namespaces]]
-binding = "KV"
-id = "把复制到的 id 粘贴到这里"
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "cloudflare-chat-r2"
 ```
-
-这样后续部署完全确定，不再依赖置备逻辑，也便于在多个环境间保持一致。
-
-### 如果不需要 KV
-
-KV 仅用于 Telegram 机器人记住每个用户选择的模型。代码中所有 KV 调用都有 `if (env.KV)` 保护，**缺少绑定时不会报错**，只是机器人重启后用户的模型选择会回到默认值。若不需要，可整段删除 `wrangler.toml` 中的 `[[kv_namespaces]]` 配置。
 
 ---
 
@@ -189,7 +195,7 @@ ACCESS_PASSWORD = 你自己设定的一串口令
 https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=https://<你的Worker域名>/tg-webhook&secret_token=<SECRET>
 ```
 
-配置完成后，在 Telegram 中向机器人发送 `/start` 或 `/model` 即可通过内联按钮切换模型。用户的模型选择会通过第二步自动创建的 KV 持久化保存。
+配置完成后，在 Telegram 中向机器人发送 `/start` 或 `/model` 即可通过内联按钮切换模型。用户的模型选择会通过第二步自动创建的 R2 存储桶持久化保存。
 
 ### 多轮对话
 
@@ -210,7 +216,7 @@ https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=https://<你的Work
 | `calculate` | 精确数学计算（自研解析器，拒绝注入） | "帮我算 (3280-1299)*1.13" |
 | `get_time` | 当前时间（可指定时区） | "现在几点了" |
 | `get_weather` | 城市天气 + 今明两天预报（Open-Meteo） | "北京明天适合跑步吗" |
-| `remember` | 长期记住关于你的事实（KV 持久化，上限 50 条） | "记住，我养了一只猫叫汤圆" |
+| `remember` | 长期记住关于你的事实（R2 持久化，不限条数） | "记住，我养了一只猫叫汤圆" |
 
 **工作方式**：ReAct 循环 —— 模型先判断意图，简单问题直接回答；需要时自主规划多步（比如先搜索再抓取原文、先计算再汇总），最多 6 步，工具结果回填后综合作答，绝不编造。
 
@@ -291,7 +297,7 @@ https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=https://<你的Work
 
 **部署日志报 `Missing id` 或要求交互式输入**
 
-构建环境使用的 Wrangler 版本过旧，不支持自动置备。确认仓库根目录存在 `package.json` 且其中声明了 `wrangler ^4.0.0`。若仍失败，改用第二步的「回填 id」方案：手动创建一个 KV 命名空间，把 id 写进 `wrangler.toml`。
+构建环境使用的 Wrangler 版本过旧，不支持自动置备。确认仓库根目录存在 `package.json` 且其中声明了 `wrangler ^4.0.0`。若仍失败，按第二步「如果自动置备失败」手动创建 R2 bucket 并把 `bucket_name` 写进 `wrangler.toml`。
 
 **部署日志报 `Binding at index N must have a name [code: 10052]`**
 
@@ -311,9 +317,9 @@ https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=https://<你的Work
 
 若你并不想启用口令，把服务端的 `ACCESS_PASSWORD` 变量删除后重新部署，即可恢复开放访问。反过来，如果你没配置过 `ACCESS_PASSWORD` 却收到 401，说明有人给这个 Worker 加了口令，去「设置 → 变量和机密」确认一下。
 
-**每次部署都会重复创建 KV 命名空间**
+**每次部署都会重复创建 R2 bucket**
 
-去 KV 页面确认是否出现多个同名或相似名字的命名空间。若有，删除多余的，并按第二步「回填 id」的方式把正确的 id 固定到 `wrangler.toml` 中。
+去 R2 页面确认是否出现多个同名或相似名字的 bucket。若有，删除多余的，并在 `wrangler.toml` 中用 `bucket_name` 把正确的 bucket 名固定下来，不再依赖置备逻辑。
 
 **改了环境变量但前端模型列表没更新**
 
