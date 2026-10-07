@@ -23,7 +23,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.5.0';
+const APP_VERSION = '6.6.1';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -925,6 +925,54 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
   return { apiUrl, currentApiKey, payload, isImageAPI };
 }
 
+// ==================== Web 端 Agent（v6.6.0） ====================
+// 与 Telegram 共用 tgAgentChat（含 6 个零密钥工具 + 长期记忆），
+// 记忆命名空间为 web_<sessionId>，与 Telegram 完全隔离。
+// 进度通过 SSE 自定义事件推送：{"agent_progress": "..."} / {"agent_error": "..."}，
+// 正文走标准 OpenAI delta 事件，最后 data: [DONE] 结束。
+async function handleWebAgent(env, body) {
+  const sid = String(body.session_id || 'default').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'default';
+  const webChatId = 'web_' + sid;
+  const history = Array.isArray(body.messages) ? body.messages : [];
+  const targetModelId = body.model;
+  const encoder = new TextEncoder();
+  // Web 无 Telegram 上下文：typing 心跳直接 no-op
+  const noOpTgApi = () => Promise.resolve({ ok: true });
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      const send = (obj) => {
+        try { controller.enqueue(encoder.encode('data: ' + JSON.stringify(obj) + '\n\n')); } catch (e) {}
+      };
+      const done = () => {
+        try { controller.enqueue(encoder.encode('data: [DONE]\n\n')); } catch (e) {}
+        try { controller.close(); } catch (e) {}
+      };
+      try {
+        const onProgress = async (text) => { send({ agent_progress: String(text).slice(0, 500) }); };
+        // opts 留空：Web 用完整 AGENT_TIMEOUT_MS 预算（浏览器长连接，无 60 秒重发问题），不做断点续做
+        let r = await tgAgentChat(env, noOpTgApi, webChatId, targetModelId, history, true, onProgress, {});
+        if (r.fallback) r = await tgAgentChat(env, noOpTgApi, webChatId, targetModelId, history, false, onProgress, {});
+        if (r.error) {
+          send({ agent_error: r.error });
+        } else if (r.text) {
+          const t = r.text;
+          for (let i = 0; i < t.length; i += 2000) {
+            send({ choices: [{ delta: { content: t.slice(i, i + 2000) } }] });
+          }
+        } else {
+          send({ agent_error: 'AI 没有返回有效内容' });
+        }
+      } catch (e) {
+        send({ agent_error: '⚠️ Agent 执行出错：' + (e && e.message ? e.message : String(e)) });
+      }
+      done();
+    }
+  });
+
+  return new Response(stream, { headers: SSE_HEADERS });
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -977,12 +1025,19 @@ export default {
           return new Response(JSON.stringify({ error: "无效的请求格式" }), { status: 400, headers: CORS_HEADERS });
         }
 
-        const aiConfig = buildAIRequest(env, body.model, body.messages, true);
+        const aiConfig = buildAIRequest(env, body.model, body.messages, body.agent !== true);
         if (aiConfig.error) {
           return new Response(JSON.stringify({ error: aiConfig.error }), { status: 500, headers: CORS_HEADERS });
         }
 
         const { apiUrl, currentApiKey, payload, isImageAPI } = aiConfig;
+
+        // v6.6.0: Web 端 Agent 模式 —— 复用 Telegram 同一套 ReAct 循环 + 工具链，
+        // 进度通过 SSE 事件推送。记忆按 Web 会话隔离（web_<sessionId>），与 Telegram 互不干扰。
+        // Web 是浏览器长连接（无 Telegram 的 60 秒重发问题），用完整 AGENT_TIMEOUT_MS 预算。
+        if (body.agent === true && !isImageAPI) {
+          return await handleWebAgent(env, body);
+        }
 
         const upstreamResponse = await fetch(apiUrl, {
           method: 'POST',
@@ -1049,7 +1104,7 @@ export default {
         optionsHtml = '<option value="" disabled selected>未配置模型，请检查环境变量</option>';
       }
 
-      const html = HTML_CONTENT.replaceAll('{{MODEL_OPTIONS}}', optionsHtml);
+      const html = HTML_CONTENT.replaceAll('{{MODEL_OPTIONS}}', optionsHtml).replaceAll('{{APP_VERSION}}', APP_VERSION);
       return new Response(html, { headers: HTML_HEADERS });
     }
 
@@ -1855,6 +1910,10 @@ const HTML_CONTENT = `<!DOCTYPE html>
     @keyframes speakPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
     .tts-warn { font-size: 12px; color: #ef4444; margin-top: 8px; }
     .retry-notice { font-size: 12px; color: var(--text-secondary); margin-top: 10px; padding: 8px 12px; background: var(--hover-bg); border-radius: 10px; animation: speakPulse 1.6s infinite ease-in-out; }
+    .agent-progress { font-size: 12px; color: var(--text-secondary); margin-top: 10px; padding: 8px 12px; background: var(--hover-bg); border-radius: 10px; animation: speakPulse 1.6s infinite ease-in-out; white-space: pre-line; word-break: break-word; }
+    .agent-toggle { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; font-weight: 600; color: var(--text-secondary); background: var(--hover-bg); border: 1px solid var(--border-color, #e2e8f0); border-radius: 999px; padding: 5px 12px; cursor: pointer; transition: all .2s; white-space: nowrap; }
+    .agent-toggle:hover { color: var(--text-main); }
+    .agent-toggle.active { color: #fff; background: linear-gradient(135deg, #3b82f6, #6366f1); border-color: transparent; }
     .code-wrapper pre { background: transparent !important; margin: 0 !important; padding: 20px; overflow-x: auto; border-radius: 0; box-shadow: none; max-width: 100%; }
     .code-wrapper pre code { background: transparent; padding: 0; color: #e2e8f0; font-size: 14px; line-height: 1.6; font-family: 'SFMono-Regular', Consolas, monospace; word-break: normal; }
 
@@ -2083,7 +2142,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
           <svg id="themeIcon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
         </button>
       </div>
-      <div style="font-size: 12px; color: var(--text-secondary); font-weight: 600; white-space: nowrap; flex-shrink: 0;">v6.5.0</div>
+      <div style="font-size: 12px; color: var(--text-secondary); font-weight: 600; white-space: nowrap; flex-shrink: 0;">Pro v{{APP_VERSION}}</div>
     </div>
   </div>
 
@@ -2126,6 +2185,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
               {{MODEL_OPTIONS}}
             </select>
           </div>
+          <button class="agent-toggle" id="agentToggle" title="Agent 模式：自主规划并调用工具（🔍 搜索 / 📄 网页 / 🧮 计算 / 🌤 天气 / 🕐 时间），还能长期记住你告诉它的事">🤖 Agent</button>
         </div>
       </div>
       <div class="disclaimer">AI 生成的内容可能不准确，请核实重要信息。</div>
@@ -2471,6 +2531,26 @@ const HTML_CONTENT = `<!DOCTYPE html>
   modelSelect.addEventListener('change', onModelChange);
   modelSelect.addEventListener('input', onModelChange);
 
+  // v6.6.0: Web 端 Agent 模式开关（默认开启，与 Telegram 一致；记忆按 Web 会话隔离）
+  const agentToggle = document.getElementById('agentToggle');
+  let agentMode = localStorage.getItem('cfchat_agent_mode') !== '0';
+  function renderAgentToggle() {
+    if (!agentToggle) return;
+    agentToggle.classList.toggle('active', agentMode);
+    agentToggle.textContent = agentMode ? '🤖 Agent 开' : '🤖 Agent';
+    agentToggle.title = agentMode
+      ? 'Agent 模式已开启：自主规划并调用工具（🔍 搜索 / 📄 网页 / 🧮 计算 / 🌤 天气 / 🕐 时间），长期记住你告诉它的事。点击关闭。'
+      : 'Agent 模式已关闭：普通对话，不调用工具。点击开启。';
+  }
+  if (agentToggle) {
+    agentToggle.addEventListener('click', () => {
+      agentMode = !agentMode;
+      try { localStorage.setItem('cfchat_agent_mode', agentMode ? '1' : '0'); } catch (e) {}
+      renderAgentToggle();
+    });
+    renderAgentToggle();
+  }
+
   function deleteSession(e, id) {
     e.stopPropagation(); 
     if (!confirm('确认删除此记录吗？')) return;
@@ -2644,6 +2724,25 @@ const HTML_CONTENT = `<!DOCTYPE html>
         });
       }
 
+      // v6.6.0 Agent 进度条（气泡内，收到正文结束 / 出错 / 中止时清除）
+      let agentProgressEl = null;
+      function showAgentProgress(text) {
+        if (!agentProgressEl) {
+          agentProgressEl = document.createElement('div');
+          agentProgressEl.className = 'agent-progress';
+          bubble.appendChild(agentProgressEl);
+        }
+        agentProgressEl.textContent = text;
+        const distanceToBottom = scrollArea.scrollHeight - scrollArea.scrollTop - scrollArea.clientHeight;
+        if (distanceToBottom < 120) {
+          scrollArea.scrollTop = scrollArea.scrollHeight;
+        }
+      }
+      function clearAgentProgress() {
+        if (agentProgressEl && agentProgressEl.parentNode) agentProgressEl.parentNode.removeChild(agentProgressEl);
+        agentProgressEl = null;
+      }
+
       // 自动重试提示条（只在断流重试时短暂出现）
       let retryNoticeEl = null;
       function setRetryNotice(text) {
@@ -2665,6 +2764,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
         aiContent = '';
         reasoningContent = '';
         gotDone = false;
+        clearAgentProgress();
         if (rBox) { rBox.style.display = 'none'; rBox.textContent = ''; }
         tBox.innerHTML = '';
       }
@@ -2677,7 +2777,9 @@ const HTML_CONTENT = `<!DOCTYPE html>
           headers: reqHeaders,
           body: JSON.stringify({
             messages: currentSession.messages.slice(-MAX_SEND_MSGS),
-            model: modelSelect.value
+            model: modelSelect.value,
+            agent: agentMode,
+            session_id: currentSessionId
           }),
           signal: currentAbortController.signal
         });
@@ -2710,6 +2812,21 @@ const HTML_CONTENT = `<!DOCTYPE html>
             if (!line.startsWith('data:')) continue;
             // 结束标记：兼容 data:[DONE]（无空格）写法
             if (line.slice(5).trim() === '[DONE]') { gotDone = true; continue; }
+            // v6.6.0 Agent 事件：进度展示 / 错误（错误直接抛给外层统一处理，不自动重试，避免工具重复执行）
+            if (line.indexOf('"agent_progress"') > 0 || line.indexOf('"agent_error"') > 0) {
+              try {
+                const adata = JSON.parse(line.slice(5).trim());
+                if (adata.agent_progress) { showAgentProgress(adata.agent_progress); continue; }
+                if (adata.agent_error) {
+                  const ae = new Error(adata.agent_error);
+                  ae.name = 'AgentError';
+                  throw ae;
+                }
+              } catch (e) {
+                if (e && e.name === 'AgentError') throw e;
+              }
+              continue;
+            }
             try {
               const data = JSON.parse(line.slice(5).trim());
               if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
@@ -2752,6 +2869,8 @@ const HTML_CONTENT = `<!DOCTYPE html>
           streamError = e;
         }
         if (gotDone) break;
+        // v6.6.0 Agent 模式不自动重试：重跑会重复执行工具（重复搜索/重复记忆），中断直接走错误展示
+        if (agentMode) break;
         if (!streamError) streamError = new Error('连接意外中断（未收到结束标记）');
         if (attempt > MAX_AUTO_RETRY) break;
         resetStreamUI();
@@ -2763,7 +2882,8 @@ const HTML_CONTENT = `<!DOCTYPE html>
 
       isCurrentlyStreaming = false;
       if (!reasoningContent && rBox) rBox.remove();
-      
+      clearAgentProgress();
+
       tBox.innerHTML = safeHtml(aiContent);
       tBox.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
       scrollArea.scrollTop = scrollArea.scrollHeight;
@@ -2779,9 +2899,14 @@ const HTML_CONTENT = `<!DOCTYPE html>
       
     } catch (error) {
       isCurrentlyStreaming = false;
+      clearAgentProgress();
       const tBox = bubble.querySelector('.message-text');
-      
-      if (error.name === 'AbortError') {
+
+      if (error.name === 'AgentError') {
+        // v6.6.0 Agent 执行错误：红色展示，不记入历史（避免错误文本污染上下文）
+        tBox.innerHTML = '<span style="color: #ef4444; font-size: 14px; font-weight: 600;">' + escapeHtml(error.message) + '</span>';
+        bubble.parentElement.classList.add('error-msg');
+      } else if (error.name === 'AbortError') {
         const interruptNote = '<br><br><span style="color: var(--text-secondary); font-size: 13px; font-weight: 500;">(🛑 生成已手动中止)</span>';
         tBox.innerHTML = safeHtml(aiContent || '已中止') + interruptNote;
         if (aiContent) currentSession.messages.push({ role: 'assistant', content: aiContent });
