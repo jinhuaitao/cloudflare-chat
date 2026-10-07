@@ -23,7 +23,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.6.3';
+const APP_VERSION = '6.6.5';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -221,7 +221,7 @@ function getAgentTools() {
       type: 'function',
       function: {
         name: 'web_search',
-        description: '联网搜索最新信息。当问题涉及实时新闻、时事、价格、股价等时效性内容，或超出你知识范围时使用。',
+        description: '联网搜索最新信息。仅在需要时效性内容（实时新闻、价格、股价、赛事结果等）或问题超出你知识范围时使用；稳定的常识性知识不要搜，直接回答。',
         parameters: {
           type: 'object',
           properties: {
@@ -236,7 +236,7 @@ function getAgentTools() {
       type: 'function',
       function: {
         name: 'web_fetch',
-        description: '抓取指定网页的正文纯文本，用于总结文章、阅读文档页面。返回清理后的文本（截断）。',
+        description: '抓取指定网页的正文纯文本，用于总结文章、阅读文档页面（返回清理后的文本，可能截断）。只对搜索结果中或用户明确给出的 URL 使用，不要猜测/编造 URL。',
         parameters: {
           type: 'object',
           properties: { url: { type: 'string', description: '完整的 http(s) URL' } },
@@ -248,7 +248,7 @@ function getAgentTools() {
       type: 'function',
       function: {
         name: 'calculate',
-        description: '精确数学计算，支持加减乘除、乘方(^)、取余(%)、括号。复杂计算不要心算，一律用此工具。',
+        description: '精确数学计算，支持加减乘除、乘方(^)、取余(%)、括号。任何需要数字运算的场景（哪怕看起来简单）都用它，不要心算。',
         parameters: {
           type: 'object',
           properties: { expression: { type: 'string', description: '如 (3+5)*2^3/4' } },
@@ -260,7 +260,7 @@ function getAgentTools() {
       type: 'function',
       function: {
         name: 'get_time',
-        description: '获取当前时间，可指定 IANA 时区。',
+        description: '获取当前时间，可指定 IANA 时区。用户问"现在几点/今天周几/日期"之类时使用，不要凭记忆回答时间。',
         parameters: {
           type: 'object',
           properties: { timezone: { type: 'string', description: '如 Asia/Shanghai，默认 Asia/Shanghai' } }
@@ -271,7 +271,7 @@ function getAgentTools() {
       type: 'function',
       function: {
         name: 'get_weather',
-        description: '查询指定城市当前天气与今明两天预报。',
+        description: '查询指定城市当前天气与今明两天预报。city 必须给明确城市名（如"北京"、"Tokyo"）；用户没说城市时先追问，不要猜。',
         parameters: {
           type: 'object',
           properties: { city: { type: 'string', description: '城市名，如"北京"、"Tokyo"' } },
@@ -283,7 +283,7 @@ function getAgentTools() {
       type: 'function',
       function: {
         name: 'remember',
-        description: '把关于用户的重要长期信息存入记忆（如偏好、生日、项目名、常用城市）。存入后以后所有对话都会记得。',
+        description: '把关于用户的重要长期信息存入记忆（如偏好、生日、项目名、常用城市），存入后以后所有对话都会记得。仅在用户明确要求记住（"记住…"）时调用，不要把临时对话内容存进去。',
         parameters: {
           type: 'object',
           properties: { fact: { type: 'string', description: '一句话事实' } },
@@ -556,14 +556,16 @@ function buildAgentSystemPrompt(memories, query) {
   let p = '你是 Cloudflare-Chat 智能助手，一个具备自主规划、工具调用和长期记忆能力的 AI Agent。\n';
   p += '当前时间：' + timeStr + '（北京时间）。\n\n';
   p += '【工作方式】\n'
-    + '1. 意图判断：闲聊、简单问答、你知识范围内的内容——直接回答，不要调用工具。\n'
+    + '1. 意图判断：闲聊、简单问答、你知识范围内的稳定知识——直接回答，绝不调用工具。工具是稀缺资源，能不用就不用。\n'
     + '2. 工具选择：需要最新/实时信息（新闻、价格、赛事等）→ web_search，可换多个关键词搜索；想深入了解某条结果 → web_fetch 读原文；任何精确计算 → calculate（不要心算）；天气 → get_weather；时间 → get_time；用户明确告知的长期事实（偏好、生日、项目、城市等）→ remember。\n'
-    + '3. 多步规划：允许先搜索再抓取、先计算再汇总。一次可并行调用多个工具。\n'
+    + '3. 多步规划：允许先搜索再抓取、先计算再汇总，一次可并行调用多个工具；但每次只规划接下来 1-2 步，拿到结果再决定下一步，不要一次规划过长链条。\n'
     + '4. 诚实：工具没给的信息绝不编造；搜索无结果就直说。\n'
-    + '5. 语言：默认用中文回答（用户用其他语言时跟随用户语言）。\n\n';
+    + '5. 语言：默认用中文回答（用户用其他语言时跟随用户语言）。\n'
+    + '6. 含糊处理：问题缺少关键信息且工具无法补足时（如查天气没说城市），用一句话追问，不要猜测调用工具。\n'
+    + '7. 技术细节隔离：最终回答里绝不出现函数名、参数 JSON、调用标记等技术细节，只呈现结论本身。\n\n';
   p += '【输出要求】\n'
     + '- 重要结论先行，结构清晰，适合手机阅读；代码用代码块。\n'
-    + '- 引用网络信息给出结论即可，不必罗列链接（除非用户要求）。\n\n';
+    + '- 引用网络信息给出结论即可，不必罗列链接（除非用户要求）；数据注明来源与时间（如"据今日搜索"），不确定的信息明确标注。\n\n';
   if (memories.length) {
     const qTokens = memoryTokens(query);
     const scored = memories.map((m) => {
@@ -588,8 +590,142 @@ function buildAgentSystemPrompt(memories, query) {
   p += '【重要规则】\n'
     + '- 需要用户私密或实时信息时必须用工具核实，不要凭空猜测。\n'
     + '- remember 只用于用户明确要求记住的长期事实，不要把临时对话内容存进去。\n'
+    + '- 同一工具用相同参数反复调用没有意义：换关键词/换思路，仍无进展就基于已有信息直接回答。\n'
     + '- 当你觉得已经掌握足够信息，直接给出最终答案，不要为了调用工具而调用工具。';
   return p;
+}
+
+// ==================== DSML 工具调用兼容（v6.6.4） ====================
+// 背景：DeepSeek V3.2 / V4 系模型的服务层（vLLM / SGLang 等）在收到带 tools 的请求时，
+// 会往 system prompt 注入一段 "## Tools" 说明，要求模型用
+//   <｜DSML｜tool_calls><｜DSML｜invoke name="get_weather">
+//   <｜DSML｜parameter name="city" string="true">上海</｜DSML｜parameter>
+//   </｜DSML｜invoke></｜DSML｜tool_calls>
+// 这种 XML 式标记输出工具调用，并由网关负责把它解析回 OpenAI 标准的 tool_calls 字段。
+// 若通道是裸透传（不做这层转换），响应的 message.tool_calls 为空、DSML 原文留在
+// message.content 里——Agent 循环会把它当成最终答案直接发给用户（markup 泄漏），
+// 且工具一次都不会执行。本节做客户端兼容：
+//   1) parseDSMLToolCalls：从 content 解析 DSML → 转成标准 tool_calls 参与执行；
+//   2) stripDSMLBlocks：兜底剥离，任何返回给用户的文本都不允许携带 DSML markup。
+// 兼容性：外层标签 tool_calls / function_calls / calls 三种变体；全角｜/半角|、
+// 标签内多余空格、未闭合（被截断）的块都能容忍；单个 malformed 的 invoke 被跳过，
+// 不影响同块内其它调用。
+
+// 从文本中提取 DSML 工具调用，转成 OpenAI 标准 tool_calls 数组；找不到返回 []。
+function parseDSMLToolCalls(content) {
+  const text = String(content || '');
+  if (text.indexOf('DSML') === -1) return [];
+  const calls = [];
+  let seq = 0;
+  // 外层块（未闭合则截到文末，避免截断输出导致整个解析失败）
+  const blockRe = /<\s*[|｜]\s*DSML\s*[|｜]\s*(tool_calls|function_calls|calls)\s*>([\s\S]*?)(?:<\s*\/\s*[|｜]\s*DSML\s*[|｜]\s*\1\s*>|$)/g;
+  let bm;
+  while ((bm = blockRe.exec(text))) {
+    const body = bm[2];
+    const invRe = /<\s*[|｜]\s*DSML\s*[|｜]\s*invoke\b([^>]*)>([\s\S]*?)(?:<\s*\/\s*[|｜]\s*DSML\s*[|｜]\s*invoke\s*>|$)/g;
+    let im;
+    while ((im = invRe.exec(body))) {
+      const nameM = /\bname\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(im[1] || '');
+      const name = nameM ? (nameM[1] !== undefined ? nameM[1] : nameM[2]) : '';
+      if (!name) continue;
+      const args = {};
+      const pRe = /<\s*[|｜]\s*DSML\s*[|｜]\s*parameter\b([^>]*)>([\s\S]*?)<\s*\/\s*[|｜]\s*DSML\s*[|｜]\s*parameter\s*>/g;
+      let pm;
+      while ((pm = pRe.exec(im[2]))) {
+        const pnM = /\bname\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(pm[1] || '');
+        const pName = pnM ? (pnM[1] !== undefined ? pnM[1] : pnM[2]) : '';
+        if (!pName) continue;
+        const sM = /\bstring\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(pm[1] || '');
+        const isStr = sM ? (sM[1] !== undefined ? sM[1] : sM[2]) !== 'false' : true;
+        const raw = pm[2];
+        if (isStr) {
+          args[pName] = raw.trim();
+        } else {
+          try { args[pName] = JSON.parse(raw); }
+          catch (e) { args[pName] = raw.trim(); }
+        }
+      }
+      seq += 1;
+      calls.push({
+        id: 'call_dsml_' + Date.now().toString(36) + '_' + seq,
+        type: 'function',
+        function: { name: name, arguments: JSON.stringify(args) }
+      });
+    }
+  }
+  return calls;
+}
+
+// 兜底剥离：删掉文本里残留的 DSML 块（含未闭合的）、零散 DSML 标签，
+// 以及 DeepSeek 偶发泄漏的 <｜end▁of▁sentence｜> 结束符。幂等，无 DSML 时原文返回。
+function stripDSMLBlocks(content) {
+  let text = String(content || '');
+  if (text.indexOf('DSML') === -1 && text.indexOf('end▁of▁sentence') === -1) return text;
+  // 成对或未闭合的外层块（三种外层标签名，闭合标签名不一致也照删）
+  text = text.replace(/<\s*[|｜]\s*DSML\s*[|｜]\s*(?:tool_calls|function_calls|calls)\s*>[\s\S]*?(?:<\s*\/\s*[|｜]\s*DSML\s*[|｜]\s*(?:tool_calls|function_calls|calls)\s*>|$)/g, '');
+  // 残留的零散 DSML 标签（含属性的也删）
+  text = text.replace(/<\s*\/?\s*[|｜]\s*DSML\s*[|｜]\s*[^<>]*>/gi, '');
+  // DeepSeek 结束符
+  text = text.replace(/<\s*[|｜]\s*end▁of▁sentence\s*[|｜]\s*>/g, '');
+  return text;
+}
+
+// ==================== Agent 稳定性增强（v6.6.5） ====================
+// 1) truncateToolResult：工具结果截断并明确标注，避免模型误以为拿到了完整数据。
+// 2) toolCallSignature：工具调用签名，用于"重复调用熔断"。
+// 3) trimAgentMessages：上下文预算裁剪。多步任务中工具结果（每条可达 4000 字）
+//    会快速堆积，超预算时从最旧的"整轮"（1 条 assistant + 其 tool 消息）开始删，
+//    成对删除保证 OpenAI 消息序列合法性（assistant tool_calls 后必须紧跟 tool 应答）。
+//    只动本轮循环产生的消息（loopStartIdx 之后），system 与历史对话永不裁剪。
+
+// 工具结果截断：超长时保留前 maxChars 并标注，避免模型误判为完整数据
+function truncateToolResult(result, maxChars) {
+  const s = String(result == null ? '' : result);
+  maxChars = maxChars > 0 ? maxChars : 4000;
+  if (s.length <= maxChars) return s;
+  return s.slice(0, maxChars) + '\n…（结果过长，仅显示前 ' + maxChars + ' 字符）';
+}
+
+// 工具调用签名：name + 规范化后的参数，用于检测模型是否在原地打转
+function toolCallSignature(tc) {
+  const fn = (tc && tc.function) || {};
+  let args = {};
+  try { args = JSON.parse(fn.arguments || '{}'); } catch (e) { args = {}; }
+  const keys = Object.keys(args).sort();
+  const norm = {};
+  for (const k of keys) norm[k] = args[k];
+  return (fn.name || '') + '|' + JSON.stringify(norm);
+}
+
+// 按字符预算裁剪 Agent 循环消息；返回新数组（不修改原数组，便于测试与断点续存）
+function trimAgentMessages(messages, loopStartIdx, budget) {
+  budget = budget > 0 ? budget : 24000;
+  const arr = Array.isArray(messages) ? messages : [];
+  if (arr.length <= 1) return arr.slice();
+  let start = Math.max(0, Math.min(loopStartIdx | 0, arr.length));
+  // 估算字符数（JSON 长度近似 token 量的上界）
+  const msgLen = (m) => {
+    try { return JSON.stringify(m).length; } catch (e) { return 0; }
+  };
+  let total = 0;
+  for (const m of arr) total += msgLen(m);
+  if (total <= budget) return arr.slice();
+  // 找出本轮循环内的"轮次"边界：每轮以 role=assistant 开头
+  const rounds = [];
+  let cur = -1;
+  for (let i = start; i < arr.length; i++) {
+    if (arr[i] && arr[i].role === 'assistant') { cur = rounds.length; rounds.push([i]); }
+    else if (cur >= 0) rounds[cur].push(i);
+  }
+  // 至少保留最后一轮（当前正在进行的上下文），从最旧的轮次开始删
+  const doomed = new Set();
+  for (let r = 0; r < rounds.length - 1 && total > budget; r++) {
+    for (const i of rounds[r]) { doomed.add(i); total -= msgLen(arr[i]); }
+  }
+  if (!doomed.size) return arr.slice();
+  const out = [];
+  for (let i = 0; i < arr.length; i++) if (!doomed.has(i)) out.push(arr[i]);
+  return out;
 }
 
 // ==================== Telegram Agent：主循环 ====================
@@ -688,7 +824,7 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
   };
   // 超时暂停：保存循环状态，用户发「继续」即恢复。无 R2 时退化为直接终结。
   const pauseForResume = async () => {
-    const t = lastAssistantText();
+    const t = stripDSMLBlocks(lastAssistantText());
     let saved = false;
     if (resumeKey) {
       saved = await agentSaveResumeState(env, chatId, {
@@ -707,6 +843,14 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
     try { tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {}); } catch (e) {}
   }, 20000);
   try {
+  // 本轮循环在 messages 中的起始下标：上下文裁剪只动这之后的消息，
+  // system 与历史对话永不裁剪；断点续存（R2）保存的是完整 messages
+  const loopStartIdx = messages.length;
+  // 上下文预算（字符数，env AGENT_CONTEXT_BUDGET 可配，默认 24000）
+  let ctxBudget = parseInt(env.AGENT_CONTEXT_BUDGET || '24000', 10);
+  if (!(ctxBudget > 0)) ctxBudget = 24000;
+  // 重复调用熔断：记录每步工具调用签名，连续 3 步完全相同即判定模型原地打转
+  const callSigHistory = [];
   for (let step = 0; step < maxSteps; step++) {
     if (Date.now() > deadline) return await pauseForResume();
     const stepLabel = '🤖 Agent 思考中' + (isResume ? '（继续）' : '') + '（第 ' + (step + 1) + ' 步）…';
@@ -717,7 +861,9 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
     // 长推理时保持 typing 状态不消失
     try { tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {}); } catch (e) {}
 
-    const cfg = buildAIRequest(env, targetModelId, messages, false, tools);
+    // 超预算时裁剪本轮循环产生的旧 tool 轮次（成对删除，保证消息序列合法）
+    const sendMessages = trimAgentMessages(messages, loopStartIdx, ctxBudget);
+    const cfg = buildAIRequest(env, targetModelId, sendMessages, false, tools);
     if (cfg.error) return { error: cfg.error };
 
     let resp;
@@ -757,12 +903,47 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
     const msg = data && data.choices && data.choices[0] && data.choices[0].message;
     if (!msg) return { error: 'AI 没有返回有效内容' };
 
-    const toolCalls = msg.tool_calls || [];
-    const assistantMsg = { role: 'assistant', content: msg.content || '' };
+    // 原生 tool_calls 为空时，尝试从 content 解析 DSML 文本格式工具调用
+    // （DeepSeek V3.2/V4 系模型 + 裸透传通道的组合会产生这种输出）
+    let toolCalls = msg.tool_calls || [];
+    let assistantText = msg.content || '';
+    if (!toolCalls.length && assistantText.indexOf('DSML') !== -1) {
+      const dsmlCalls = parseDSMLToolCalls(assistantText);
+      if (dsmlCalls.length) {
+        toolCalls = dsmlCalls;
+        assistantText = stripDSMLBlocks(assistantText);
+      }
+    }
+    const assistantMsg = { role: 'assistant', content: assistantText };
     if (toolCalls.length) assistantMsg.tool_calls = toolCalls;
+    // 推理模型（DeepSeek R1 等）多轮工具调用要求回传 reasoning_content，
+    // 否则后续轮次会丢失推理上下文；不返回该字段的模型无影响
+    const reasoning = msg.reasoning_content || msg.reasoning || '';
+    if (reasoning) assistantMsg.reasoning_content = reasoning;
     messages.push(assistantMsg);
 
-    if (!toolCalls.length) return { text: msg.content || '', usedTools: step > 0 };
+    // 兜底：任何返回给用户的文本都不允许携带 DSML markup
+    if (!toolCalls.length) {
+      const clean = stripDSMLBlocks(assistantText).trim();
+      let text = clean;
+      if (!text) {
+        text = assistantText.indexOf('DSML') !== -1
+          ? '（工具调用格式解析失败，已隐藏原始标记，请换个问法重试或切换模型）'
+          : (reasoning ? '（模型思考后没有给出文字答复，请换个问法重试）' : '（模型返回了空内容，请换个问法重试）');
+      }
+      return { text: text, usedTools: step > 0 };
+    }
+
+    // 重复调用熔断：连续 3 步工具调用完全相同 → 判定原地打转，直接收尾
+    const stepSig = toolCalls.map(toolCallSignature).sort().join(';;');
+    callSigHistory.push(stepSig);
+    if (callSigHistory.length >= 3 &&
+        callSigHistory[callSigHistory.length - 1] === stepSig &&
+        callSigHistory[callSigHistory.length - 2] === stepSig &&
+        callSigHistory[callSigHistory.length - 3] === stepSig) {
+      const prefix = stripDSMLBlocks(assistantText).trim();
+      return { text: (prefix ? prefix + '\n\n' : '') + '（检测到重复调用同一工具，已停止以避免空转；请换个问法或补充信息后重试）', usedTools: true };
+    }
 
     // 进度提示：让用户看到 Agent 在干什么（force 突破节流）
     if (typeof onProgress === 'function') {
@@ -784,7 +965,7 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       try { args = JSON.parse(fn.arguments || '{}'); } catch (e) {}
       if (!fn.name) return { tc, result: '工具调用缺少名称，已跳过' };
       const result = await execAgentTool(fn.name, args, env, chatId);
-      return { tc, result: String(result).slice(0, 4000) };
+      return { tc, result: truncateToolResult(result, 4000) };
     }));
     for (const tr of toolResults) {
       const fn = (tr.tc && tr.tc.function) || {};
@@ -800,7 +981,7 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
     clearInterval(heartbeat);
   }
   // 步数用尽：同样保存进度，允许「继续」
-  const t = lastAssistantText();
+  const t = stripDSMLBlocks(lastAssistantText());
   if (resumeKey) {
     const saved = await agentSaveResumeState(env, chatId, {
       v: 1, savedAt: Date.now(), chatId, targetModelId, allowTools, messages

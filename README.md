@@ -2,7 +2,29 @@
 
 基于 Cloudflare Workers 的多通道 AI 对话前端 + Telegram 机器人。单文件 Worker（`_worker.js`），通过 `wrangler.toml` 声明式配置，支持连接 GitHub 仓库自动构建部署。
 
-> 当前版本：**v6.6.3**（见下方更新日志）
+> 当前版本：**v6.6.5**（见下方更新日志）
+
+> ⚠️ 版本基线说明：v6.6.4 / v6.6.5 是从 **v6.6.3 基线**直接打的补丁包，**不包含 v6.7.x 的微信通道功能**。
+> 若你线上跑的是 v6.7.x（含微信），请勿用此包整体覆盖部署（会丢失微信通道），
+> 建议把补丁手动合并到线上版本，或等后续基于 v6.7.x 的合并包。
+
+## v6.6.5 更新日志（Agent 完善）
+
+- **推理模型多轮工具连续性**：`tgAgentRunLoop` 开始保留并回传 `reasoning_content`（DeepSeek R1 等推理模型要求工具轮次之间回传推理内容，否则后续步骤会丢失上下文）。不返回该字段的模型无影响；断点续存（R2）同样保留该字段，「继续」后不断推理。
+- **上下文预算与裁剪**：多步任务中工具结果（每条可达 4000 字）会快速堆积。新函数 `trimAgentMessages` 在每次请求前按字符预算（默认 24000，`AGENT_CONTEXT_BUDGET` 可配）裁剪**本轮循环**产生的旧 tool 轮次，成对删除（assistant tool_calls + 其 tool 应答）保证消息序列合法；system 与历史对话永不裁剪。
+- **重复调用熔断**：连续 3 步工具调用签名（函数名+参数）完全相同 → 判定模型原地打转，直接收尾并提示换问法，避免空烧步数与 token。
+- **工具结果截断标注**：超长结果截断时明确标注"仅显示前 N 字符"，避免模型误以为拿到完整数据。
+- **空回复兜底**：模型返回空内容时不再发空白消息，按"思考后无文字 / 纯空"给一句可读提示。
+- **系统提示词增强**：工具能不用就不用、缺关键信息时一句话追问而非猜测调用、每次只规划 1-2 步、最终回答绝不出现函数名/参数 JSON 等技术细节、数据注明来源与时间。
+- **工具描述优化**：6 个工具的 description 补充 when-to-use / when-not-to-use 指引（如 web_search 仅用于时效性内容、web_fetch 不猜 URL、get_weather 缺城市先追问）。
+
+## v6.6.4 更新日志
+
+- **修复 DSML 工具调用原文泄漏到用户面前**：DeepSeek V3.2/V4 系模型的服务层会要求模型用 `<｜DSML｜tool_calls>` 这种 XML 式标记输出工具调用，并由网关解析回 OpenAI 标准的 `tool_calls` 字段；若通道是裸透传（不做这层转换），`message.tool_calls` 为空、DSML 原文留在 `content` 里，旧代码会把它当成最终答案原样发给用户（且工具一次都不会执行）
+  - 新增 `parseDSMLToolCalls`：从 `content` 解析 DSML → 转成标准 `tool_calls` → 走正常工具执行流程（兼容 `tool_calls` / `function_calls` / `calls` 三种外层标签名，全角｜/半角|、标签内空格、未闭合截断块，`string="false"` 的参数按 JSON 解析）
+  - 新增 `stripDSMLBlocks` 兜底剥离：任何返回给用户的文本都不允许携带 DSML markup（含零散标签和偶发泄漏的 `<｜end▁of▁sentence｜>` 结束符）；解析失败也不暴露原文，改为一句可读提示
+  - 覆盖 `tgAgentRunLoop` 的三条用户可见路径：正常返回、`⏸️ 暂停/步数用尽`的"已产出"文本
+  - 附带现象：此前"工具调用了但用户只看到 markup、且天气/搜索类回答里出现离谱数字（如体感温度 122.5°C）"都是同一根因——工具根本没执行，模型在裸答
 
 ## v6.6.3 更新日志
 
@@ -425,6 +447,7 @@ const rx = p => p.split('@').join(BS);   // 用 @ 占位，运行时展开成反
 | `AGENT_MAX_STEPS` | Agent 单轮任务最大推理步数（上限 12） | `6` |
 | `AGENT_TIMEOUT_MS` | Agent 单轮任务总超时（毫秒） | `240000`（4 分钟） |
 | `AGENT_TOOL_TIMEOUT_MS` | 单个工具最长执行时间（毫秒） | `30000`（30 秒） |
+| `AGENT_CONTEXT_BUDGET` | Agent 单轮任务上下文字符预算，超预算裁剪本轮旧 tool 轮次 | `24000` |
 | `TG_API_TIMEOUT_MS` | Telegram Bot API 单次调用超时（毫秒） | `15000`（15 秒） |
 | `TG_WEBHOOK_BUDGET_MS` | webhook 内 Agent 单轮预算（毫秒），10 秒 ~ 240 秒 | `55000`（55 秒） |
 
