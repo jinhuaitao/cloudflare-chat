@@ -23,7 +23,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.6.1';
+const APP_VERSION = '6.6.2';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -1005,6 +1005,22 @@ export default {
     //    永远「探测成功」→ 自动重连逻辑形同虚设。
     if (request.method === 'GET' && url.pathname === '/healthz') {
       return new Response(JSON.stringify({ ok: true, t: Date.now() }), { headers: HEALTH_HEADERS });
+    }
+
+    // v6.6.2: 删除 Web 会话时同步清理 R2 上的 Agent 长期记忆（agent_mem_web_<sessionId>）。
+    // 注意内存缓存也要清，否则下次 remember 会把删掉的记忆从缓存里复活写回去。
+    if (request.method === 'DELETE' && url.pathname === '/api/web-memory') {
+      const denied = denyUnauthorized(env, request);
+      if (denied) return denied;
+
+      const sid = String(url.searchParams.get('session_id') || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+      if (!sid) {
+        return new Response(JSON.stringify({ error: '缺少 session_id' }), { status: 400, headers: CORS_HEADERS });
+      }
+      const webChatId = 'web_' + sid;
+      tgAgentMemCache.delete(webChatId);
+      await storeDelete(env, 'agent_mem_' + webChatId);
+      return new Response(JSON.stringify({ ok: true }), { headers: CORS_HEADERS });
     }
 
     if (request.method === 'POST' && url.pathname === '/api/chat') {
@@ -2556,6 +2572,12 @@ const HTML_CONTENT = `<!DOCTYPE html>
     if (!confirm('确认删除此记录吗？')) return;
     sessions = sessions.filter(s => s.id !== id); 
     saveSessions();
+    // v6.6.2: 同步删除 R2 上的 Agent 长期记忆；失败也不影响本地删除
+    try {
+      const delHeaders = {};
+      if (typeof accessToken !== 'undefined' && accessToken) delHeaders['X-Access-Token'] = accessToken;
+      fetch('/api/web-memory?session_id=' + encodeURIComponent(id), { method: 'DELETE', headers: delHeaders }).catch(() => {});
+    } catch (err) {}
     if (sessions.length === 0) createNewSession();
     else if (currentSessionId === id) switchSession(sessions[0].id);
     else renderSessionList();

@@ -2,7 +2,13 @@
 
 基于 Cloudflare Workers 的多通道 AI 对话前端 + Telegram 机器人。单文件 Worker（`_worker.js`），通过 `wrangler.toml` 声明式配置，支持连接 GitHub 仓库自动构建部署。
 
-> 当前版本：**v6.6.1**（见下方更新日志）
+> 当前版本：**v6.6.2**（见下方更新日志）
+
+## v6.6.2 更新日志
+
+- **删除 Web 对话时同步清理 R2 记忆**：删除会话会调用新增的 `DELETE /api/web-memory?session_id=xxx`，把该会话的 Agent 长期记忆（`agent_mem_web_<sessionId>`）从 R2 删除，**内存缓存也一起清**（否则下次 `remember` 会把删掉的记忆复活写回去）
+  - session_id 经过严格清洗 + `web_` 前缀强制隔离，路径遍历攻击无法误删别人的 key
+  - 删除失败不影响本地会话删除
 
 ## v6.6.1 更新日志
 
