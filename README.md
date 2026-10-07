@@ -1,6 +1,6 @@
 # Cloudflare-Chat
 
-基于 Cloudflare Workers 的多通道 AI 对话前端 + Telegram 机器人。单文件 Worker（`_worker.js`），通过 `wrangler.toml` 声明式配置，支持连接 GitHub 仓库自动构建部署。当前版本 v6.7.1。
+基于 Cloudflare Workers 的多通道 AI 对话前端 + Telegram 机器人。单文件 Worker（`_worker.js`），通过 `wrangler.toml` 声明式配置，支持连接 GitHub 仓库自动构建部署。当前版本 v6.8.0。
 
 ## 功能一览
 
@@ -70,7 +70,8 @@ R2 没有真正的目录，用 key 前缀 + `/` 模拟文件夹，控制台按�
 kb/
 ├── agent_mem_<chatId>      长期记忆索引：JSON 数组（唯一可信源）
 ├── mem/<chatId>/*.md       每条记忆的 Markdown 镜像（frontmatter + 正文），供控制台浏览
-└── docs/<标题>.md          知识库文档：save_doc 工具写入的长篇 Markdown
+├── docs/<标题>.md          知识库文档：save_doc 工具写入的长篇 Markdown
+└── docs/registry.json      文档注册表：标题/来源/大小/时间的索引（去重与列表的唯一依据，损坏自动重建）
 tg_hist_<chatId>            Telegram 对话历史（根目录）
 tg_user_<chatId>            用户模型选择（根目录）
 agent_mode_<chatId>         Agent 开关（根目录）
@@ -214,7 +215,7 @@ https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=https://<你的Work
 
 **记忆**：短期记忆是多轮对话历史；长期记忆是你明确告知的事实（`remember`，每条不超过 200 字，不限条数），每次对话按相关性自动注入，无需重复介绍自己。
 
-**知识库文档**：`save_doc` 专门用来存长篇内容（如"抓取这篇文章并生成知识库文档"），同名保存即覆盖更新并会明确提示。只有工具真正返回成功，机器人才会告诉你"已保存"；`remember` 存不下整篇文章，不要混用。**同一网址只保存一次**：换标题重复保存会被拒绝（指引你用原标题覆盖或先删除），标题仅差空格也会归一为同一文件名。提问时若问题可能涉及知识库文档主题，机器人会先 `list_docs` 看标题、再 `read_doc` 细读（标题想不起来时会自动搜正文），**文档内容优先引用**并注明出处；`delete_doc` 可删除文档，`/kb` 可查看知识库总览。
+**知识库文档**：`save_doc` 专门用来存长篇内容（如"抓取这篇文章并生成知识库文档"），同名保存即覆盖更新并会明确提示。只有工具真正返回成功，机器人才会告诉你"已保存"；`remember` 存不下整篇文章，不要混用。**同一网址只保存一次**：换标题重复保存会被拒绝（指引你用原标题覆盖或先删除），标题仅差空格也会归一为同一文件名。所有文档在 `kb/docs/registry.json` 注册表里统一登记，去重/列表/删除都走注册表。提问时若问题可能涉及知识库文档主题，机器人会先 `list_docs` 看标题、再 `read_doc` 细读（标题想不起来时会自动搜正文），**文档内容优先引用**并注明出处；`delete_doc` 可删除文档，`/kb` 可查看知识库总览。
 
 **命令**：
 - `/agent` —— 在 Agent / 普通对话模式间切换（选择保存在 R2，默认 Agent 开启）

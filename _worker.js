@@ -23,7 +23,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.7.1';
+const APP_VERSION = '6.8.0';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -182,6 +182,7 @@ function tgTrimHistory(history, env) {
 //   kb/agent_mem_<chatId>   知识库索引：长期记忆 JSON 数组 [{fact, ts, file}]（唯一可信源）
 //   kb/mem/<chatId>/*.md    知识库镜像：每条记忆一个 Markdown 文件（frontmatter + 正文），供控制台浏览
 //   kb/docs/<标题>.md       知识库文档：save_doc 工具写入的长篇 Markdown（全局共享）
+//   kb/docs/registry.json   文档注册表：标题/来源/大小/时间的索引（去重与列表的唯一依据，损坏自动重建）
 //   tg_hist_<chatId>         Telegram 对话历史（根目录，保持原样）
 //   tg_user_<chatId>         用户模型选择（根目录，保持原样）
 //   agent_mode_<chatId>      Agent 开关（根目录，保持原样）
@@ -677,10 +678,18 @@ async function agentForgetMemory(env, chatId, keyword) {
   return { removed };
 }
 
-// ==================== 知识库文档（v6.6.8）：save_doc 工具 ====================
-// 真实写入 R2 的 kb/docs/<标题>.md。文件名由标题清洗得到（去掉 / \ : * ? " < > | #
-// 与控制字符，中文保留；空格直接去掉——避免"甲骨文云 ARM"与"甲骨文云ARM"生成两个文件），
-// 超长截断；标题被洗空时用时间戳兜底。
+// ==================== 知识库文档（v6.8.0 重构）：注册表方案 ====================
+// kb/docs/registry.json 是文档的唯一注册表：[{file, title, source, size, updated_at}]。
+// save / list / read / delete 全部走注册表：去重与列表都是 O(1)，不再逐篇扫描 frontmatter。
+// 注册表缺失或损坏时自动扫描 kb/docs/ 重建（自愈）；registry.json 本身永不计入文档。
+// 文件名仍为 kb/docs/<标题>.md（标题清洗，中文保留）。
+// 注意：注册表更新是 read-modify-write，极端并发下可能丢失一次更新；个人单用户场景可接受。
+const KB_DOCS_PREFIX = KB_PREFIX + 'docs/';
+const KB_REGISTRY_KEY = KB_DOCS_PREFIX + 'registry.json';
+
+// 文件名由标题清洗得到（去掉 / \ : * ? " < > | # 与控制字符，中文保留；
+// 空格直接去掉——避免"甲骨文云 ARM"与"甲骨文云ARM"生成两个文件），超长截断；
+// 标题被洗空时用时间戳兜底。
 function kbDocSlug(title) {
   let s = String(title || '').trim()
     .replace(/[\/\\:*?"<>|#\x00-\x1f\x7f]/g, '')
@@ -689,23 +698,96 @@ function kbDocSlug(title) {
   if (!s) s = 'doc_' + Date.now().toString(36);
   return s;
 }
-// 按原文链接查找已保存的文档（读每篇前 800 字节的 frontmatter，range GET 很便宜）
-// 链接归一化：去首尾空格、去末尾斜杠、小写。返回 {key, title} 或 null
-async function kbFindDocBySource(env, source) {
-  const norm = u => String(u || '').trim().replace(/\/+$/, '').toLowerCase();
-  const target = norm(source);
-  if (!target || !env.R2) return null;
-  const keys = await kbListDocKeys(env);
-  for (const k of keys) {
-    try {
-      const obj = await env.R2.get(k, { range: { offset: 0, length: 800 } });
-      if (!obj) continue;
-      const head = await obj.text();
-      const m = head.match(/^source:\s*(\S+)/m);
-      if (m && norm(m[1]) === target) return { key: k, title: kbDocTitleOf(k) };
-    } catch (e) {}
+// 原文链接归一化：去首尾空格、去末尾斜杠、转小写
+function kbNormSource(u) { return String(u || '').trim().replace(/\/+$/, '').toLowerCase(); }
+function kbDocTitleOf(key) {
+  let t = String(key || '').slice(KB_DOCS_PREFIX.length);
+  if (t.endsWith('.md')) t = t.slice(0, -3);
+  return t;
+}
+// 解析 save_doc 生成的 frontmatter 头（---\nkey: value\n---）
+function kbParseFrontmatter(head) {
+  const out = {};
+  const m = String(head || '').match(/^---\n([\s\S]*?)\n---/);
+  if (!m) return out;
+  for (const line of m[1].split('\n')) {
+    const i = line.indexOf(':');
+    if (i === -1) continue;
+    let v = line.slice(i + 1).trim();
+    if (v.length >= 2 && v.startsWith('"') && v.endsWith('"')) v = v.slice(1, -1);
+    out[line.slice(0, i).trim()] = v;
   }
-  return null;
+  return out;
+}
+// 列出 kb/docs/ 下全部文档对象（分页取全量；自动排除 registry.json）
+async function kbListDocObjects(env) {
+  const objs = [];
+  if (!env.R2) return objs;
+  try {
+    let cursor;
+    do {
+      const listed = await env.R2.list({ prefix: KB_DOCS_PREFIX, limit: 1000, cursor: cursor });
+      for (const o of (listed.objects || [])) {
+        if (o.key !== KB_REGISTRY_KEY) objs.push(o);
+      }
+      cursor = listed.truncated ? listed.cursor : undefined;
+    } while (cursor);
+  } catch (e) {}
+  return objs;
+}
+// 从现有文件重建注册表（读每篇前 1200 字节的 frontmatter），并写回
+async function kbRebuildRegistry(env) {
+  const reg = [];
+  if (!env.R2) return reg;
+  const objs = await kbListDocObjects(env);
+  for (const o of objs) {
+    let fm = {};
+    try {
+      const r = await env.R2.get(o.key, { range: { offset: 0, length: 1200 } });
+      if (r) fm = kbParseFrontmatter(await r.text());
+    } catch (e) {}
+    reg.push({
+      file: String(o.key).slice(KB_DOCS_PREFIX.length),
+      title: fm.title || kbDocTitleOf(o.key),
+      source: fm.source || '',
+      size: o.size || 0,
+      updated_at: fm.saved_at || (o.uploaded ? new Date(o.uploaded).toISOString() : '')
+    });
+  }
+  await kbSaveRegistry(env, reg);
+  return reg;
+}
+async function kbGetRegistry(env) {
+  if (!env.R2) return [];
+  try {
+    const obj = await env.R2.get(KB_REGISTRY_KEY);
+    if (obj) {
+      const p = JSON.parse(await obj.text());
+      if (Array.isArray(p)) return p;
+    }
+  } catch (e) {}
+  // 缺失或损坏 → 自动重建（自愈）
+  return await kbRebuildRegistry(env);
+}
+async function kbSaveRegistry(env, reg) {
+  if (!env.R2) return;
+  try { await env.R2.put(KB_REGISTRY_KEY, JSON.stringify(reg)); } catch (e) {}
+}
+// 注册表内模糊查找：标题精确相等 > 标题包含 > 文件名包含（大小写不敏感）
+function kbFindRegEntry(reg, query) {
+  const q = String(query || '').trim().toLowerCase();
+  if (!q || !reg || !reg.length) return null;
+  return reg.find(e => String(e.title || '').toLowerCase() === q)
+    || reg.find(e => String(e.title || '').toLowerCase().indexOf(q) !== -1)
+    || reg.find(e => String(e.file || '').toLowerCase().indexOf(q) !== -1)
+    || null;
+}
+function kbFmtSize(b) {
+  b = b || 0;
+  return b >= 1048576 ? (b / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(b / 1024)) + ' KB';
+}
+function kbFmtDate(d) {
+  try { const s = new Date(d).toISOString().slice(0, 10); return s === '1970-01-01' ? '' : s; } catch (e) { return ''; }
 }
 async function toolSaveDoc(env, chatId, args) {
   args = args || {};
@@ -714,97 +796,67 @@ async function toolSaveDoc(env, chatId, args) {
   if (!title) return '标题为空，未保存';
   if (!content.trim()) return '内容为空，未保存';
   if (content.length > 100000) content = content.slice(0, 100000) + '\n\n> （内容过长，仅保存前 10 万字符）';
-  const key = KB_PREFIX + 'docs/' + kbDocSlug(title) + '.md';
-  // 同链接去重：该网址已保存为另一篇文档时拒绝，避免一个网址产生两个 md 文件
-  // （标题完全相同时走下面的覆盖更新，不受影响）
-  if (args.source) {
-    const dup = await kbFindDocBySource(env, args.source);
-    if (dup && dup.key !== key) {
-      return '该链接已保存为知识库文档《' + dup.title + '》，未重复保存。如需更新内容，请用完全相同的标题"' + dup.title + '"重新保存以覆盖，或先用 delete_doc 删除旧文档。';
+  const file = kbDocSlug(title) + '.md';
+  const key = KB_DOCS_PREFIX + file;
+  const reg = await kbGetRegistry(env);
+  // 同链接去重（O(1) 查注册表）：已存为另一篇文档时拒绝
+  const normSrc = kbNormSource(args.source);
+  if (normSrc) {
+    const dup = reg.find(e => kbNormSource(e.source) === normSrc);
+    if (dup && dup.file !== file) {
+      return '该链接已保存为知识库文档《' + (dup.title || dup.file) + '》，未重复保存。如需更新内容，请用完全相同的标题"' + (dup.title || dup.file) + '"重新保存以覆盖，或先用 delete_doc 删除旧文档。';
     }
   }
-  // 同名覆盖即更新：提前告知是新建还是覆盖
-  let existed = false;
-  try { existed = !!(env.R2 && await env.R2.head(key)); } catch (e) {}
+  const existed = reg.some(e => e.file === file);
   const head = '---\ntitle: "' + title.replace(/"/g, '') + '"\nsaved_at: ' + new Date().toISOString()
     + '\nchat_id: "' + kbSafeChatId(chatId) + '"'
-    + (args.source ? '\nsource: ' + String(args.source).slice(0, 500) : '')
+    + (args.source ? '\nsource: ' + String(args.source).trim().slice(0, 500) : '')
     + '\n---\n\n';
-  await storePut(env, key, head + content);
+  const body = head + content;
+  await storePut(env, key, body);
+  const entry = {
+    file: file,
+    title: title,
+    source: String(args.source || '').trim().slice(0, 500),
+    size: body.length,
+    updated_at: new Date().toISOString()
+  };
+  const idx = reg.findIndex(e => e.file === file);
+  if (idx >= 0) reg[idx] = entry; else reg.push(entry);
+  await kbSaveRegistry(env, reg);
   return '已保存为知识库文档：' + key + '（' + content.length + ' 字符' + (existed ? '，已覆盖旧版本' : '，新建') + '）';
-}
-
-// 列出 kb/docs/ 下全部文档对象（分页取全量）
-async function kbListDocObjects(env) {
-  const objs = [];
-  if (!env.R2) return objs;
-  try {
-    const prefix = KB_PREFIX + 'docs/';
-    let cursor;
-    do {
-      const listed = await env.R2.list({ prefix: prefix, limit: 1000, cursor: cursor });
-      for (const o of (listed.objects || [])) objs.push(o);
-      cursor = listed.truncated ? listed.cursor : undefined;
-    } while (cursor);
-  } catch (e) {}
-  return objs;
-}
-async function kbListDocKeys(env) {
-  return (await kbListDocObjects(env)).map(o => o.key);
-}
-function kbDocTitleOf(key) {
-  let t = String(key || '').slice((KB_PREFIX + 'docs/').length);
-  if (t.endsWith('.md')) t = t.slice(0, -3);
-  return t;
-}
-// 标题模糊匹配：精确相等 > 包含匹配（大小写不敏感），返回 key 或 null
-function kbFindDocKey(keys, query) {
-  const q = String(query || '').trim().toLowerCase();
-  if (!q || !keys || !keys.length) return null;
-  return keys.find(k => kbDocTitleOf(k).toLowerCase() === q)
-    || keys.find(k => kbDocTitleOf(k).toLowerCase().indexOf(q) !== -1)
-    || null;
-}
-function kbFmtSize(b) {
-  b = b || 0;
-  return b >= 1048576 ? (b / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(b / 1024)) + ' KB';
-}
-function kbFmtDate(d) {
-  try { return new Date(d).toISOString().slice(0, 10); } catch (e) { return ''; }
 }
 async function toolListDocs(env) {
   if (!env.R2) return 'R2 未绑定，无法读取知识库文档';
-  let objs;
-  try { objs = await kbListDocObjects(env); } catch (e) { return '读取文档列表失败'; }
-  if (!objs.length) return '知识库文档为空（kb/docs/ 下暂无文档，可用 save_doc 保存）';
-  return '知识库文档（共' + objs.length + '篇）：\n' +
-    objs.map((o, i) => (i + 1) + '. ' + kbDocTitleOf(o.key) + '（' + kbFmtSize(o.size) + '，' + kbFmtDate(o.uploaded) + '）').join('\n');
+  const reg = await kbGetRegistry(env);
+  if (!reg.length) return '知识库文档为空（kb/docs/ 下暂无文档，可用 save_doc 保存）';
+  return '知识库文档（共' + reg.length + '篇）：\n' +
+    reg.map((e, i) => (i + 1) + '. ' + (e.title || e.file) + '（' + kbFmtSize(e.size) + '，' + kbFmtDate(e.updated_at) + '）').join('\n');
 }
-// 按标题关键词读取一篇文档；标题无命中时自动改搜正文并返回关键词附近片段
 async function toolReadDoc(env, args) {
   args = args || {};
   const query = String(args.query || '').trim();
   if (!query) return '请给出要读取的文档标题关键词';
   if (!env.R2) return 'R2 未绑定，无法读取知识库文档';
-  const keys = await kbListDocKeys(env);
-  if (!keys.length) return '知识库文档为空（kb/docs/ 下暂无文档）';
-  const hit = kbFindDocKey(keys, query);
+  const reg = await kbGetRegistry(env);
+  if (!reg.length) return '知识库文档为空（kb/docs/ 下暂无文档）';
+  const hit = kbFindRegEntry(reg, query);
   if (hit) {
     try {
-      const obj = await env.R2.get(hit);
-      if (!obj) return '文档读取失败：' + kbDocTitleOf(hit);
+      const obj = await env.R2.get(KB_DOCS_PREFIX + hit.file);
+      if (!obj) return '文档读取失败：' + (hit.title || hit.file);
       let text = await obj.text();
       const MAX = 8000;
       let note = '';
       if (text.length > MAX) { text = text.slice(0, MAX); note = '\n\n> （文档过长，仅显示前 8000 字符）'; }
-      return '【知识库文档《' + kbDocTitleOf(hit) + '》】\n' + text + note;
-    } catch (e) { return '文档读取失败：' + kbDocTitleOf(hit); }
+      return '【知识库文档《' + (hit.title || hit.file) + '》】\n' + text + note;
+    } catch (e) { return '文档读取失败：' + (hit.title || hit.file); }
   }
-  // 标题无命中 → 全文关键词检索（最多查 30 篇，防长尾延迟）
-  const snippet = await kbSearchDocBody(env, keys.slice(0, 30), query);
+  // 标题无命中 → 全文关键词检索（最多查 30 篇）
+  const snippet = await kbSearchDocBody(env, reg.slice(0, 30).map(e => KB_DOCS_PREFIX + e.file), query);
   if (snippet) return snippet;
   return '未找到标题或正文包含"' + query + '"的文档。现有文档：\n' +
-    keys.map(k => '- ' + kbDocTitleOf(k)).join('\n');
+    reg.map(e => '- ' + (e.title || e.file)).join('\n');
 }
 // 全文关键词检索：逐篇读正文，返回首个命中的关键词上下文片段
 async function kbSearchDocBody(env, keys, query) {
@@ -831,15 +883,16 @@ async function toolDeleteDoc(env, args) {
   const query = String(args.query || '').trim();
   if (!query) return '请给出要删除的文档标题关键词';
   if (!env.R2) return 'R2 未绑定，无法删除知识库文档';
-  const keys = await kbListDocKeys(env);
-  if (!keys.length) return '知识库文档为空，无需删除';
-  const hit = kbFindDocKey(keys, query);
+  const reg = await kbGetRegistry(env);
+  if (!reg.length) return '知识库文档为空，无需删除';
+  const hit = kbFindRegEntry(reg, query);
   if (!hit) {
     return '未找到标题包含"' + query + '"的文档。现有文档：\n' +
-      keys.map(k => '- ' + kbDocTitleOf(k)).join('\n');
+      reg.map(e => '- ' + (e.title || e.file)).join('\n');
   }
-  try { await env.R2.delete(hit); } catch (e) { return '删除失败：' + kbDocTitleOf(hit); }
-  return '已删除知识库文档《' + kbDocTitleOf(hit) + '》';
+  try { await env.R2.delete(KB_DOCS_PREFIX + hit.file); } catch (e) { return '删除失败：' + (hit.title || hit.file); }
+  await kbSaveRegistry(env, reg.filter(e => e !== hit));
+  return '已删除知识库文档《' + (hit.title || hit.file) + '》';
 }
 
 // 获取 Agent 模式开关（默认开启）
