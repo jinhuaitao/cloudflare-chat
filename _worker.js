@@ -23,7 +23,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.7.3';
+const APP_VERSION = '6.7.4';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -1354,44 +1354,61 @@ async function wxHandleInbound(env, bind, msg) {
 
 // ---- cron 轮询入口 ----
 // debug=true 时返回每条消息的处理明细（供 /api/wx/diag 诊断用，不含 token）
-async function wxCronTick(env, debug) {
+// single=true 时只拉一轮（供手动诊断用）
+// v6.7.4：drain loop —— cron 单轮内连续监听（预算 50 秒），有消息立刻再拉，
+// 把"每分钟拉一次 25 秒"的盲区基本消灭，延迟从"最多约 1 分钟"降到"通常十几秒"。
+async function wxCronTick(env, debug, single) {
   const bind = await wxGetBind(env);
   if (!bind) return { ok: false, reason: 'not-bound' };
-  // 防重叠：90 秒内的 tick 直接跳过（cron 每分钟一次，正常不会重叠）
+  // 防重叠：锁存在且 90 秒内 → 跳过；锁在 tick 结束时删除，崩溃残留的锁 90 秒后失效
   try {
     const lockRaw = await storeGet(env, WX_POLL_LOCK_KEY);
     if (lockRaw && Date.now() - parseInt(lockRaw, 10) < 90000) return { ok: false, reason: 'overlap-skip' };
   } catch (e) {}
   await storePut(env, WX_POLL_LOCK_KEY, String(Date.now()));
-  let resp;
-  try {
-    resp = await wxApi(bind.baseUrl, 'POST', '/ilink/bot/getupdates', {
-      get_updates_buf: bind.cursor || '',
-      base_info: { channel_version: WX_CHANNEL_VERSION, bot_agent: WX_BOT_AGENT },
-    }, bind.token, 25000);
-  } catch (e) {
-    return { ok: false, reason: 'poll-error: ' + (e && e.message ? e.message : String(e)) };
-  }
-  const msgs = resp && Array.isArray(resp.msgs) ? resp.msgs : [];
+  const startedAt = Date.now();
+  const POLL_BUDGET_MS = 50000;
+  const POLL_TIMEOUT_MS = 25000; // 单次 getupdates 长轮询超时
   const dbgMsgs = [];
-  let n = 0;
-  for (const m of msgs) {
-    if (!m || typeof m !== 'object') continue;
-    const sender = String((m && (m.from_user_id || m.from_user)) || 'unknown');
-    try {
-      const turn = await wxHandleInbound(env, bind, m);
-      if (debug) dbgMsgs.push({ sender, ok: true, textPreview: wxExtractText(m).slice(0, 120), turn: turn || null });
-    } catch (e) {
-      console.log('微信消息处理异常:', e);
-      if (debug) dbgMsgs.push({ sender, ok: false, error: String((e && e.message) || e).slice(0, 200) });
+  let total = 0;
+  let lastReason = 'ok';
+  try {
+    for (;;) {
+      let resp;
+      try {
+        resp = await wxApi(bind.baseUrl, 'POST', '/ilink/bot/getupdates', {
+          get_updates_buf: bind.cursor || '',
+          base_info: { channel_version: WX_CHANNEL_VERSION, bot_agent: WX_BOT_AGENT },
+        }, bind.token, POLL_TIMEOUT_MS);
+      } catch (e) {
+        lastReason = 'poll-error: ' + (e && e.message ? e.message : String(e));
+        break;
+      }
+      const msgs = resp && Array.isArray(resp.msgs) ? resp.msgs : [];
+      for (const m of msgs) {
+        if (!m || typeof m !== 'object') continue;
+        const sender = String((m && (m.from_user_id || m.from_user)) || 'unknown');
+        try {
+          const turn = await wxHandleInbound(env, bind, m);
+          if (debug) dbgMsgs.push({ sender, ok: true, textPreview: wxExtractText(m).slice(0, 120), turn: turn || null });
+        } catch (e) {
+          console.log('微信消息处理异常:', e);
+          if (debug) dbgMsgs.push({ sender, ok: false, error: String((e && e.message) || e).slice(0, 200) });
+        }
+        total++;
+      }
+      if (typeof resp.get_updates_buf === 'string' && resp.get_updates_buf) {
+        bind.cursor = resp.get_updates_buf;
+        await wxSaveBind(env, bind);
+      }
+      // 空闲时也继续监听直到预算用完（getupdates 是长轮询，服务端会挂起等待，
+      // 不会空转打爆 API）；有消息则立刻再拉，把堆积吃光；手动单轮只拉一次。
+      if (single || Date.now() - startedAt > POLL_BUDGET_MS) break;
     }
-    n++;
+  } finally {
+    try { await storeDelete(env, WX_POLL_LOCK_KEY); } catch (e) {}
   }
-  if (typeof resp.get_updates_buf === 'string' && resp.get_updates_buf) {
-    bind.cursor = resp.get_updates_buf;
-    await wxSaveBind(env, bind);
-  }
-  const result = { ok: true, count: n };
+  const result = lastReason === 'ok' ? { ok: true, count: total } : { ok: false, reason: lastReason, count: total };
   if (debug) result.debug = dbgMsgs;
   return result;
 }
@@ -1579,7 +1596,7 @@ export default {
       const bind = await wxGetBind(env);
       let tick;
       try {
-        tick = await wxCronTick(env, true);
+        tick = await wxCronTick(env, true, true); // 手动诊断只拉一轮，避免等 50 秒
       } catch (e) {
         tick = { ok: false, reason: 'tick-throw: ' + (e && e.message ? e.message : String(e)) };
       }
