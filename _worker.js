@@ -303,6 +303,28 @@ async function execAgentTool(name, args, env, chatId) {
   }
 }
 
+// DuckDuckGo HTML 结果解析（抽出以便测试）
+function parseDuckDuckGo(html, count) {
+  const out = [];
+  const re = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+  // 摘要与标题在页面中按相同顺序出现，按序配对
+  const snips = [];
+  const reSnip = /<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+  let sm;
+  while ((sm = reSnip.exec(html)) && snips.length < count) {
+    snips.push(sm[1].replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200));
+  }
+  let m;
+  while ((m = re.exec(html)) && out.length < count) {
+    let href = m[1];
+    const uddg = href.match(/[?&]uddg=([^&]+)/);
+    try { if (uddg) href = decodeURIComponent(uddg[1]); } catch (e) {}
+    const title = m[2].replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+    if (title && href && href.startsWith('http')) out.push({ title, url: href, snip: snips[out.length] || '' });
+  }
+  return out;
+}
+
 async function toolWebSearch(query, count) {
   query = String(query || '').trim();
   if (!query) return '搜索关键词为空';
@@ -316,20 +338,11 @@ async function toolWebSearch(query, count) {
     });
     if (!res.ok) return '搜索请求失败，HTTP ' + res.status;
     const html = await res.text();
-    const out = [];
-    const re = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
-    let m;
-    while ((m = re.exec(html)) && out.length < count) {
-      let href = m[1];
-      const uddg = href.match(/[?&]uddg=([^&]+)/);
-      try { if (uddg) href = decodeURIComponent(uddg[1]); } catch (e) {}
-      const title = m[2].replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-      if (title && href && href.startsWith('http')) out.push({ title, url: href });
-    }
+    const out = parseDuckDuckGo(html, count);
     if (!out.length) return '搜索「' + query + '」无结果';
     let text = '搜索「' + query + '」结果：\n';
-    out.forEach((r, i) => { text += (i + 1) + '. ' + r.title + '\n   ' + r.url + '\n'; });
-    return text.slice(0, 3000);
+    out.forEach((r, i) => { text += (i + 1) + '. ' + r.title + '\n   ' + r.url + (r.snip ? '\n   摘要：' + r.snip : '') + '\n'; });
+    return text.slice(0, 4000);
   } catch (e) {
     return '搜索失败: ' + (e.name === 'AbortError' ? '超时' : e.message);
   } finally { clearTimeout(timer); }
@@ -470,6 +483,20 @@ async function agentSaveMemory(env, chatId, fact) {
   return '已记住：' + fact + '（共' + arr.length + '条）';
 }
 
+async function agentForgetMemory(env, chatId, keyword) {
+  keyword = String(keyword || '').trim();
+  if (!keyword) return { removed: 0 };
+  const arr = await agentGetMemories(env, chatId);
+  const kept = arr.filter(m => String(m.fact || '').indexOf(keyword) < 0);
+  const removed = arr.length - kept.length;
+  if (removed > 0) {
+    tgAgentMemCache.set(chatId, kept);
+    await storePut(env, 'agent_mem_' + chatId, JSON.stringify(kept));
+  }
+  return { removed };
+}
+
+// 获取 Agent 模式开关（默认开启）
 async function agentGetMode(env, chatId) {
   if (tgAgentModeCache.has(chatId)) return tgAgentModeCache.get(chatId);
   let on = true; // 默认开启 Agent 模式
@@ -484,49 +511,114 @@ async function agentSetMode(env, chatId, on) {
   await storePut(env, 'agent_mode_' + chatId, on ? '1' : '0');
 }
 
-function buildAgentSystemPrompt(memories) {
+// 记忆分词：英文按词、中文按 2-gram，用于相关性打分
+function memoryTokens(s) {
+  const out = [];
+  const segs = String(s || '').toLowerCase().split(/[^a-z0-9\u4e00-\u9fff]+/);
+  for (const seg of segs) {
+    if (!seg) continue;
+    out.push(seg);
+    if (/[\u4e00-\u9fff]/.test(seg)) {
+      for (let i = 0; i + 2 <= seg.length; i++) out.push(seg.slice(i, i + 2));
+    }
+  }
+  return out;
+}
+
+// 构建 Agent 系统提示词（记忆按【相关性 + 新近度】排序注入，而非只取最新）
+function buildAgentSystemPrompt(memories, query) {
   const now = new Date();
   let timeStr = '';
   try {
     timeStr = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', dateStyle: 'full', timeStyle: 'short' }).format(now);
   } catch (e) { timeStr = now.toISOString(); }
   let p = '你是 Cloudflare-Chat 智能助手，一个具备自主规划、工具调用和长期记忆能力的 AI Agent。\n';
-  p += '当前时间：' + timeStr + '（北京时间）。\n';
+  p += '当前时间：' + timeStr + '（北京时间）。\n\n';
+  p += '【工作方式】\n'
+    + '1. 意图判断：闲聊、简单问答、你知识范围内的内容——直接回答，不要调用工具。\n'
+    + '2. 工具选择：需要最新/实时信息（新闻、价格、赛事等）→ web_search，可换多个关键词搜索；想深入了解某条结果 → web_fetch 读原文；任何精确计算 → calculate（不要心算）；天气 → get_weather；时间 → get_time；用户明确告知的长期事实（偏好、生日、项目、城市等）→ remember。\n'
+    + '3. 多步规划：允许先搜索再抓取、先计算再汇总。一次可并行调用多个工具。\n'
+    + '4. 诚实：工具没给的信息绝不编造；搜索无结果就直说。\n'
+    + '5. 语言：默认用中文回答（用户用其他语言时跟随用户语言）。\n\n';
+  p += '【输出要求】\n'
+    + '- 重要结论先行，结构清晰，适合手机阅读；代码用代码块。\n'
+    + '- 引用网络信息给出结论即可，不必罗列链接（除非用户要求）。\n\n';
   if (memories.length) {
-    // 存储无上限，但每次注入按字符预算取最新的，避免 prompt 过长烧 token
+    const qTokens = memoryTokens(query);
+    const scored = memories.map((m) => {
+      const fTokens = memoryTokens(m.fact);
+      let score = 0;
+      for (const t of qTokens) if (fTokens.indexOf(t) >= 0) score += t.length >= 2 ? 2 : 1;
+      return { m, score };
+    });
+    scored.sort((a, b) => (b.score - a.score) || ((b.m.ts || 0) - (a.m.ts || 0)));
     let budget = 6000;
     const picked = [];
-    for (let i = memories.length - 1; i >= 0; i--) {
-      const f = String(memories[i].fact || '');
+    for (const s of scored) {
+      const f = String(s.m.fact || '');
       if (!f || f.length > budget) continue;
-      picked.unshift(f);
+      picked.push(f);
       budget -= f.length;
     }
     p += '【关于用户的长期记忆】（共' + memories.length + '条' +
-      (picked.length < memories.length ? '，本次注入最近' + picked.length + '条' : '') + '）\n' +
-      picked.map(f => '- ' + f).join('\n') + '\n';
+      (picked.length < memories.length ? '，按与本次提问的相关性注入' + picked.length + '条' : '') + '）\n' +
+      picked.map(f => '- ' + f).join('\n') + '\n\n';
   }
-  p += '【工作方式】\n'
-    + '1. 先理解用户意图：简单问题直接回答，不要为了用工具而用工具。\n'
-    + '2. 需要最新信息（新闻、价格、动态）时用 web_search；需要读具体网页时用 web_fetch；精确计算用 calculate；查天气用 get_weather；查时间用 get_time。\n'
-    + '3. 可以多步规划：先搜索再抓取、先计算再汇总。工具结果返回后综合作答，绝不编造工具没给的信息。\n'
-    + '4. 用户明确告知的长期信息（偏好、生日、项目、常用城市等）用 remember 记住。\n'
-    + '5. 用中文回答，适合手机阅读：重要结论先行，简洁清晰。\n';
+  p += '【重要规则】\n'
+    + '- 需要用户私密或实时信息时必须用工具核实，不要凭空猜测。\n'
+    + '- remember 只用于用户明确要求记住的长期事实，不要把临时对话内容存进去。\n'
+    + '- 当你觉得已经掌握足够信息，直接给出最终答案，不要为了调用工具而调用工具。';
   return p;
 }
 
 // ==================== Telegram Agent：主循环 ====================
 // ReAct 风格：LLM 决策 → 执行工具 → 结果回填 → 最多 MAX_STEPS 步。
 // 通道/模型不支持 tools 参数时返回 { fallback: true }，由调用方降级为普通对话。
-async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTools) {
+// Agent 运行限制（可配，防极端情况失控）
+function agentLimits(env) {
+  let maxSteps = parseInt(env.AGENT_MAX_STEPS || '6', 10);
+  if (!(maxSteps > 0)) maxSteps = 6;
+  if (maxSteps > 12) maxSteps = 12;
+  let timeoutMs = parseInt(env.AGENT_TIMEOUT_MS || '240000', 10);
+  if (!(timeoutMs > 0)) timeoutMs = 240000;
+  return { maxSteps, timeoutMs };
+}
+
+// 工具调用的人类可读描述，用于进度提示
+function describeToolCall(name, args) {
+  args = args || {};
+  switch (name) {
+    case 'web_search': return '🔍 正在搜索：' + (args.query || '');
+    case 'web_fetch': return '📄 正在读取网页…';
+    case 'calculate': return '🧮 正在计算：' + (args.expression || '');
+    case 'get_weather': return '🌤 正在查询天气：' + (args.city || '');
+    case 'get_time': return '🕐 正在获取时间…';
+    case 'remember': return '🧠 正在记住…';
+    default: return '⚙️ 正在调用：' + name;
+  }
+}
+
+async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTools, onProgress) {
+  const query = history.length ? String(history[history.length - 1].content || '') : '';
   const memories = await agentGetMemories(env, chatId);
-  const systemPrompt = buildAgentSystemPrompt(memories);
+  const systemPrompt = buildAgentSystemPrompt(memories, query);
   const tools = allowTools ? getAgentTools() : null;
   const messages = [{ role: 'system', content: systemPrompt }];
   for (const m of history) messages.push({ role: m.role, content: m.content });
 
-  const MAX_STEPS = 6;
-  for (let step = 0; step < MAX_STEPS; step++) {
+  let maxSteps = agentLimits(env).maxSteps;
+  let timeoutMs = agentLimits(env).timeoutMs;
+  const deadline = Date.now() + timeoutMs;
+  const lastAssistantText = () => {
+    const f = [...messages].reverse().find(m => m.role === 'assistant' && m.content);
+    return f ? f.content : '';
+  };
+
+  for (let step = 0; step < maxSteps; step++) {
+    if (Date.now() > deadline) {
+      const t = lastAssistantText();
+      return { text: '（本次任务超时，已停止）' + (t ? '\n\n' + t : ''), usedTools: true };
+    }
     // 长推理时保持 typing 状态不消失
     try { tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {}); } catch (e) {}
 
@@ -538,9 +630,13 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
       resp = await fetch(cfg.apiUrl, {
         method: 'POST',
         headers: { 'Authorization': 'Bearer ' + cfg.currentApiKey, 'Content-Type': 'application/json' },
-        body: JSON.stringify(cfg.payload)
+        body: JSON.stringify(cfg.payload),
+        signal: AbortSignal.timeout(180000) // 单次 LLM 调用上限 3 分钟，防真死锁
       });
-    } catch (e) { return { error: '网络错误：' + e.message }; }
+    } catch (e) {
+      if (e && e.name === 'AbortError') return { error: '上游响应超时（3 分钟无返回），请重试或换个问法' };
+      return { error: '网络错误：' + e.message };
+    }
 
     if (!resp.ok) {
       const t = await resp.text().catch(() => '');
@@ -563,20 +659,36 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
 
     if (!toolCalls.length) return { text: msg.content || '', usedTools: step > 0 };
 
-    for (const tc of toolCalls) {
+    // 进度提示：让用户看到 Agent 在干什么
+    if (typeof onProgress === 'function') {
+      try {
+        const descs = toolCalls.map(tc => {
+          let a = {};
+          try { a = JSON.parse((tc.function && tc.function.arguments) || '{}'); } catch (e) {}
+          return describeToolCall(tc.function.name, a);
+        });
+        await onProgress('🤖 Agent 思考中（第 ' + (step + 1) + ' 步）…\n' + descs.join('\n'));
+      } catch (e) {}
+    }
+
+    // 同一步的多个工具调用并行执行（顺序写回，保证消息顺序）
+    const toolResults = await Promise.all(toolCalls.map(async (tc) => {
       let args = {};
       try { args = JSON.parse((tc.function && tc.function.arguments) || '{}'); } catch (e) {}
       const result = await execAgentTool(tc.function.name, args, env, chatId);
+      return { tc, result: String(result).slice(0, 4000) };
+    }));
+    for (const tr of toolResults) {
       messages.push({
         role: 'tool',
-        tool_call_id: tc.id,
-        name: tc.function.name,
-        content: String(result).slice(0, 4000)
+        tool_call_id: tr.tc.id,
+        name: tr.tc.function.name,
+        content: tr.result
       });
     }
   }
-  const last = [...messages].reverse().find(m => m.role === 'assistant' && m.content);
-  return { text: (last && last.content) || '（思考步数已用尽，请换个问法重试）', usedTools: true };
+  const t = lastAssistantText();
+  return { text: t || '（思考步数已用尽，请换个问法重试）', usedTools: true };
 }
 
 // ======= 统一解析通道配置（带内存缓存） =======
@@ -885,7 +997,7 @@ export default {
 
                 await tgApi('sendMessage', {
                   chat_id: chatId,
-                  text: "⚙️ **请选择对话要使用的 AI 模型:**\n\n_支持多轮对话（最近 " + (parseInt(env.TG_HISTORY_ROUNDS || '10', 10) || 10) + " 轮），发送 /clear 可清空上下文。_\n\n🤖 **Agent 模式**（默认开启）：我会自主规划、调用工具（🔍 联网搜索、📄 网页读取、🧮 精确计算、🌤 天气、🕐 时间），并用 🧠 长期记住你告诉我的事。发送 /agent 可切换为普通对话模式。",
+                  text: "⚙️ **请选择对话要使用的 AI 模型:**\n\n_支持多轮对话（最近 " + (parseInt(env.TG_HISTORY_ROUNDS || '10', 10) || 10) + " 轮），发送 /clear 可清空上下文。_\n\n🤖 **Agent 模式**（默认开启）：我会自主规划、调用工具（🔍 联网搜索、📄 网页读取、🧮 精确计算、🌤 天气、🕐 时间），并用 🧠 长期记住你告诉我的事。发送 /agent 可切换为普通对话模式，/help 查看全部命令。",
                   parse_mode: "Markdown",
                   reply_markup: { inline_keyboard }
                 });
@@ -895,6 +1007,49 @@ export default {
               if (userText === '/clear' || userText === '/new') {
                 await tgClearHistory(env, chatId);
                 await tgApi('sendMessage', { chat_id: chatId, text: "🧹 上下文已清空，可以开始新的话题了。" });
+                return;
+              }
+
+              if (userText === '/help') {
+                await tgApi('sendMessage', {
+                  chat_id: chatId,
+                  text: "🤖 命令列表：\n\n"
+                    + "/start、/model —— 选择对话模型\n"
+                    + "/agent —— 切换 Agent / 普通对话模式\n"
+                    + "/clear —— 清空当前对话上下文\n"
+                    + "/memory —— 查看长期记忆\n"
+                    + "/forget 关键词 —— 删除包含关键词的记忆\n\n"
+                    + "Agent 模式下我会自主规划、调用工具（🔍 搜索、📄 网页、🧮 计算、🌤 天气、🕐 时间），并长期记住你告诉我的事。"
+                });
+                return;
+              }
+
+              if (userText === '/memory') {
+                const mems = await agentGetMemories(env, chatId);
+                if (!mems.length) {
+                  await tgApi('sendMessage', { chat_id: chatId, text: "🧠 暂无长期记忆。\n\n对我说「记住xxx」即可保存，比如：记住，我养了一只猫叫汤圆" });
+                } else {
+                  let text = '🧠 长期记忆（共' + mems.length + '条）：\n';
+                  mems.forEach((mm, i) => { text += (i + 1) + '. ' + mm.fact + '\n'; });
+                  text += '\n用 /forget 关键词 删除记忆。';
+                  for (let s = 0; s < text.length; s += 4000) {
+                    await tgApi('sendMessage', { chat_id: chatId, text: text.slice(s, s + 4000) });
+                  }
+                }
+                return;
+              }
+
+              if (userText.startsWith('/forget')) {
+                const kw = userText.slice(7).trim();
+                if (!kw) {
+                  await tgApi('sendMessage', { chat_id: chatId, text: "用法：/forget 关键词\n例如：/forget 猫 —— 删除所有包含「猫」的记忆" });
+                } else {
+                  const rr = await agentForgetMemory(env, chatId, kw);
+                  await tgApi('sendMessage', {
+                    chat_id: chatId,
+                    text: rr.removed > 0 ? '🗑 已删除 ' + rr.removed + ' 条包含「' + kw + '」的记忆。' : '没有找到包含「' + kw + '」的记忆。'
+                  });
+                }
                 return;
               }
 
@@ -942,8 +1097,20 @@ export default {
               let agentErr = null;
 
               if (useAgent) {
-                let r = await tgAgentChat(env, tgApi, chatId, targetModelId, history, true);
-                if (r.fallback) r = await tgAgentChat(env, tgApi, chatId, targetModelId, history, false);
+                // Agent 模式：ReAct 多步推理 + 工具调用（进度实时编辑到 pending 消息上）
+                let lastProgressEdit = 0;
+                const onProgress = async (text) => {
+                  if (!pendingMsgId) return;
+                  const now = Date.now();
+                  if (now - lastProgressEdit < 1500) return; // Telegram 编辑限流，节流
+                  lastProgressEdit = now;
+                  try {
+                    // 纯文本，不加 parse_mode，避免搜索词里的 Markdown 特殊字符导致编辑失败
+                    await tgApi('editMessageText', { chat_id: chatId, message_id: pendingMsgId, text: String(text).slice(0, 4000) });
+                  } catch (e) {}
+                };
+                let r = await tgAgentChat(env, tgApi, chatId, targetModelId, history, true, onProgress);
+                if (r.fallback) r = await tgAgentChat(env, tgApi, chatId, targetModelId, history, false, onProgress);
                 if (r.error) {
                   agentErr = r.error;
                 } else {
@@ -1720,7 +1887,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
           <svg id="themeIcon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
         </button>
       </div>
-      <div style="font-size: 12px; color: var(--text-secondary); font-weight: 600; white-space: nowrap; flex-shrink: 0;">V6.3</div>
+      <div style="font-size: 12px; color: var(--text-secondary); font-weight: 600; white-space: nowrap; flex-shrink: 0;">V6.4</div>
     </div>
   </div>
 
