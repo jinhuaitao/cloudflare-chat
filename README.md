@@ -2,7 +2,15 @@
 
 基于 Cloudflare Workers 的多通道 AI 对话前端 + Telegram 机器人。单文件 Worker（`_worker.js`），通过 `wrangler.toml` 声明式配置，支持连接 GitHub 仓库自动构建部署。
 
-> 当前版本：**v6.4.1**（见下方更新日志）
+> 当前版本：**v6.4.2**（见下方更新日志）
+
+## v6.4.2 更新日志
+
+- **修复 Agent 卡死无响应**：某步工具执行异常 hung 住（如抓取到永不结束的流式响应）或内部抛错时，之前会静默卡死在"思考中"，现在三层防护：
+  1. 调用方加 try/catch，任何未预期异常都转为可见的错误提示，不再 frozen
+  2. 每个工具增加独立竞速超时（默认 30 秒，可通过 `AGENT_TOOL_TIMEOUT_MS` 调整），abort 信号中断不了的 hung 住也能被救回来
+  3. 畸形 tool_call（含缺失 function 字段）不再抛错导致整个 Agent 崩溃，而是跳过继续
+- **每步开始报进度**：LLM 长思考时也能看到"第 N 步"活着；工具进度用 force 标记突破 1.5 秒节流
 
 ## v6.4.1 更新日志
 
@@ -408,6 +416,7 @@ const rx = p => p.split('@').join(BS);   // 用 @ 占位，运行时展开成反
 | `RATE_LIMIT_PER_MIN` | 每 IP 每分钟 `/api/chat` 限额，`0` 关闭 | `60` |
 | `AGENT_MAX_STEPS` | Agent 单轮任务最大推理步数（上限 12） | `6` |
 | `AGENT_TIMEOUT_MS` | Agent 单轮任务总超时（毫秒） | `240000`（4 分钟） |
+| `AGENT_TOOL_TIMEOUT_MS` | 单个工具最长执行时间（毫秒） | `30000`（30 秒） |
 
 ---
 

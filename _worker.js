@@ -288,18 +288,32 @@ function getAgentTools() {
 }
 
 async function execAgentTool(name, args, env, chatId) {
+  // 兜底超时：单个工具最长执行时间，防止 abort 信号无法中断 hung 住的请求体
+  // （如永不结束的流式响应）。可通过 AGENT_TOOL_TIMEOUT_MS 调整，默认 30 秒。
+  let toolTimeoutMs = parseInt(env.AGENT_TOOL_TIMEOUT_MS || '30000', 10);
+  if (!(toolTimeoutMs > 0)) toolTimeoutMs = 30000;
+  let timer;
   try {
-    switch (name) {
-      case 'web_search': return await toolWebSearch(args.query, args.count);
-      case 'web_fetch': return await toolWebFetch(args.url);
-      case 'calculate': return toolCalculate(args.expression);
-      case 'get_time': return toolGetTime(args.timezone);
-      case 'get_weather': return await toolGetWeather(args.city);
-      case 'remember': return await agentSaveMemory(env, chatId, args.fact);
-      default: return '未知工具: ' + name;
-    }
+    const run = (async () => {
+      switch (name) {
+        case 'web_search': return await toolWebSearch(args.query, args.count);
+        case 'web_fetch': return await toolWebFetch(args.url);
+        case 'calculate': return toolCalculate(args.expression);
+        case 'get_time': return toolGetTime(args.timezone);
+        case 'get_weather': return await toolGetWeather(args.city);
+        case 'remember': return await agentSaveMemory(env, chatId, args.fact);
+        default: return '未知工具: ' + name;
+      }
+    })();
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('__TOOL_TIMEOUT__')), toolTimeoutMs);
+    });
+    return await Promise.race([run, timeout]);
   } catch (e) {
+    if (e && e.message === '__TOOL_TIMEOUT__') return '工具 ' + name + ' 执行超时（' + Math.round(toolTimeoutMs / 1000) + ' 秒），已跳过';
     return '工具执行失败: ' + (e && e.message ? e.message : String(e));
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -619,6 +633,10 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
       const t = lastAssistantText();
       return { text: '（本次任务超时，已停止）' + (t ? '\n\n' + t : ''), usedTools: true };
     }
+    // 每步开始先报进度：LLM 长思考时用户也能看到活着
+    if (typeof onProgress === 'function') {
+      try { await onProgress('🤖 Agent 思考中（第 ' + (step + 1) + ' 步）…'); } catch (e) {}
+    }
     // 长推理时保持 typing 状态不消失
     try { tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {}); } catch (e) {}
 
@@ -659,30 +677,34 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
 
     if (!toolCalls.length) return { text: msg.content || '', usedTools: step > 0 };
 
-    // 进度提示：让用户看到 Agent 在干什么
+    // 进度提示：让用户看到 Agent 在干什么（force 突破节流）
     if (typeof onProgress === 'function') {
       try {
         const descs = toolCalls.map(tc => {
+          const fn = (tc && tc.function) || {};
           let a = {};
-          try { a = JSON.parse((tc.function && tc.function.arguments) || '{}'); } catch (e) {}
-          return describeToolCall(tc.function.name, a);
+          try { a = JSON.parse(fn.arguments || '{}'); } catch (e) {}
+          return describeToolCall(fn.name || 'unknown', a);
         });
-        await onProgress('🤖 Agent 思考中（第 ' + (step + 1) + ' 步）…\n' + descs.join('\n'));
+        await onProgress('🤖 Agent 思考中（第 ' + (step + 1) + ' 步）…\n' + descs.join('\n'), true);
       } catch (e) {}
     }
 
     // 同一步的多个工具调用并行执行（顺序写回，保证消息顺序）
     const toolResults = await Promise.all(toolCalls.map(async (tc) => {
+      const fn = (tc && tc.function) || {};
       let args = {};
-      try { args = JSON.parse((tc.function && tc.function.arguments) || '{}'); } catch (e) {}
-      const result = await execAgentTool(tc.function.name, args, env, chatId);
+      try { args = JSON.parse(fn.arguments || '{}'); } catch (e) {}
+      if (!fn.name) return { tc, result: '工具调用缺少名称，已跳过' };
+      const result = await execAgentTool(fn.name, args, env, chatId);
       return { tc, result: String(result).slice(0, 4000) };
     }));
     for (const tr of toolResults) {
+      const fn = (tr.tc && tr.tc.function) || {};
       messages.push({
         role: 'tool',
         tool_call_id: tr.tc.id,
-        name: tr.tc.function.name,
+        name: fn.name || 'unknown',
         content: tr.result
       });
     }
@@ -1099,18 +1121,24 @@ export default {
               if (useAgent) {
                 // Agent 模式：ReAct 多步推理 + 工具调用（进度实时编辑到 pending 消息上）
                 let lastProgressEdit = 0;
-                const onProgress = async (text) => {
+                const onProgress = async (text, force) => {
                   if (!pendingMsgId) return;
                   const now = Date.now();
-                  if (now - lastProgressEdit < 1500) return; // Telegram 编辑限流，节流
+                  if (!force && now - lastProgressEdit < 1500) return; // Telegram 编辑限流，节流；工具进度用 force 突破
                   lastProgressEdit = now;
                   try {
                     // 纯文本，不加 parse_mode，避免搜索词里的 Markdown 特殊字符导致编辑失败
                     await tgApi('editMessageText', { chat_id: chatId, message_id: pendingMsgId, text: String(text).slice(0, 4000) });
                   } catch (e) {}
                 };
-                let r = await tgAgentChat(env, tgApi, chatId, targetModelId, history, true, onProgress);
-                if (r.fallback) r = await tgAgentChat(env, tgApi, chatId, targetModelId, history, false, onProgress);
+                let r;
+                try {
+                  r = await tgAgentChat(env, tgApi, chatId, targetModelId, history, true, onProgress);
+                  if (r.fallback) r = await tgAgentChat(env, tgApi, chatId, targetModelId, history, false, onProgress);
+                } catch (e) {
+                  // 兜底：Agent 内部任何未预期异常都转为可见错误，绝不让用户面对卡死的"思考中"
+                  r = { error: '⚠️ Agent 执行出错：' + (e && e.message ? e.message : String(e)) };
+                }
                 if (r.error) {
                   agentErr = r.error;
                 } else {
@@ -1887,7 +1915,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
           <svg id="themeIcon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
         </button>
       </div>
-      <div style="font-size: 12px; color: var(--text-secondary); font-weight: 600; white-space: nowrap; flex-shrink: 0;">V6.41</div>
+      <div style="font-size: 12px; color: var(--text-secondary); font-weight: 600; white-space: nowrap; flex-shrink: 0;">v6.42</div>
     </div>
   </div>
 
