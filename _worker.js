@@ -23,7 +23,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.6.6';
+const APP_VERSION = '6.6.7';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -174,19 +174,84 @@ function tgTrimHistory(history, env) {
 // 单对象可达 5TB、读写强一致。未绑定 R2 时退化为纯内存
 // （isolate 重启丢失；Telegram 机器人需要持久化，请务必绑定 R2）。
 //
-// ---------- R2 文件夹布局（v6.6.6 起） ----------
+// ---------- R2 文件夹布局（v6.6.6 起，v6.6.7 补充 md 镜像） ----------
 // R2 没有真正的目录，用 key 前缀 + '/' 模拟文件夹，控制台按此展示层级。
 // 「知识库」（Agent 长期记忆）独立存放在 kb/ 文件夹下，与其它数据隔离，
 // 便于在控制台单独浏览、备份或设置生命周期规则；其余数据保持原样不动。
 //
-//   kb/agent_mem_<chatId>   知识库：Agent 长期记忆（remember 工具写入，JSON 数组）
+//   kb/agent_mem_<chatId>   知识库索引：长期记忆 JSON 数组 [{fact, ts, file}]（唯一可信源）
+//   kb/mem/<chatId>/*.md    知识库镜像：每条记忆一个 Markdown 文件（frontmatter + 正文），供控制台浏览
 //   tg_hist_<chatId>         Telegram 对话历史（根目录，保持原样）
 //   tg_user_<chatId>         用户模型选择（根目录，保持原样）
 //   agent_mode_<chatId>      Agent 开关（根目录，保持原样）
 //   tg_agent_<chatId>        Agent 断点续做（根目录，保持原样）
+//
+// 注意：md 镜像只是"可读副本"，机器人只读 JSON 索引。手动在控制台改 md
+// 不会生效；以索引为准，缺失的 md 会在下次加载时自动补建。
 const KB_PREFIX = 'kb/';
 function agentMemKey(chatId) { return KB_PREFIX + 'agent_mem_' + chatId; }
 function agentMemKeyLegacy(chatId) { return 'agent_mem_' + chatId; } // v6.6.5 及更早的旧 key（根目录），仅用于兼容迁移
+// chatId 清洗：只允许字母数字、下划线、中划线，防路径遍历（如 ../）污染 kb/mem/ 目录
+function kbSafeChatId(chatId) { return String(chatId == null ? '' : chatId).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64); }
+function kbMemDir(chatId) { return KB_PREFIX + 'mem/' + kbSafeChatId(chatId) + '/'; }
+// md 文件名：时间戳（36 进制，可按字典序排列）+ 随机后缀防同毫秒碰撞
+function kbNewMemFile() { return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6) + '.md'; }
+function kbMemMarkdown(chatId, fact, ts) {
+  let d = '';
+  try { d = new Date(ts || Date.now()).toISOString(); } catch (e) { d = new Date().toISOString(); }
+  return '---\nchat_id: "' + kbSafeChatId(chatId) + '"\nsaved_at: ' + d + '\n---\n\n' + String(fact == null ? '' : fact) + '\n';
+}
+// R2 批量删除（delete 支持字符串数组，一次最多 1000 个）
+async function kbDeleteKeys(env, keys) {
+  if (!env.R2 || !keys || !keys.length) return;
+  try { await env.R2.delete(keys.slice(0, 1000)); } catch (e) {}
+  if (keys.length > 1000) await kbDeleteKeys(env, keys.slice(1000));
+}
+// 清空某用户的整个 md 镜像目录（删 Web 会话时用）
+async function kbDeleteMemDir(env, chatId) {
+  if (!env.R2) return;
+  try {
+    const prefix = kbMemDir(chatId);
+    let cursor;
+    do {
+      const listed = await env.R2.list({ prefix: prefix, cursor: cursor, limit: 1000 });
+      const keys = (listed.objects || []).map(function (o) { return o.key; });
+      if (keys.length) await env.R2.delete(keys);
+      cursor = listed.truncated ? listed.cursor : undefined;
+    } while (cursor);
+  } catch (e) {}
+}
+// 回补 md 镜像：给缺 file 字段的老条目分配文件名，并补建 R2 里缺失的 md 文件。
+// 返回 true 表示索引数组被修改过（调用方需重写索引）。
+async function kbBackfillMd(env, chatId, arr) {
+  if (!env.R2 || !Array.isArray(arr) || !arr.length) return false;
+  const dir = kbMemDir(chatId);
+  let indexChanged = false;
+  const need = [];
+  for (const m of arr) {
+    if (!m || !m.fact) continue;
+    if (!m.file) { m.file = kbNewMemFile(); indexChanged = true; }
+    need.push(m);
+  }
+  if (!need.length) return indexChanged;
+  // 查目录找出 R2 里缺失的 md（分页取全量，避免逐个 HEAD；超 1000 条也 OK）
+  const existing = new Set();
+  try {
+    let cursor;
+    do {
+      const listed = await env.R2.list({ prefix: dir, limit: 1000, cursor: cursor });
+      for (const o of (listed.objects || [])) existing.add(o.key);
+      cursor = listed.truncated ? listed.cursor : undefined;
+    } while (cursor);
+  } catch (e) {}
+  const puts = [];
+  for (const m of need) {
+    const key = dir + m.file;
+    if (!existing.has(key)) puts.push(storePut(env, key, kbMemMarkdown(chatId, m.fact, m.ts)));
+  }
+  if (puts.length) await Promise.all(puts);
+  return indexChanged;
+}
 async function storeGet(env, key) {
   if (!env.R2) return null;
   try {
@@ -513,6 +578,12 @@ async function agentGetMemories(env, chatId) {
   if (raw) {
     try { const p = JSON.parse(raw); if (Array.isArray(p)) arr = p; } catch (e) {}
   }
+  // v6.6.7：回补 md 镜像 —— 老条目自动分配文件名并建 md；控制台误删的 md 也会按索引重建
+  try {
+    if (await kbBackfillMd(env, chatId, arr)) {
+      await storePut(env, agentMemKey(chatId), JSON.stringify(arr));
+    }
+  } catch (e) {}
   tgAgentMemCache.set(chatId, arr);
   return arr;
 }
@@ -522,10 +593,13 @@ async function agentSaveMemory(env, chatId, fact) {
   fact = String(fact || '').trim().slice(0, 200);
   if (!fact) return '内容为空，未保存';
   if (arr.some(m => m.fact === fact)) return '已记住过，无需重复保存';
-  arr.push({ fact, ts: Date.now() });
+  // v6.6.7：条目带 file 字段；先写 md 镜像再写索引（索引是唯一可信源）
+  const m = { fact: fact, ts: Date.now(), file: kbNewMemFile() };
+  arr.push(m);
   // v6.4.1 起彻底不限条数：R2 单对象可达 5TB，且每次 prompt 只按预算注入，
   // 条数增长不影响 token 成本；remember 需用户明确要求才会触发，无失控风险。
   tgAgentMemCache.set(chatId, arr);
+  await storePut(env, kbMemDir(chatId) + m.file, kbMemMarkdown(chatId, fact, m.ts));
   await storePut(env, agentMemKey(chatId), JSON.stringify(arr));
   return '已记住：' + fact + '（共' + arr.length + '条）';
 }
@@ -537,8 +611,15 @@ async function agentForgetMemory(env, chatId, keyword) {
   const kept = arr.filter(m => String(m.fact || '').indexOf(keyword) < 0);
   const removed = arr.length - kept.length;
   if (removed > 0) {
+    // v6.6.7：同步删除被删条目的 md 镜像
+    const keptSet = new Set(kept);
+    const files = [];
+    for (const m of arr) {
+      if (!keptSet.has(m) && m && m.file) files.push(kbMemDir(chatId) + m.file);
+    }
     tgAgentMemCache.set(chatId, kept);
     await storePut(env, agentMemKey(chatId), JSON.stringify(kept));
+    if (files.length) await kbDeleteKeys(env, files);
   }
   return { removed };
 }
@@ -1218,7 +1299,8 @@ export default {
       return new Response(JSON.stringify({ ok: true, t: Date.now() }), { headers: HEALTH_HEADERS });
     }
 
-    // v6.6.2: 删除 Web 会话时同步清理 R2 上的 Agent 长期记忆（kb/agent_mem_web_<sessionId>）。
+    // v6.6.2: 删除 Web 会话时同步清理 R2 上的 Agent 长期记忆
+    //（索引 kb/agent_mem_web_<sessionId> + 镜像目录 kb/mem/web_<sessionId>/）。
     // 注意内存缓存也要清，否则下次 remember 会把删掉的记忆从缓存里复活写回去。
     if (request.method === 'DELETE' && url.pathname === '/api/web-memory') {
       const denied = denyUnauthorized(env, request);
@@ -1231,6 +1313,7 @@ export default {
       const webChatId = 'web_' + sid;
       tgAgentMemCache.delete(webChatId);
       await storeDelete(env, agentMemKey(webChatId));
+      await kbDeleteMemDir(env, webChatId); // v6.6.7：同步清空该会话的 md 镜像目录
       return new Response(JSON.stringify({ ok: true }), { headers: CORS_HEADERS });
     }
 

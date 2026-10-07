@@ -3,6 +3,13 @@
 基于 Cloudflare Workers 的多通道 AI 对话前端 + Telegram 机器人。单文件 Worker（`_worker.js`），通过 `wrangler.toml` 声明式配置，支持连接 GitHub 仓库自动构建部署。
 
 
+## v6.6.7 更新日志（知识库 md 镜像）
+
+- **每条记忆一个 Markdown 文件**：知识库保持 JSON 索引（`kb/agent_mem_<chatId>`，唯一可信源，读取性能不变），每条记忆额外镜像为 `kb/mem/<chatId>/<时间戳>-<随机>.md`（frontmatter 含 `chat_id` / `saved_at` + 正文），R2 控制台可逐条浏览
+  - `remember` 写入时先写 md 再写索引；`/forget` 同步删除对应 md；删除 Web 会话时清空整个 `kb/mem/<sessionId>/` 目录
+  - **老数据自动补建**：升级后首次加载记忆时，没有 md 的老条目会自动生成（控制台误删的 md 也会按索引重建）
+  - 注意：md 是只读镜像，手动改 md 不会生效；`chatId` 经清洗防路径遍历
+
 ## v6.6.6 更新日志（知识库独立文件夹）
 
 - **知识库搬入 R2 独立文件夹**：Agent 长期记忆（知识库）的 R2 key 从根目录的 `agent_mem_<chatId>` 改为 `kb/agent_mem_<chatId>`，在 R2 控制台按文件夹独立展示，便于单独浏览、备份与设置生命周期规则；其它数据（对话历史 `tg_hist_*`、模型选择 `tg_user_*`、Agent 开关 `agent_mode_*`、断点 `tg_agent_*`）保持原样不动
