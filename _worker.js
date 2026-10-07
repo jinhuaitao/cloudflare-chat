@@ -22,6 +22,9 @@ const SSE_HEADERS = {
 const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
+// 应用版本号（/help 显示；发版时同步 package.json）
+const APP_VERSION = '6.4.3';
+
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
 // 保证「单文件 Worker / 无额外构建产物」的部署方式不被破坏。
@@ -612,7 +615,7 @@ function describeToolCall(name, args) {
   }
 }
 
-async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTools, onProgress) {
+async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTools, onProgress, opts) {
   const query = history.length ? String(history[history.length - 1].content || '') : '';
   const memories = await agentGetMemories(env, chatId);
   const systemPrompt = buildAgentSystemPrompt(memories, query);
@@ -622,12 +625,21 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
 
   let maxSteps = agentLimits(env).maxSteps;
   let timeoutMs = agentLimits(env).timeoutMs;
+  // webhook 场景传入 maxRuntimeMs：HTTP 响应必须在 Telegram 因超时重发 update
+  // 之前返回（约 60 秒），取两者较小值，避免整体预算形同虚设
+  if (opts && opts.maxRuntimeMs > 0 && opts.maxRuntimeMs < timeoutMs) timeoutMs = opts.maxRuntimeMs;
   const deadline = Date.now() + timeoutMs;
   const lastAssistantText = () => {
     const f = [...messages].reverse().find(m => m.role === 'assistant' && m.content);
     return f ? f.content : '';
   };
 
+  // typing 心跳：长推理 / 长工具调用期间每 20 秒刷新一次"正在输入"，
+  // 任何 return / throw 分支都会在 finally 里清理定时器
+  const heartbeat = setInterval(() => {
+    try { tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {}); } catch (e) {}
+  }, 20000);
+  try {
   for (let step = 0; step < maxSteps; step++) {
     if (Date.now() > deadline) {
       const t = lastAssistantText();
@@ -645,14 +657,17 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
 
     let resp;
     try {
+      // 单步超时取 3 分钟与整体剩余预算的较小值：避免整体 deadline 已过，
+      // 还被一次上游调用拖住几分钟（webhook 必须在 Telegram 重发前返回）
+      const remainMs = Math.max(0, deadline - Date.now());
       resp = await fetch(cfg.apiUrl, {
         method: 'POST',
         headers: { 'Authorization': 'Bearer ' + cfg.currentApiKey, 'Content-Type': 'application/json' },
         body: JSON.stringify(cfg.payload),
-        signal: AbortSignal.timeout(180000) // 单次 LLM 调用上限 3 分钟，防真死锁
+        signal: AbortSignal.timeout(Math.max(15000, Math.min(180000, remainMs)))
       });
     } catch (e) {
-      if (e && e.name === 'AbortError') return { error: '上游响应超时（3 分钟无返回），请重试或换个问法' };
+      if (e && e.name === 'AbortError') return { error: '上游响应超时，请重试或换个问法' };
       return { error: '网络错误：' + e.message };
     }
 
@@ -708,6 +723,9 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
         content: tr.result
       });
     }
+  }
+  } finally {
+    clearInterval(heartbeat);
   }
   const t = lastAssistantText();
   return { text: t || '（思考步数已用尽，请换个问法重试）', usedTools: true };
@@ -973,13 +991,22 @@ export default {
         const update = await request.json();
         if (!env.TG_BOT_TOKEN) return new Response('OK', { status: 200 });
 
+        // Telegram Bot API 单次调用超时（默认 15 秒，可用 TG_API_TIMEOUT_MS 调整）：
+        // 之前是裸 fetch 无超时，api.telegram.org 偶发 hung 住会让进度消息永远停在"思考中"
+        let tgApiTimeoutMs = parseInt(env.TG_API_TIMEOUT_MS || '15000', 10);
+        if (!(tgApiTimeoutMs > 0)) tgApiTimeoutMs = 15000;
         const tgApi = (method, body) => fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/${method}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body)
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(tgApiTimeoutMs)
         });
 
-        ctx.waitUntil((async () => {
+        // v6.4.3 根因修复：之前收到 webhook 立刻返回 OK、把全部工作丢进 ctx.waitUntil ——
+        // 但 HTTP 响应结束后 waitUntil 最多再延续约 30 秒，超过 30 秒的 Agent 任务会被
+        // 静默掐断（pending 消息永远卡在"📄 正在读取网页…"，且无任何错误）。
+        // 现在改为在请求上下文内等待处理完成再返回 OK。
+        async function processTelegramUpdate(env, update, tgApi) {
           try {
             const { models: modelObjList } = getChannelConfig(env);
             if (modelObjList.length === 0) return;
@@ -994,9 +1021,9 @@ export default {
                 if (modelObjList[index]) {
                   const selected = modelObjList[index];
                   tgUserModels.set(chatId, selected.id);
-                  ctx.waitUntil(storePut(env, `tg_user_${chatId}`, selected.id));
-                  
-                  tgApi('sendMessage', {
+                  await storePut(env, `tg_user_${chatId}`, selected.id);
+
+                  await tgApi('sendMessage', {
                     chat_id: chatId,
                     text: `✅ **已切换模型为:** \n\`${selected.name}\``,
                     parse_mode: "Markdown"
@@ -1004,7 +1031,7 @@ export default {
                 }
               }
 
-              tgApi('answerCallbackQuery', { callback_query_id: cb.id }).catch(() => {});
+              await tgApi('answerCallbackQuery', { callback_query_id: cb.id }).catch(() => {});
               return;
             }
 
@@ -1042,6 +1069,7 @@ export default {
                     + "/memory —— 查看长期记忆\n"
                     + "/forget 关键词 —— 删除包含关键词的记忆\n\n"
                     + "Agent 模式下我会自主规划、调用工具（🔍 搜索、📄 网页、🧮 计算、🌤 天气、🕐 时间），并长期记住你告诉我的事。"
+                    + "\n\n📌 当前版本 v" + APP_VERSION + "（R2 持久化 · 长期记忆无上限）"
                 });
                 return;
               }
@@ -1133,8 +1161,9 @@ export default {
                 };
                 let r;
                 try {
-                  r = await tgAgentChat(env, tgApi, chatId, targetModelId, history, true, onProgress);
-                  if (r.fallback) r = await tgAgentChat(env, tgApi, chatId, targetModelId, history, false, onProgress);
+                  // webhook 内整体预算 55 秒：保证在 Telegram 因响应超时重发 update 之前返回 OK
+                  r = await tgAgentChat(env, tgApi, chatId, targetModelId, history, true, onProgress, { maxRuntimeMs: 55000 });
+                  if (r.fallback) r = await tgAgentChat(env, tgApi, chatId, targetModelId, history, false, onProgress, { maxRuntimeMs: 55000 });
                 } catch (e) {
                   // 兜底：Agent 内部任何未预期异常都转为可见错误，绝不让用户面对卡死的"思考中"
                   r = { error: '⚠️ Agent 执行出错：' + (e && e.message ? e.message : String(e)) };
@@ -1171,7 +1200,8 @@ export default {
                         'Authorization': `Bearer ${currentApiKey}`,
                         'Content-Type': 'application/json',
                       },
-                      body: JSON.stringify(payload)
+                      body: JSON.stringify(payload),
+                      signal: AbortSignal.timeout(60000) // 普通对话上游单次调用上限 60 秒
                     });
                     break;
                   } catch (e) {
@@ -1202,7 +1232,7 @@ export default {
               }
 
               if (pendingMsgId) {
-                ctx.waitUntil(tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {}));
+                await tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {});
               }
 
               if (agentErr) {
@@ -1211,6 +1241,21 @@ export default {
               }
 
               if (replyText) {
+                // 最终回复发送：带一次重试。tgApi 有 15 秒超时，一次偶发 hung 不该直接丢掉用户回复
+                const sendReplyChunk = async (text, useMarkdown) => {
+                  for (let attempt = 1; attempt <= 2; attempt++) {
+                    try {
+                      const r = await tgApi('sendMessage', useMarkdown
+                        ? { chat_id: chatId, text, parse_mode: "Markdown" }
+                        : { chat_id: chatId, text });
+                      if (r.ok || attempt === 2) return r;
+                    } catch (e) {
+                      if (attempt === 2) return { ok: false };
+                    }
+                    await new Promise(function (rr) { setTimeout(rr, 800); });
+                  }
+                  return { ok: false };
+                };
                 const maxLength = 4000;
                 let startIndex = 0;
                 while (startIndex < replyText.length) {
@@ -1225,14 +1270,10 @@ export default {
                   const chunk = replyText.slice(startIndex, startIndex + sliceLength);
                   startIndex += sliceLength;
 
-                  const tgRes = await tgApi('sendMessage', {
-                    chat_id: chatId,
-                    text: chunk,
-                    parse_mode: "Markdown"
-                  });
+                  const tgRes = await sendReplyChunk(chunk, true);
 
                   if (!tgRes.ok) {
-                    await tgApi('sendMessage', { chat_id: chatId, text: chunk });
+                    await sendReplyChunk(chunk, false);
                   }
                 }
               }
@@ -1240,7 +1281,31 @@ export default {
           } catch (err) {
             console.log("后台处理异常:", err);
           }
-        })());
+        }
+
+        // update_id 去重：同一 update 10 分钟内只处理一次。
+        // 处理改为在请求内等待完成，响应变慢时 Telegram 可能重发 update，
+        // 去重可避免重复执行 Agent / 重复发送回复。R2 未绑定时自动跳过去重。
+        try {
+          const uid = update && update.update_id;
+          if (uid !== undefined && uid !== null) {
+            const seenKey = 'tg_update_' + uid;
+            const seenRaw = await storeGet(env, seenKey);
+            let dup = false;
+            if (seenRaw) {
+              const seenAt = parseInt(seenRaw, 10);
+              if (seenAt > 0 && Date.now() - seenAt < 600000) dup = true;
+            }
+            if (dup) return new Response('OK', { status: 200 });
+            await storePut(env, seenKey, String(Date.now()));
+          }
+        } catch (e) {}
+
+        try {
+          await processTelegramUpdate(env, update, tgApi);
+        } catch (err) {
+          console.log("处理 Telegram 更新异常:", err);
+        }
 
         return new Response('OK', { status: 200 });
       } catch (error) {
@@ -1915,7 +1980,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
           <svg id="themeIcon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
         </button>
       </div>
-      <div style="font-size: 12px; color: var(--text-secondary); font-weight: 600; white-space: nowrap; flex-shrink: 0;">v6.42</div>
+      <div style="font-size: 12px; color: var(--text-secondary); font-weight: 600; white-space: nowrap; flex-shrink: 0;">v6.43</div>
     </div>
   </div>
 

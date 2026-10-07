@@ -2,7 +2,18 @@
 
 基于 Cloudflare Workers 的多通道 AI 对话前端 + Telegram 机器人。单文件 Worker（`_worker.js`），通过 `wrangler.toml` 声明式配置，支持连接 GitHub 仓库自动构建部署。
 
-> 当前版本：**v6.4.2**（见下方更新日志）
+> 当前版本：**v6.4.3**（见下方更新日志）
+
+## v6.4.3 更新日志
+
+- **根因修复 Agent 长任务静默被掐断**：之前收到 Telegram webhook 立刻返回 OK、把全部工作丢进 `ctx.waitUntil`，但 HTTP 响应结束后 `waitUntil` 最多再延续约 30 秒 —— 超过 30 秒的 Agent 任务会被无声终止，pending 消息永远卡在"📄 正在读取网页…"。现在改为**在请求上下文内等待处理完成再返回 OK**，彻底告别 30 秒天花板
+- **webhook 内 Agent 预算 55 秒**：保证在 Telegram 因响应超时重发 update 之前返回；超时不再静默卡死，而是返回"（本次任务超时，已停止）"+ 已有进展
+- **`update_id` 去重**：同一 update 10 分钟内只处理一次，防止 Telegram 重发导致重复执行 / 重复回复（R2 未绑定时自动跳过）
+- **Telegram API 调用超时**：`tgApi` 增加 `AbortSignal` 超时（默认 15 秒，可用 `TG_API_TIMEOUT_MS` 调整），`api.telegram.org` 偶发 hung 住不再拖死整个流程；最终回复发送失败自动重试一次
+- **typing 心跳**：Agent 运行期间每 20 秒刷新一次"正在输入…"，长推理/长工具调用用户侧一直有反馈；结束时自动清理定时器
+- **单步 LLM 超时与整体预算联动**：单次上游调用超时取 3 分钟与整体剩余预算的较小值
+- **`/help` 显示版本号**：方便确认线上部署的版本
+- 普通对话模式的上游调用也加上 60 秒超时
 
 ## v6.4.2 更新日志
 
@@ -417,6 +428,7 @@ const rx = p => p.split('@').join(BS);   // 用 @ 占位，运行时展开成反
 | `AGENT_MAX_STEPS` | Agent 单轮任务最大推理步数（上限 12） | `6` |
 | `AGENT_TIMEOUT_MS` | Agent 单轮任务总超时（毫秒） | `240000`（4 分钟） |
 | `AGENT_TOOL_TIMEOUT_MS` | 单个工具最长执行时间（毫秒） | `30000`（30 秒） |
+| `TG_API_TIMEOUT_MS` | Telegram Bot API 单次调用超时（毫秒） | `15000`（15 秒） |
 
 ---
 
