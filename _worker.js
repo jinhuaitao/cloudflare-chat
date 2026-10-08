@@ -38,7 +38,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.8.1';
+const APP_VERSION = '6.8.2';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -1290,6 +1290,18 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
     const f = [...messages].reverse().find(m => m.role === 'assistant' && m.content);
     return f ? f.content : '';
   };
+  // v6.8.2 作用域修复：loopStartIdx 与 ctxBudget 必须在函数作用域声明、
+  // 且位于 pauseForResume 之前。之前误放在 try 块内，而 pauseForResume
+  // 与步数用尽分支都在 try 块之外引用它们，导致 ReferenceError: loopStartIdx is not defined。
+  // 本轮循环在 messages 中的起始下标：上下文裁剪只动这之后的消息，
+  // system 与历史对话永不裁剪。「继续」时传入首次运行的下标，老轮次也可被裁剪，
+  // 防止多段续做让上下文无限增长。
+  const loopStartIdx = (typeof baseLoopStartIdx === 'number' && baseLoopStartIdx >= 0)
+    ? Math.min(baseLoopStartIdx, messages.length)
+    : messages.length;
+  // 上下文预算（字符数，env AGENT_CONTEXT_BUDGET 可配，默认 24000）
+  let ctxBudget = parseInt(env.AGENT_CONTEXT_BUDGET || '24000', 10);
+  if (!(ctxBudget > 0)) ctxBudget = 24000;
   // 超时暂停：保存循环状态，用户发「继续」即恢复。无 R2 时退化为直接终结。
   // v6.8.1：保存前先按上下文预算裁剪本轮老轮次（trim 只删 loopStartIdx 之后的消息，
   // 该下标本身不受影响，可原样存档），否则多段「继续」会让存档与发送量无限增长。
@@ -1315,15 +1327,6 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
     try { tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {}); } catch (e) {}
   }, 20000);
   try {
-  // 本轮循环在 messages 中的起始下标：上下文裁剪只动这之后的消息，
-  // system 与历史对话永不裁剪。「继续」时传入首次运行的下标，老轮次也可被裁剪，
-  // 防止多段续做让上下文无限增长。
-  const loopStartIdx = (typeof baseLoopStartIdx === 'number' && baseLoopStartIdx >= 0)
-    ? Math.min(baseLoopStartIdx, messages.length)
-    : messages.length;
-  // 上下文预算（字符数，env AGENT_CONTEXT_BUDGET 可配，默认 24000）
-  let ctxBudget = parseInt(env.AGENT_CONTEXT_BUDGET || '24000', 10);
-  if (!(ctxBudget > 0)) ctxBudget = 24000;
   // 重复调用熔断：记录每步工具调用签名，连续 3 步完全相同即判定模型原地打转
   const callSigHistory = [];
   for (let step = 0; step < maxSteps; step++) {
