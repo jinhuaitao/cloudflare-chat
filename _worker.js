@@ -38,7 +38,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.8.2';
+const APP_VERSION = '6.8.3';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -283,6 +283,14 @@ async function storeGet(env, key) {
 async function storePut(env, key, value) {
   if (!env.R2) return;
   try { await env.R2.put(key, String(value)); } catch (e) {}
+}
+
+// v6.8.3：带成功返回的 R2 写入。storePut 静默吞错，只用于"尽力而为"的场景；
+// 知识库/记忆写入必须诚实——没存上就要让 Agent 知道，而不是谎称成功。
+async function storePutChecked(env, key, value) {
+  if (!env.R2) return false;
+  try { await env.R2.put(key, String(value)); return true; }
+  catch (e) { return false; }
 }
 
 async function storeDelete(env, key) {
@@ -734,8 +742,13 @@ async function agentSaveMemory(env, chatId, fact) {
   // v6.4.1 起彻底不限条数：R2 单对象可达 5TB，且每次 prompt 只按预算注入，
   // 条数增长不影响 token 成本；remember 需用户明确要求才会触发，无失控风险。
   mapSetBounded(tgAgentMemCache, chatId, arr);
-  await storePut(env, kbMemDir(chatId) + m.file, kbMemMarkdown(chatId, fact, m.ts));
-  await storePut(env, agentMemKey(chatId), JSON.stringify(arr));
+  // v6.8.3：未绑定 R2 时只留内存，必须如实告知——之前会谎称"已记住"，重启就丢
+  if (!env.R2) {
+    return '已暂存于内存（R2 未绑定，Worker 重启后会丢失；按 README 第二步绑定 R2 后可永久记住）：' + fact;
+  }
+  const okMd = await storePutChecked(env, kbMemDir(chatId) + m.file, kbMemMarkdown(chatId, fact, m.ts));
+  const okIdx = await storePutChecked(env, agentMemKey(chatId), JSON.stringify(arr));
+  if (!okMd || !okIdx) return '记忆写入 R2 失败，已暂存于内存；请检查 R2 绑定与权限后重试：' + fact;
   return '已记住：' + fact + '（共' + arr.length + '条）';
 }
 
@@ -876,6 +889,8 @@ async function toolSaveDoc(env, chatId, args) {
   let content = String(args.content || '');
   if (!title) return '标题为空，未保存';
   if (!content.trim()) return '内容为空，未保存';
+  // v6.8.3：R2 未绑定时必须明确失败——之前会静默跳过写入却谎称"已保存"
+  if (!env.R2) return 'R2 未绑定，知识库文档无法保存。请先按 README 第二步绑定 R2 存储桶后再试；本次内容未保存。';
   if (content.length > 100000) content = content.slice(0, 100000) + '\n\n> （内容过长，仅保存前 10 万字符）';
   const file = kbDocSlug(title) + '.md';
   const key = KB_DOCS_PREFIX + file;
@@ -894,7 +909,9 @@ async function toolSaveDoc(env, chatId, args) {
     + (args.source ? '\nsource: ' + String(args.source).trim().slice(0, 500) : '')
     + '\n---\n\n';
   const body = head + content;
-  await storePut(env, key, body);
+  // v6.8.3：校验写入结果，R2 写入失败（如权限问题）不再谎称成功
+  const okDoc = await storePutChecked(env, key, body);
+  if (!okDoc) return '知识库文档写入 R2 失败（' + key + '），请检查 R2 绑定与权限后重试；本次内容未保存。';
   const entry = {
     file: file,
     title: title,
