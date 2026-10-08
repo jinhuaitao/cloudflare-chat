@@ -38,7 +38,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.8.6';
+const APP_VERSION = '6.8.7';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -152,12 +152,20 @@ function hitRateLimit(request, env) {
     || (request.headers.get('X-Forwarded-For') || '').split(',')[0].trim()
     || 'unknown';
   const now = Date.now();
-  let arr = rateLimitMap.get(ip) || [];
-  arr = arr.filter(t => now - t < 60000);
+  let arr = rateLimitMap.get(ip);
+  if (arr) {
+    arr = arr.filter(t => now - t < 60000);
+    // v6.8.7：该 IP 的计数已全部过期则删 key，避免"僵尸 key"越积越多
+    // 顶满 5000 导致限流永久 fail-open
+    if (!arr.length) { rateLimitMap.delete(ip); arr = []; }
+  } else {
+    arr = [];
+  }
   if (arr.length >= perMin) return true;
   arr.push(now);
-  rateLimitMap.set(ip, arr);
-  if (rateLimitMap.size > 5000) rateLimitMap.clear(); // 防止 Map 无限增长
+  // v6.8.7：超限时淘汰最旧条目（mapSetBounded），不再 clear() 整个 Map——
+  // clear 会在高并发/攻击场景下让所有 IP 的计数瞬间归零，限流形同虚设
+  mapSetBounded(rateLimitMap, ip, arr, 5000);
   return false;
 }
 
@@ -205,7 +213,8 @@ function tgTrimHistory(history, env) {
 //   kb/agent_mem_<chatId>   知识库索引：长期记忆 JSON 数组 [{fact, ts, file}]（唯一可信源）
 //   kb/mem/<chatId>/*.md    知识库镜像：每条记忆一个 Markdown 文件（frontmatter + 正文），供控制台浏览
 //   kb/docs/<标题>.md       知识库文档：save_doc 工具写入的长篇 Markdown（全局共享）
-//   kb/docs/registry.json   文档注册表：标题/来源/大小/时间的索引（去重与列表的唯一依据，损坏自动重建）
+//   kb/docs/registry.json   文档注册表：标题/来源/大小/时间的索引缓存（v6.8.4 起仅为加速用，
+//                            真相以 kb/docs/ 下实际 md 文件为准；读取时自动比对数量并重建）
 //   tg_hist_<chatId>         Telegram 对话历史（根目录，保持原样）
 //   tg_user_<chatId>         用户模型选择（根目录，保持原样）
 //   agent_mode_<chatId>      Agent 开关（根目录，保持原样）
@@ -1231,7 +1240,11 @@ function parseDSMLToolCalls(content) {
       const name = nameM ? (nameM[1] !== undefined ? nameM[1] : nameM[2]) : '';
       if (!name) continue;
       const args = {};
-      const pRe = /<\s*[|｜]\s*DSML\s*[|｜]\s*parameter\b([^>]*)>([\s\S]*?)<\s*\/\s*[|｜]\s*DSML\s*[|｜]\s*parameter\s*>/g;
+      // v6.8.7：parameter 终止条件与 invoke 级保持一致，容忍 max_tokens 截断——
+      // 未闭合的参数取到文末（$）；前瞻排除"下一个 parameter 开标签"被吞进值的
+      // 畸形情况。之前强制要求闭合标签，截断时最后一个参数被静默丢弃
+      //（如 save_doc 的 content 丢失），与注释"未闭合的块都能容忍"矛盾。
+      const pRe = /<\s*[|｜]\s*DSML\s*[|｜]\s*parameter\b([^>]*)>([\s\S]*?)(?:<\s*\/\s*[|｜]\s*DSML\s*[|｜]\s*parameter\s*>|(?=<\s*[|｜]\s*DSML\s*[|｜]\s*parameter\b)|$)/g;
       let pm;
       while ((pm = pRe.exec(im[2]))) {
         const pnM = /\bname\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(pm[1] || '');
@@ -1285,7 +1298,12 @@ function truncateToolResult(result, maxChars) {
   const s = String(result == null ? '' : result);
   maxChars = maxChars > 0 ? maxChars : 4000;
   if (s.length <= maxChars) return s;
-  return s.slice(0, maxChars) + '\n…（结果过长，仅显示前 ' + maxChars + ' 字符）';
+  // v6.8.7：slice 按 UTF-16 码元计数，切点若落在 emoji 等增补字符的代理对中间，
+  // 会留下孤立高代理项导致下游显示 �；此时多退一位，保证字符完整
+  let cut = maxChars;
+  const last = s.charCodeAt(cut - 1);
+  if (last >= 0xD800 && last <= 0xDBFF) cut--;
+  return s.slice(0, cut) + '\n…（结果过长，仅显示前 ' + maxChars + ' 字符）';
 }
 
 // 工具调用签名：name + 规范化后的参数，用于检测模型是否在原地打转
@@ -1328,6 +1346,33 @@ function trimAgentMessages(messages, loopStartIdx, budget) {
   const out = [];
   for (let i = 0; i < arr.length; i++) if (!doomed.has(i)) out.push(arr[i]);
   return out;
+}
+
+// 带预算的响应体读取：错误响应体也可能超大（如上游网关吐整页 HTML），
+// 无上限 res.text() 会全量进内存。用流式读取截断，保证最多 maxChars 字符。
+async function readTextBudgeted(resp, maxChars) {
+  maxChars = maxChars > 0 ? maxChars : 2000;
+  try {
+    if (!resp || !resp.body || typeof resp.body.getReader !== 'function') {
+      const t = await resp.text();
+      return String(t || '').slice(0, maxChars);
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let out = '';
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        out += decoder.decode(value, { stream: true });
+        if (out.length >= maxChars) { out = out.slice(0, maxChars); break; }
+      }
+      out += decoder.decode();
+    } finally {
+      try { reader.cancel(); } catch (e) {}
+    }
+    return out.slice(0, maxChars);
+  } catch (e) { return ''; }
 }
 
 // ==================== Telegram Agent：主循环 ====================
@@ -1510,7 +1555,8 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
     }
 
     if (!resp.ok) {
-      const t = await resp.text().catch(() => '');
+      // v6.8.7：错误体带预算读取（最多 2KB），既满足 /tool/i 降级检测，又防超大错误页进内存
+      const t = await readTextBudgeted(resp, 2000);
       if (allowTools && /tool/i.test(t) && step === 0) return { fallback: true };
       return { error: 'API 报错 (' + resp.status + ')：' + String(t).slice(0, 500) };
     }
@@ -2351,6 +2397,13 @@ export default {
           await processTelegramUpdate(env, update, tgApi);
         } catch (err) {
           console.log("处理 Telegram 更新异常:", err);
+          // v6.8.7：处理抛异常时删除去重标记，Telegram 重发该 update 时可重试；
+          // 若 worker 硬崩溃（CPU 超时/OOM）未能返回 200，重发同样会走到这里重试。
+          // 注意不要改成"成功后才 set"——慢响应下 Telegram 重发会导致双重处理。
+          try {
+            const uid = update && update.update_id;
+            if (uid !== undefined && uid !== null) seenUpdateIds.delete(uid);
+          } catch (e) {}
         }
 
         return new Response('OK', { status: 200 });
