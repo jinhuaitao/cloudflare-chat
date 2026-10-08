@@ -38,7 +38,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.8.7';
+const APP_VERSION = '6.8.8';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -302,10 +302,25 @@ async function storePut(env, key, value) {
 
 // v6.8.3：带成功返回的 R2 写入。storePut 静默吞错，只用于"尽力而为"的场景；
 // 知识库/记忆写入必须诚实——没存上就要让 Agent 知道，而不是谎称成功。
+// v6.8.8：名副其实的 "checked"——put 成功后立即读回校验。
+// 背景：有用户反馈"机器人说已保存，但 R2 控制台看不到文件"。R2 的 put
+// resolve 即强一致落盘，理论上不存在"写成功但文件不存在"；但"put 没抛错"
+// 不等于"用户在控制台能看见"（如 Worker 绑定的 bucket 并非控制台正在看的
+// 那个）。读回校验让"已保存"三个字有真凭实据：读不到、大小对不上，就判失败，
+// 绝不谎称成功。顺带把"幽灵写入"（put 假成功）的最后一丝可能也掐掉。
 async function storePutChecked(env, key, value) {
   if (!env.R2) return false;
-  try { await env.R2.put(key, String(value)); return true; }
-  catch (e) { return false; }
+  const body = String(value);
+  const wantSize = kbUtf8Len(body);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await env.R2.put(key, body);
+      const back = await env.R2.get(key);
+      // R2Object.size 是字节数；读回存在且大小一致才算真写成功
+      if (back && back.size === wantSize) return true;
+    } catch (e) {}
+  }
+  return false;
 }
 
 async function storeDelete(env, key) {
@@ -1036,8 +1051,9 @@ async function toolSaveDoc(env, chatId, args) {
     + '\n---\n\n';
   const body = head + content;
   // v6.8.3：校验写入结果，R2 写入失败（如权限问题）不再谎称成功
+  // v6.8.8：storePutChecked 已是 put+读回双校验；失败消息给排查指引
   const okDoc = await storePutChecked(env, key, body);
-  if (!okDoc) return '知识库文档写入 R2 失败（' + key + '），请检查 R2 绑定与权限后重试；本次内容未保存。';
+  if (!okDoc) return '知识库文档写入 R2 失败（' + key + '，put 后读回校验未通过）。请检查：1) Worker 绑定的 R2 变量名是否为 R2；2) 绑定的 bucket 与 R2 控制台正在查看的是同一个 bucket；3) bucket 读写权限正常。本次内容未保存。';
   const entry = {
     file: file,
     title: safeTitle,
@@ -1049,7 +1065,7 @@ async function toolSaveDoc(env, chatId, args) {
   // （之前 kbSaveRegistry 静默吞错、并发 read-modify-write 丢更新，都会造成"已保存但查不到"。）
   const okReg = await kbUpsertDocEntry(env, entry);
   if (!okReg) return '知识库文档文件已写入 R2（' + key + '），但注册表更新确认失败（可能是并发冲突或 R2 写入异常）。请稍后用 list_docs 确认是否可见；若不可见，删除 kb/docs/registry.json 后任意一次列表操作会自动重建注册表。';
-  return '已保存为知识库文档：' + key + '（' + content.length + ' 字符' + (existed ? '，已覆盖旧版本' : '，新建') + '）';
+  return '已保存为知识库文档：' + key + '（' + content.length + ' 字符' + (existed ? '，已覆盖旧版本' : '，新建') + '；已从 R2 读回校验，文件真实存在）';
 }
 async function toolListDocs(env) {
   if (!env.R2) return 'R2 未绑定，无法读取知识库文档';
@@ -1199,7 +1215,7 @@ function buildAgentSystemPrompt(memories, query) {
   p += '【重要规则】\n'
     + '- 需要用户私密或实时信息时必须用工具核实，不要凭空猜测。\n'
     + '- remember 只用于用户明确要求记住的长期事实，不要把临时对话内容存进去。\n'
-    + '- save_doc 是唯一能写知识库文档的途径：只有它返回成功，才可以告诉用户"已保存/已生成文档"；没有调用成功就不许声称。长文档用 save_doc，不要用 remember 硬塞。\n'
+    + '- save_doc 是唯一能写知识库文档的途径：只有它返回成功（成功消息里带有"已从 R2 读回校验"字样），才可以告诉用户"已保存/已生成文档"；凡没看到这句成功消息，一律按失败处理，如实告诉用户没存上并贴出工具原话，绝不许用"已保存/已生成/已写入/新建"等任何同义表述美化失败。长文档用 save_doc，不要用 remember 硬塞。\n'
     + '- 知识库优先：read_doc 读到的文档内容优先于通用知识和训练记忆引用，引用时注明"据知识库文档《标题》"。\n'
     + '- 同一工具用相同参数反复调用没有意义：换关键词/换思路，仍无进展就基于已有信息直接回答。\n'
     + '- 当你觉得已经掌握足够信息，直接给出最终答案，不要为了调用工具而调用工具。';
