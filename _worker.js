@@ -38,7 +38,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.8.5';
+const APP_VERSION = '6.8.3';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -401,13 +401,13 @@ function getAgentTools() {
       type: 'function',
       function: {
         name: 'save_doc',
-        description: '把长篇内容保存为知识库文档，真实写入 R2 的 kb/docs/ 文件夹（文件名取自标题）。仅在用户明确要求保存文档（"保存成文档/存到知识库/生成知识库文件"）时调用；简短的个人信息用 remember，不要用它；不要主动为普通回答生成文档。只有本工具返回成功，才可以告诉用户"已保存/已生成"；失败或没调用时绝不声称已保存。去重规则（自动执行）：文件名相同（不分大小写）/来源链接相同→覆盖更新旧文档；内容完全相同→拒绝并提示；标题与现有文档高度相似→返回确认提示，按提示用完全相同的标题重试即为覆盖更新。',
+        description: '把长篇内容保存为知识库文档，真实写入 R2 的 kb/docs/ 文件夹（文件名取自标题）。仅在用户明确要求保存文档（"保存成文档/存到知识库/生成知识库文件"）时调用；简短的个人信息用 remember，不要用它；不要主动为普通回答生成文档。只有本工具返回成功，才可以告诉用户"已保存/已生成"；失败或没调用时绝不声称已保存。',
         parameters: {
           type: 'object',
           properties: {
             title: { type: 'string', description: '文档标题，用作文件名，如"甲骨文云ARM放货知识库"' },
             content: { type: 'string', description: 'Markdown 格式的正文' },
-            source: { type: 'string', description: '强烈建议填写：原文链接，用于去重（同一链接再次保存会自动覆盖更新旧文档而非新建），会记入文件头' }
+            source: { type: 'string', description: '可选：原文链接，会记入文件头' }
           },
           required: ['title', 'content']
         }
@@ -794,34 +794,6 @@ function kbDocSlug(title) {
 }
 // 原文链接归一化：去首尾空格、去末尾斜杠、转小写
 function kbNormSource(u) { return String(u || '').trim().replace(/\/+$/, '').toLowerCase(); }
-// ==================== v6.8.4 去重 helpers ====================
-// 内容哈希（djb2，非密码学用途，只做"完全相同内容"的去重判断）
-function kbHash(s) {
-  s = String(s == null ? '' : s);
-  let h = 5381;
-  for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
-  return h.toString(36);
-}
-// 标题归一化：小写、去掉空白与常见分隔符，用于相似度比较
-function kbNormTitle(t) {
-  return String(t || '').toLowerCase().replace(/[\s\-_.,，。、；;：:!?！？·・|/\\'"“”‘’()（）\[\]【】<>《》~～^$#@%*+=\n\r\t]+/g, '');
-}
-// 标题强相似：在注册表中找"归一化后一方包含另一方"的条目。
-// 限制短者≥6字符、长度比≥0.5，避免"a"包含于一切、或"Python笔记"vs"Python笔记进阶教程合集"
-// 这类弱相关被误判。命中只表示"疑似重复"，调用方应要求确认而非直接覆盖。
-function kbFindSimilarTitle(reg, title) {
-  const n = kbNormTitle(title);
-  if (!n || n.length < 6 || !Array.isArray(reg)) return null;
-  for (const e of reg) {
-    if (!e) continue;
-    const o = kbNormTitle(e.title || e.file || '');
-    if (!o || o.length < 6) continue;
-    const short = n.length <= o.length ? n : o;
-    const long = n.length <= o.length ? o : n;
-    if (long.indexOf(short) !== -1 && short.length / long.length >= 0.5) return e;
-  }
-  return null;
-}
 function kbDocTitleOf(key) {
   let t = String(key || '').slice(KB_DOCS_PREFIX.length);
   if (t.endsWith('.md')) t = t.slice(0, -3);
@@ -885,17 +857,7 @@ async function kbGetRegistry(env) {
     const obj = await env.R2.get(KB_REGISTRY_KEY);
     if (obj) {
       const p = JSON.parse(await obj.text());
-      if (Array.isArray(p)) {
-        // v6.8.4：过滤幽灵条目——用户可能在 R2 控制台手动删过文件，
-        // 否则 list_docs 会列出不存在的文档。失败时回退为不过滤。
-        try {
-          const objs = await kbListDocObjects(env);
-          const have = new Set(objs.map(o => o.key));
-          const filtered = p.filter(e => e && have.has(KB_DOCS_PREFIX + e.file));
-          if (filtered.length !== p.length) await kbSaveRegistry(env, filtered);
-          return filtered;
-        } catch (e2) { return p; }
-      }
+      if (Array.isArray(p)) return p;
     }
   } catch (e) {}
   // 缺失或损坏 → 自动重建（自愈）
@@ -931,60 +893,36 @@ async function toolSaveDoc(env, chatId, args) {
   if (!env.R2) return 'R2 未绑定，知识库文档无法保存。请先按 README 第二步绑定 R2 存储桶后再试；本次内容未保存。';
   if (content.length > 100000) content = content.slice(0, 100000) + '\n\n> （内容过长，仅保存前 10 万字符）';
   const file = kbDocSlug(title) + '.md';
+  const key = KB_DOCS_PREFIX + file;
   const reg = await kbGetRegistry(env);
+  // 同链接去重（O(1) 查注册表）：已存为另一篇文档时拒绝
   const normSrc = kbNormSource(args.source);
-  const contentHash = kbHash(content);
-  // v6.8.4 去重（按置信度从高到低，命中即视为"同一篇文档"处理）：
-  // 1) 文件名大小写不敏感相同 → 同一篇，原位覆盖（R2 key 大小写敏感，之前会产生重复文件）
-  // 2) 内容完全相同 → 重复保存，直接拒绝并指向已有文档
-  // 3) 来源链接相同 → 同一篇，自动覆盖更新（之前是拒绝，Agent 容易换个标题绕开去重，反而制造重复）
-  // 4) 标题高度相似 → 疑似重复，本次不保存，由调用方用完全相同的标题重试（覆盖）或换标题（新建）
-  let target = reg.find(e => e && String(e.file || '').toLowerCase() === file.toLowerCase()) || null;
-  let dedupHow = target ? '文件名相同' : '';
-  if (!target && contentHash) {
-    const dupContent = reg.find(e => e && e.hash && e.hash === contentHash);
-    if (dupContent) {
-      return '该内容与知识库文档《' + (dupContent.title || dupContent.file) + '》完全相同，未重复保存。';
+  if (normSrc) {
+    const dup = reg.find(e => kbNormSource(e.source) === normSrc);
+    if (dup && dup.file !== file) {
+      return '该链接已保存为知识库文档《' + (dup.title || dup.file) + '》，未重复保存。如需更新内容，请用完全相同的标题"' + (dup.title || dup.file) + '"重新保存以覆盖，或先用 delete_doc 删除旧文档。';
     }
   }
-  if (!target && normSrc) {
-    const dupSrc = reg.find(e => e && kbNormSource(e.source) === normSrc);
-    if (dupSrc) { target = dupSrc; dedupHow = '来源链接相同'; }
-  }
-  if (!target) {
-    const sim = kbFindSimilarTitle(reg, title);
-    if (sim) {
-      const simTitle = sim.title || sim.file;
-      return '检测到标题高度相似的已有文档《' + simTitle + '》（文件 ' + sim.file + '），本次未保存。'
-        + '如果这是同一篇文档的更新，请用完全相同的标题"' + simTitle + '"重新调用 save_doc 覆盖；'
-        + '如果确定是不同文档，请换一个更具区分度的标题后重试。现有文档可用 list_docs 查看。';
-    }
-  }
-  // 目标文件名：命中去重时沿用旧文件名原位覆盖（不因大小写差异产生新文件），否则用新标题生成
-  const targetFile = target ? target.file : file;
-  const targetKey = KB_DOCS_PREFIX + targetFile;
-  const existed = !!target;
+  const existed = reg.some(e => e.file === file);
   const head = '---\ntitle: "' + title.replace(/"/g, '') + '"\nsaved_at: ' + new Date().toISOString()
     + '\nchat_id: "' + kbSafeChatId(chatId) + '"'
     + (args.source ? '\nsource: ' + String(args.source).trim().slice(0, 500) : '')
     + '\n---\n\n';
   const body = head + content;
   // v6.8.3：校验写入结果，R2 写入失败（如权限问题）不再谎称成功
-  const okDoc = await storePutChecked(env, targetKey, body);
-  if (!okDoc) return '知识库文档写入 R2 失败（' + targetKey + '），请检查 R2 绑定与权限后重试；本次内容未保存。';
+  const okDoc = await storePutChecked(env, key, body);
+  if (!okDoc) return '知识库文档写入 R2 失败（' + key + '），请检查 R2 绑定与权限后重试；本次内容未保存。';
   const entry = {
-    file: targetFile,
+    file: file,
     title: title,
     source: String(args.source || '').trim().slice(0, 500),
     size: body.length,
-    hash: contentHash, // v6.8.4：内容哈希，用于"完全相同内容"的去重
     updated_at: new Date().toISOString()
   };
-  const idx = target ? reg.indexOf(target) : -1;
+  const idx = reg.findIndex(e => e.file === file);
   if (idx >= 0) reg[idx] = entry; else reg.push(entry);
   await kbSaveRegistry(env, reg);
-  return '已保存为知识库文档：' + targetKey + '（' + content.length + ' 字符' +
-    (existed ? '，已覆盖更新《' + (target.title || target.file) + '》' + (dedupHow ? '（' + dedupHow + '）' : '') : '，新建') + '）';
+  return '已保存为知识库文档：' + key + '（' + content.length + ' 字符' + (existed ? '，已覆盖旧版本' : '，新建') + '）';
 }
 async function toolListDocs(env) {
   if (!env.R2) return 'R2 未绑定，无法读取知识库文档';
@@ -1095,8 +1033,8 @@ function buildAgentSystemPrompt(memories, query) {
   p += '当前时间：' + timeStr + '（北京时间）。\n\n';
   p += '【工作方式】\n'
     + '1. 意图判断：闲聊、简单问答、你知识范围内的稳定知识——直接回答，绝不调用工具。工具是稀缺资源，能不用就不用。\n'
-    + '2. 工具选择：需要最新/实时信息（新闻、价格、赛事等）→ web_search，可换多个关键词搜索；想深入了解某条结果 → web_fetch 读原文；任何精确计算 → calculate（不要心算）；天气 → get_weather；时间 → get_time；用户明确告知的长期事实（偏好、生日、项目、城市等）→ remember；用户明确要求把长内容存成文档 → save_doc（批量保存前先 list_docs 看已有标题，标题与现有文档完全一致即覆盖更新，同一主题只存一篇，绝不换个标题重复保存；内容来自网页时务必填写 source 参数，同一链接再次保存会自动覆盖更新旧文档）；用户明确要求删除文档 → delete_doc；用户问题可能涉及知识库文档主题 → 先 list_docs 看标题，有相关再 read_doc 细读（标题想不起来时 read_doc 会自动搜正文），文档内容优先引用并注明"据知识库文档《xxx》"。\n'
-    + '3. 多步规划：允许先搜索再抓取、先计算再汇总，一次可并行调用多个工具；批量任务（用户一次给出多个网址/多个独立问题）必须一次并行调用多个工具批量处理，绝不能一个一个串行——单轮步骤预算只有约 6 步，串行一定做不完；但每次只规划接下来 1-2 步，拿到结果再决定下一步，不要一次规划过长链条。\n'
+    + '2. 工具选择：需要最新/实时信息（新闻、价格、赛事等）→ web_search，可换多个关键词搜索；想深入了解某条结果 → web_fetch 读原文；任何精确计算 → calculate（不要心算）；天气 → get_weather；时间 → get_time；用户明确告知的长期事实（偏好、生日、项目、城市等）→ remember；用户明确要求把长内容存成文档 → save_doc（同名覆盖即更新；同一网址只保存一次，勿换标题重复保存）；用户明确要求删除文档 → delete_doc；用户问题可能涉及知识库文档主题 → 先 list_docs 看标题，有相关再 read_doc 细读（标题想不起来时 read_doc 会自动搜正文），文档内容优先引用并注明"据知识库文档《xxx》"。\n'
+    + '3. 多步规划：允许先搜索再抓取、先计算再汇总，一次可并行调用多个工具；但每次只规划接下来 1-2 步，拿到结果再决定下一步，不要一次规划过长链条。\n'
     + '4. 诚实：工具没给的信息绝不编造；搜索无结果就直说。\n'
     + '5. 语言：默认用中文回答（用户用其他语言时跟随用户语言）。\n'
     + '6. 含糊处理：问题缺少关键信息且工具无法补足时（如查天气没说城市），用一句话追问，不要猜测调用工具。\n'
@@ -1330,18 +1268,6 @@ async function agentClearResumeState(env, chatId) {
   try { await storeDelete(env, tgAgentResumeKey(chatId)); } catch (e) {}
 }
 
-// v6.8.5：判断用户消息是否为"继续做之前暂停任务"的意图。
-// 显式"继续"走主分支；催促类短消息（?/好了吗/怎么样了…）也视为继续——
-// 调用方仅在存在未过期断点时才恢复任务，否则按普通消息处理。
-function isResumeNudge(text) {
-  const t = String(text || '').trim();
-  // "继续"只认本体+语气词，避免"继续教育是什么"这类真问题被误判
-  if (/^继续([吧啊呀嘛呢]|一下)?$/.test(t)) return true;
-  if (/^[?？]+$/.test(t)) return true;
-  if (/^(好了|好了吗|好了没|怎么样|怎么样了|如何了|进度|进度如何|快了吗|快好了吗)$/.test(t)) return true;
-  return false;
-}
-
 function tgAgentDeadline(env, opts) {
   let timeoutMs = agentLimits(env).timeoutMs;
   // webhook 场景传入 maxRuntimeMs：HTTP 响应必须在 Telegram 因超时重发 update
@@ -1407,7 +1333,7 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       });
     }
     if (saved) {
-      return { text: '⏸️ 任务较长，已暂停并保存进度，发送「继续」（或 ?）让我接着做。' + (t ? '\n\n已产出：\n' + t : ''), usedTools: true, paused: true };
+      return { text: '⏸️ 任务较长，已暂停并保存进度，发送「继续」让我接着做。' + (t ? '\n\n已产出：\n' + t : ''), usedTools: true, paused: true };
     }
     return { text: '（本次任务超时，已停止）' + (t ? '\n\n' + t : ''), usedTools: true };
   };
@@ -1558,7 +1484,7 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       loopStartIdx: loopStartIdx
     });
     if (saved) {
-      return { text: '⏸️ 推理步数已用尽，进度已保存，发送「继续」（或 ?）让我接着做。' + (t ? '\n\n已产出：\n' + t : ''), usedTools: true, paused: true };
+      return { text: '⏸️ 推理步数已用尽，进度已保存，发送「继续」让我接着做。' + (t ? '\n\n已产出：\n' + t : ''), usedTools: true, paused: true };
     }
   }
   return { text: t || '（思考步数已用尽，请换个问法重试）', usedTools: true };
@@ -2109,14 +2035,9 @@ export default {
                   } catch (e) {}
                 };
                 // 「继续」：恢复上次暂停的任务；新问题则清掉旧暂停状态
-                // v6.8.5：把常见的催促也视为"继续"。用户发"?"时大概率是在催暂停中的任务，
-                // 若此时按新问题处理清掉断点，已抓取的进度会丢失、任务从头重做（用户会看到无限"正在读取网页"）。
-                // 只有当没有任何未过期断点时，催促消息才按普通新问题处理。
-                const trimmedText = userText.trim();
+                const wantResume = /^继续/.test(userText.trim());
                 let resumeState = null;
-                if (isResumeNudge(trimmedText)) {
-                  resumeState = await agentLoadResumeState(env, chatId);
-                }
+                if (wantResume) resumeState = await agentLoadResumeState(env, chatId);
                 if (!resumeState) await agentClearResumeState(env, chatId);
                 const runAgentTurn = (allowTools) => {
                   if (resumeState) {
