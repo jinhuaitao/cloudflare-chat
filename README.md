@@ -1,6 +1,6 @@
 # Cloudflare-Chat
 
-基于 Cloudflare Workers 的多通道 AI 对话前端 + Telegram 机器人。单文件 Worker（`_worker.js`），通过 `wrangler.toml` 声明式配置，支持连接 GitHub 仓库自动构建部署。当前版本 v6.8.4。
+基于 Cloudflare Workers 的多通道 AI 对话前端 + Telegram 机器人。单文件 Worker（`_worker.js`），通过 `wrangler.toml` 声明式配置，支持连接 GitHub 仓库自动构建部署。当前版本 v6.8.5。
 
 ## 功能一览
 
@@ -290,6 +290,12 @@ https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=https://<你的Work
 ---
 
 # 常见问题
+
+**长任务（批量存文档等）中途停住、发"?"后从头重做**
+
+Telegram 的 webhook 约 55 秒无响应会重发，超时的 Agent 任务会自动暂停并保存进度，回一条"⏸️ 发送「继续」（或 ?）让我接着做"。直接发 `继续` 或 `?` 即可接着做（v6.8.5 起 `?` / `好了吗` 这类催促也会被识别为继续，不会再把进度清掉重做）。注意 6 步推理用尽也会暂停，同理发送"继续"即可。
+
+批量抓取多个网页时，Agent 已被提示一次性并行抓取；若模型仍串行导致反复暂停，多发几次"继续"即可走完，上下文裁剪会保证 token 不爆炸。
 
 **Agent 说"已保存"但 R2 里看不到知识库文档**
 

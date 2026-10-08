@@ -38,7 +38,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.8.4';
+const APP_VERSION = '6.8.5';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -1096,7 +1096,7 @@ function buildAgentSystemPrompt(memories, query) {
   p += '【工作方式】\n'
     + '1. 意图判断：闲聊、简单问答、你知识范围内的稳定知识——直接回答，绝不调用工具。工具是稀缺资源，能不用就不用。\n'
     + '2. 工具选择：需要最新/实时信息（新闻、价格、赛事等）→ web_search，可换多个关键词搜索；想深入了解某条结果 → web_fetch 读原文；任何精确计算 → calculate（不要心算）；天气 → get_weather；时间 → get_time；用户明确告知的长期事实（偏好、生日、项目、城市等）→ remember；用户明确要求把长内容存成文档 → save_doc（批量保存前先 list_docs 看已有标题，标题与现有文档完全一致即覆盖更新，同一主题只存一篇，绝不换个标题重复保存；内容来自网页时务必填写 source 参数，同一链接再次保存会自动覆盖更新旧文档）；用户明确要求删除文档 → delete_doc；用户问题可能涉及知识库文档主题 → 先 list_docs 看标题，有相关再 read_doc 细读（标题想不起来时 read_doc 会自动搜正文），文档内容优先引用并注明"据知识库文档《xxx》"。\n'
-    + '3. 多步规划：允许先搜索再抓取、先计算再汇总，一次可并行调用多个工具；但每次只规划接下来 1-2 步，拿到结果再决定下一步，不要一次规划过长链条。\n'
+    + '3. 多步规划：允许先搜索再抓取、先计算再汇总，一次可并行调用多个工具；批量任务（用户一次给出多个网址/多个独立问题）必须一次并行调用多个工具批量处理，绝不能一个一个串行——单轮步骤预算只有约 6 步，串行一定做不完；但每次只规划接下来 1-2 步，拿到结果再决定下一步，不要一次规划过长链条。\n'
     + '4. 诚实：工具没给的信息绝不编造；搜索无结果就直说。\n'
     + '5. 语言：默认用中文回答（用户用其他语言时跟随用户语言）。\n'
     + '6. 含糊处理：问题缺少关键信息且工具无法补足时（如查天气没说城市），用一句话追问，不要猜测调用工具。\n'
@@ -1330,6 +1330,18 @@ async function agentClearResumeState(env, chatId) {
   try { await storeDelete(env, tgAgentResumeKey(chatId)); } catch (e) {}
 }
 
+// v6.8.5：判断用户消息是否为"继续做之前暂停任务"的意图。
+// 显式"继续"走主分支；催促类短消息（?/好了吗/怎么样了…）也视为继续——
+// 调用方仅在存在未过期断点时才恢复任务，否则按普通消息处理。
+function isResumeNudge(text) {
+  const t = String(text || '').trim();
+  // "继续"只认本体+语气词，避免"继续教育是什么"这类真问题被误判
+  if (/^继续([吧啊呀嘛呢]|一下)?$/.test(t)) return true;
+  if (/^[?？]+$/.test(t)) return true;
+  if (/^(好了|好了吗|好了没|怎么样|怎么样了|如何了|进度|进度如何|快了吗|快好了吗)$/.test(t)) return true;
+  return false;
+}
+
 function tgAgentDeadline(env, opts) {
   let timeoutMs = agentLimits(env).timeoutMs;
   // webhook 场景传入 maxRuntimeMs：HTTP 响应必须在 Telegram 因超时重发 update
@@ -1395,7 +1407,7 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       });
     }
     if (saved) {
-      return { text: '⏸️ 任务较长，已暂停并保存进度，发送「继续」让我接着做。' + (t ? '\n\n已产出：\n' + t : ''), usedTools: true, paused: true };
+      return { text: '⏸️ 任务较长，已暂停并保存进度，发送「继续」（或 ?）让我接着做。' + (t ? '\n\n已产出：\n' + t : ''), usedTools: true, paused: true };
     }
     return { text: '（本次任务超时，已停止）' + (t ? '\n\n' + t : ''), usedTools: true };
   };
@@ -1546,7 +1558,7 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       loopStartIdx: loopStartIdx
     });
     if (saved) {
-      return { text: '⏸️ 推理步数已用尽，进度已保存，发送「继续」让我接着做。' + (t ? '\n\n已产出：\n' + t : ''), usedTools: true, paused: true };
+      return { text: '⏸️ 推理步数已用尽，进度已保存，发送「继续」（或 ?）让我接着做。' + (t ? '\n\n已产出：\n' + t : ''), usedTools: true, paused: true };
     }
   }
   return { text: t || '（思考步数已用尽，请换个问法重试）', usedTools: true };
@@ -2097,9 +2109,14 @@ export default {
                   } catch (e) {}
                 };
                 // 「继续」：恢复上次暂停的任务；新问题则清掉旧暂停状态
-                const wantResume = /^继续/.test(userText.trim());
+                // v6.8.5：把常见的催促也视为"继续"。用户发"?"时大概率是在催暂停中的任务，
+                // 若此时按新问题处理清掉断点，已抓取的进度会丢失、任务从头重做（用户会看到无限"正在读取网页"）。
+                // 只有当没有任何未过期断点时，催促消息才按普通新问题处理。
+                const trimmedText = userText.trim();
                 let resumeState = null;
-                if (wantResume) resumeState = await agentLoadResumeState(env, chatId);
+                if (isResumeNudge(trimmedText)) {
+                  resumeState = await agentLoadResumeState(env, chatId);
+                }
                 if (!resumeState) await agentClearResumeState(env, chatId);
                 const runAgentTurn = (allowTools) => {
                   if (resumeState) {
