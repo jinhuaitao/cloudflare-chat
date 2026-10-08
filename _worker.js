@@ -38,7 +38,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.8.3';
+const APP_VERSION = '6.8.4';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -772,12 +772,15 @@ async function agentForgetMemory(env, chatId, keyword) {
   return { removed };
 }
 
-// ==================== 知识库文档（v6.8.0 重构）：注册表方案 ====================
-// kb/docs/registry.json 是文档的唯一注册表：[{file, title, source, size, updated_at}]。
+// ==================== 知识库文档（v6.8.0 重构，v6.8.4 加固）：注册表方案 ====================
+// kb/docs/registry.json 是文档注册表：[{file, title, source, size, updated_at}]。
 // save / list / read / delete 全部走注册表：去重与列表都是 O(1)，不再逐篇扫描 frontmatter。
-// 注册表缺失或损坏时自动扫描 kb/docs/ 重建（自愈）；registry.json 本身永不计入文档。
+// 注册表缺失/损坏/与实际文件数不一致时自动扫描 kb/docs/ 重建（自愈）；registry.json 本身永不计入文档。
 // 文件名仍为 kb/docs/<标题>.md（标题清洗，中文保留）。
-// 注意：注册表更新是 read-modify-write，极端并发下可能丢失一次更新；个人单用户场景可接受。
+// v6.8.4：注册表是 R2 实际文件的"缓存"而非绝对真理——kbGetRegistry 每次读取都比对对象数，
+// 不一致即重建，因此任何丢失的更新都会在下一次读取时自愈，"已保存但查不到"不可能长期存在。
+// 写入侧 kbUpsertDocEntry / kbRemoveDocEntry 做"写入后重读校验 + 最多 3 次重试"，
+// 确认失败则如实报错，绝不谎称"已保存/已删除"。
 const KB_DOCS_PREFIX = KB_PREFIX + 'docs/';
 const KB_REGISTRY_KEY = KB_DOCS_PREFIX + 'registry.json';
 
@@ -853,19 +856,67 @@ async function kbRebuildRegistry(env) {
 }
 async function kbGetRegistry(env) {
   if (!env.R2) return [];
+  let reg = null;
   try {
     const obj = await env.R2.get(KB_REGISTRY_KEY);
     if (obj) {
       const p = JSON.parse(await obj.text());
-      if (Array.isArray(p)) return p;
+      if (Array.isArray(p)) reg = p;
     }
   } catch (e) {}
   // 缺失或损坏 → 自动重建（自愈）
-  return await kbRebuildRegistry(env);
+  if (!reg) return await kbRebuildRegistry(env);
+  // v6.8.4：注册表只是 R2 实际文件的"缓存"，不是绝对真理——每次读取时与 kb/docs/
+  // 下实际对象数比对；不一致说明有更新丢失（并发写覆盖 / 写入失败 / 控制台手动增删），
+  // 立即扫描重建自愈。代价是一次 R2 list（个人用量可忽略），换来"已保存但查不到"不可能长期存在。
+  try {
+    const objs = await kbListDocObjects(env);
+    if (objs.length !== reg.length) return await kbRebuildRegistry(env);
+  } catch (e) {}
+  return reg;
 }
 async function kbSaveRegistry(env, reg) {
-  if (!env.R2) return;
-  try { await env.R2.put(KB_REGISTRY_KEY, JSON.stringify(reg)); } catch (e) {}
+  // v6.8.4：返回写入是否成功。之前静默吞错，调用方无从得知注册表没写上，
+  // 导致"已保存"但文档在列表/读取/删除中全部隐身。
+  if (!env.R2) return false;
+  try { await env.R2.put(KB_REGISTRY_KEY, JSON.stringify(reg)); return true; }
+  catch (e) { return false; }
+}
+// UTF-8 字节长度：R2 对象大小与 kbFmtSize 显示都按字节计；
+// 之前用 body.length（UTF-16 代码单元数），中文文档会被低估约 3 倍。
+function kbUtf8Len(s) {
+  try { return new TextEncoder().encode(String(s == null ? '' : s)).length; }
+  catch (e) { return String(s == null ? '' : s).length; }
+}
+// 注册表 upsert（写入后校验 + 重试）：
+// R2 无事务，read-modify-write 在并发下可能丢失更新；写完后重读确认条目确实存在
+// （用 updated_at 比对，防读到并发写入的旧版本），丢失则用最新注册表重试，最多 3 次。
+// 全部失败返回 false，调用方必须如实报错、不得谎称成功。
+async function kbUpsertDocEntry(env, entry) {
+  if (!env.R2 || !entry || !entry.file) return false;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const reg = await kbGetRegistry(env);
+    const idx = reg.findIndex(e => e && e.file === entry.file);
+    if (idx >= 0) reg[idx] = entry; else reg.push(entry);
+    if (!(await kbSaveRegistry(env, reg))) continue;
+    const reg2 = await kbGetRegistry(env);
+    const hit = reg2.find(e => e && e.file === entry.file);
+    if (hit && hit.updated_at === entry.updated_at) return true;
+    // 校验未通过（并发覆盖或写入未生效）→ 用最新注册表重试
+  }
+  return false;
+}
+// 注册表删除条目（写入后校验 + 重试），语义同 kbUpsertDocEntry
+async function kbRemoveDocEntry(env, file) {
+  if (!env.R2 || !file) return false;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const reg = await kbGetRegistry(env);
+    const next = reg.filter(e => e && e.file !== file);
+    if (!(await kbSaveRegistry(env, next))) continue;
+    const reg2 = await kbGetRegistry(env);
+    if (!reg2.some(e => e && e.file === file)) return true;
+  }
+  return false;
 }
 // 注册表内模糊查找：标题精确相等 > 标题包含 > 文件名包含（大小写不敏感）
 function kbFindRegEntry(reg, query) {
@@ -904,9 +955,14 @@ async function toolSaveDoc(env, chatId, args) {
     }
   }
   const existed = reg.some(e => e.file === file);
-  const head = '---\ntitle: "' + title.replace(/"/g, '') + '"\nsaved_at: ' + new Date().toISOString()
+  // v6.8.4：标题/来源里的换行符会破坏 frontmatter 结构（重建时解析错乱），先清洗；
+  // 同一时间戳同时用于 frontmatter saved_at 与注册表 updated_at，保证重建校验一致。
+  const safeTitle = title.replace(/[\r\n]+/g, ' ');
+  const safeSource = String(args.source || '').trim().replace(/[\r\n]+/g, ' ').slice(0, 500);
+  const now = new Date().toISOString();
+  const head = '---\ntitle: "' + safeTitle.replace(/"/g, '') + '"\nsaved_at: ' + now
     + '\nchat_id: "' + kbSafeChatId(chatId) + '"'
-    + (args.source ? '\nsource: ' + String(args.source).trim().slice(0, 500) : '')
+    + (safeSource ? '\nsource: ' + safeSource : '')
     + '\n---\n\n';
   const body = head + content;
   // v6.8.3：校验写入结果，R2 写入失败（如权限问题）不再谎称成功
@@ -914,14 +970,15 @@ async function toolSaveDoc(env, chatId, args) {
   if (!okDoc) return '知识库文档写入 R2 失败（' + key + '），请检查 R2 绑定与权限后重试；本次内容未保存。';
   const entry = {
     file: file,
-    title: title,
-    source: String(args.source || '').trim().slice(0, 500),
-    size: body.length,
-    updated_at: new Date().toISOString()
+    title: safeTitle,
+    source: safeSource,
+    size: kbUtf8Len(body),
+    updated_at: now
   };
-  const idx = reg.findIndex(e => e.file === file);
-  if (idx >= 0) reg[idx] = entry; else reg.push(entry);
-  await kbSaveRegistry(env, reg);
+  // v6.8.4：注册表更新带写入后校验 + 重试；确认失败则如实报错，不谎称"已保存"。
+  // （之前 kbSaveRegistry 静默吞错、并发 read-modify-write 丢更新，都会造成"已保存但查不到"。）
+  const okReg = await kbUpsertDocEntry(env, entry);
+  if (!okReg) return '知识库文档文件已写入 R2（' + key + '），但注册表更新确认失败（可能是并发冲突或 R2 写入异常）。请稍后用 list_docs 确认是否可见；若不可见，删除 kb/docs/registry.json 后任意一次列表操作会自动重建注册表。';
   return '已保存为知识库文档：' + key + '（' + content.length + ' 字符' + (existed ? '，已覆盖旧版本' : '，新建') + '）';
 }
 async function toolListDocs(env) {
@@ -989,7 +1046,9 @@ async function toolDeleteDoc(env, args) {
       reg.map(e => '- ' + (e.title || e.file)).join('\n');
   }
   try { await env.R2.delete(KB_DOCS_PREFIX + hit.file); } catch (e) { return '删除失败：' + (hit.title || hit.file); }
-  await kbSaveRegistry(env, reg.filter(e => e !== hit));
+  // v6.8.4：注册表删除带写入后校验 + 重试；失败则如实告知，避免"已删除"但列表里残留幽灵条目
+  const okReg = await kbRemoveDocEntry(env, hit.file);
+  if (!okReg) return '文档文件已删除，但注册表更新确认失败。请稍后用 list_docs 确认；若仍显示该文档，删除 kb/docs/registry.json 可触发自动重建。';
   return '已删除知识库文档《' + (hit.title || hit.file) + '》';
 }
 

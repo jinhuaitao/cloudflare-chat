@@ -1,6 +1,6 @@
 # Cloudflare-Chat
 
-基于 Cloudflare Workers 的多通道 AI 对话前端 + Telegram 机器人。单文件 Worker（`_worker.js`），通过 `wrangler.toml` 声明式配置，支持连接 GitHub 仓库自动构建部署。当前版本 v6.8.3。
+基于 Cloudflare Workers 的多通道 AI 对话前端 + Telegram 机器人。单文件 Worker（`_worker.js`），通过 `wrangler.toml` 声明式配置，支持连接 GitHub 仓库自动构建部署。当前版本 v6.8.4。
 
 ## 功能一览
 
@@ -294,9 +294,9 @@ https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=https://<你的Work
 **Agent 说"已保存"但 R2 里看不到知识库文档**
 
 按顺序排查：
-1. 先确认部署的版本：给机器人发 `/help`，看版本号是不是 v6.8.3+。v6.8.2 及更早版本在 R2 未绑定时会谎称"已保存"（v6.8.3 起会明确报错）。
+1. 先确认部署的版本：给机器人发 `/help`，看版本号是不是 v6.8.4+。v6.8.2 及更早版本在 R2 未绑定时会谎称"已保存"（v6.8.3 起会明确报错）；v6.8.3 及更早版本在**并发保存或注册表写入失败时仍可能"已保存但查不到"**（v6.8.4 起注册表更新带写入后校验 + 重试，确认失败会如实报错）。
 2. 给机器人发 `/kb`：如果回复"R2 未绑定"，说明 Worker 没有 R2 绑定——去 Cloudflare 控制台 Workers & Pages → 你的 Worker → 设置 → 绑定，确认 R2 存储桶已绑定（变量名必须是 `R2`），然后重新部署。
-3. R2 控制台确认 bucket 里有 `kb/docs/` 前缀的对象。注意文件名是标题去掉空格和特殊字符后的结果（如标题"甲骨文云 ARM"存为 `甲骨文云ARM.md`），用 `/kb` 看到的标题列表为准。
+3. R2 控制台确认 bucket 里有 `kb/docs/` 前缀的对象。注意文件名是标题去掉空格和特殊字符后的结果（如标题"甲骨文云 ARM"存为 `甲骨文云ARM.md`），用 `/kb` 看到的标题列表为准。**如果 R2 里有文件但 `/kb` / `list_docs` 看不到**：说明注册表丢了该条目（旧版本并发 bug），直接删除 `kb/docs/registry.json`，下一次列表操作会自动扫描重建。
 4. 如果曾在 v6.8.1 遇到过 `loopStartIdx is not defined` 报错：那次 Agent 是中途崩溃的，工具可能没执行完，重试一次即可（v6.8.2 已修复）。
 
 **部署日志报 `Missing id` 或要求交互式输入**
