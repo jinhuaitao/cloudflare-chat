@@ -38,7 +38,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.8.4';
+const APP_VERSION = '6.8.5';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -1408,9 +1408,10 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
   for (let step = 0; step < maxSteps; step++) {
     if (Date.now() > deadline) return await pauseForResume();
     const stepLabel = '🤖 Agent 思考中' + (isResume ? '（继续）' : '') + '（第 ' + (step + 1) + ' 步）…';
-    // 每步开始先报进度：LLM 长思考时用户也能看到活着
+    // 每步开始先报进度：LLM 长思考时用户也能看到活着。
+    // v6.8.5：步骤标签走独立节流通道（isStep=true），不被上一步的 force 工具进度吞掉。
     if (typeof onProgress === 'function') {
-      try { await onProgress(stepLabel); } catch (e) {}
+      try { await onProgress(stepLabel, false, true); } catch (e) {}
     }
     // 长推理时保持 typing 状态不消失
     try { tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {}); } catch (e) {}
@@ -2083,11 +2084,21 @@ export default {
               if (useAgent) {
                 // Agent 模式：ReAct 多步推理 + 工具调用（进度实时编辑到 pending 消息上）
                 let lastProgressEdit = 0;
-                const onProgress = async (text, force) => {
+                let lastStepEdit = 0;
+                // v6.8.5：步骤标签与工具进度用独立节流通道。之前共用 lastProgressEdit，
+                // 工具进度（force 突破节流）会连带吞掉"第 N+1 步"的标签编辑——工具执行
+                // 很快（save_doc 只要几十毫秒），用户就会一直看到上一步的"💾 正在保存文档"，
+                // 而 Agent 实际已进入下一步等待上游 LLM（推理模型可达数分钟），造成"卡住"假象。
+                const onProgress = async (text, force, isStep) => {
                   if (!pendingMsgId) return;
                   const now = Date.now();
-                  if (!force && now - lastProgressEdit < 1500) return; // Telegram 编辑限流，节流；工具进度用 force 突破
-                  lastProgressEdit = now;
+                  if (isStep) {
+                    if (now - lastStepEdit < 1500) return;
+                    lastStepEdit = now;
+                  } else {
+                    if (!force && now - lastProgressEdit < 1500) return; // Telegram 编辑限流，节流；工具进度用 force 突破
+                    lastProgressEdit = now;
+                  }
                   try {
                     // 纯文本，不加 parse_mode，避免搜索词里的 Markdown 特殊字符导致编辑失败
                     await tgApi('editMessageText', { chat_id: chatId, message_id: pendingMsgId, text: String(text).slice(0, 4000) });
