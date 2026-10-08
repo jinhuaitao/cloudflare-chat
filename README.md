@@ -1,6 +1,6 @@
 # Cloudflare-Chat
 
-基于 Cloudflare Workers 的多通道 AI 对话前端 + Telegram 机器人。单文件 Worker（`_worker.js`），通过 `wrangler.toml` 声明式配置，支持连接 GitHub 仓库自动构建部署。当前版本 v6.8.3。
+基于 Cloudflare Workers 的多通道 AI 对话前端 + Telegram 机器人。单文件 Worker（`_worker.js`），通过 `wrangler.toml` 声明式配置，支持连接 GitHub 仓库自动构建部署。当前版本 v6.8.4。
 
 ## 功能一览
 
@@ -378,6 +378,8 @@ const rx = p => p.split('@').join(BS);   // 用 @ 占位，运行时展开成反
 - **`/tg-webhook` 来源校验**：配置 `TG_WEBHOOK_SECRET` 后，只接受 `setWebhook` 时传入相同 `secret_token` 的请求。**未配置时任何人都能 POST 伪造 update、烧你的 API 配额并污染知识库**（兼容旧部署才保持开放）；公开使用时必须配置。未配置时服务端会在日志里打一次 ⚠️ 告警（`wrangler tail` 可见）。
 - **Telegram 聊天白名单（v6.8.1 新增）**：配置 `TG_ALLOWED_CHAT_IDS`（逗号分隔的 chat id，只填你自己的）后，机器人只响应名单内的聊天，其他一律静默忽略。个人自用强烈建议配置——否则任何陌生人私聊机器人都能烧你的 key。
 - **Agent `web_fetch` 的 SSRF 防护（v6.8.1 新增）**：拦截内网 / 本机回环 / 链路本地（169.254.x）/ 云元数据地址及 `localhost` 等危险主机名，防止 Worker 被当成代理。但 Workers 拿不到底层 DNS，DNS 重绑定类攻击仍需在前置 WAF 层封堵。
+- **知识库写入诚实化（v6.8.3 新增）**：R2 未绑定或写入失败时，`save_doc` / `remember` 会明确报错而不再谎称"已保存/已记住"。
+- **知识库去重（v6.8.4 新增）**：`save_doc` 按置信度自动去重——文件名相同（不分大小写）/来源链接相同→覆盖更新旧文档；内容完全相同→拒绝并提示；标题高度相似→返回确认提示（用完全相同的标题重试即覆盖）。R2 控制台手动删除文件后，注册表下次读取时自动剔除幽灵条目。
 - **AI 回复经 XSS 清洗**：前端所有 AI 生成内容先经 Markdown 渲染，再过 DOMPurify 白名单清洗后才插入页面；CDN 加载失败时降级为纯文本显示。
 - **CORS 为 `*`**：`Access-Control-Allow-Origin: *` 允许任意站点调用你的接口。如果只在自己的域名下使用，建议收紧为实际域名。
 - **API Key 只存在于服务端**：密钥通过环境变量注入，不会下发到浏览器，前端只能看到模型名称。
