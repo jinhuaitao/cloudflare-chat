@@ -38,7 +38,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.8.5';
+const APP_VERSION = '6.8.6';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -175,15 +175,21 @@ function tgTrimHistory(history, env) {
   if (!(maxRounds > 0)) maxRounds = 10;
   if (maxRounds > 30) maxRounds = 30;
   const maxMsgs = maxRounds * 2;
-  while (history.length > maxMsgs) history.shift();
+  // v6.8.6：成对裁剪——之前单条 shift() 会把 user 丢掉却留下对应的 assistant 回复，
+  // 历史以"没有问题的回答"开头，污染上游 LLM 上下文
+  while (history.length > maxMsgs) { history.shift(); history.shift(); }
   // 字符预算：超长历史从最旧开始丢弃，保证单次请求可控
   const budget = 12000;
   let total = 0;
   for (let i = 0; i < history.length; i++) total += String(history[i].content || '').length;
   while (history.length > 2 && total > budget) {
-    const dropped = history.shift();
-    total -= String(dropped.content || '').length;
+    for (let k = 0; k < 2 && history.length > 2; k++) {
+      const dropped = history.shift();
+      total -= String(dropped.content || '').length;
+    }
   }
+  // 兜底：首条恒为 user（奇数条历史裁剪后可能剩 assistant 开头）
+  if (history.length && history[0].role === 'assistant') history.shift();
   return history;
 }
 // ==================== 持久化层：R2 ====================
@@ -485,21 +491,34 @@ async function execAgentTool(name, args, env, chatId) {
 // DuckDuckGo HTML 结果解析（抽出以便测试）
 function parseDuckDuckGo(html, count) {
   const out = [];
-  const re = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
-  // 摘要与标题在页面中按相同顺序出现，按序配对
-  const snips = [];
-  const reSnip = /<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
-  let sm;
-  while ((sm = reSnip.exec(html)) && snips.length < count) {
-    snips.push(sm[1].replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200));
-  }
+  // v6.8.6：标题与摘要按"文档位置就近配对"。之前分两个独立循环收集再按下标配对，
+  // 一旦某条结果被过滤（标题为空/链接非法），后续摘要整体错位、张冠李戴。
+  // 标题正则另用前瞻断言，不再假定 class 必在 href 之前。
+  const linkRe = /<a(?=[^>]*class="result__a")[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+  const snipRe = /<a(?=[^>]*class="result__snippet")[^>]*>([\s\S]*?)<\/a>/g;
+  const links = [];
   let m;
-  while ((m = re.exec(html)) && out.length < count) {
+  while ((m = linkRe.exec(html))) {
     let href = m[1];
     const uddg = href.match(/[?&]uddg=([^&]+)/);
     try { if (uddg) href = decodeURIComponent(uddg[1]); } catch (e) {}
     const title = m[2].replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-    if (title && href && href.startsWith('http')) out.push({ title, url: href, snip: snips[out.length] || '' });
+    if (!title || !href || !href.startsWith('http')) continue;
+    links.push({ url: href, title: title, idx: m.index });
+    if (links.length >= count) break;
+  }
+  const snips = [];
+  while ((m = snipRe.exec(html)) && snips.length < 50) {
+    snips.push({
+      text: m[1].replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200),
+      idx: m.index
+    });
+  }
+  for (let i = 0; i < links.length && out.length < count; i++) {
+    const L = links[i];
+    const nextIdx = i + 1 < links.length ? links[i + 1].idx : Infinity;
+    const snip = snips.find(s => s.idx > L.idx && s.idx < nextIdx);
+    out.push({ title: L.title, url: L.url, snip: snip ? snip.text : '' });
   }
   return out;
 }
@@ -538,7 +557,8 @@ async function toolWebSearch(query, count) {
 // 残余风险：DNS 重绑定（域名先解析到公网、TTL 过期后指向内网）。Workers 无法在建连时
 // 做二次校验，如需彻底封堵请在前置 WAF / 出站代理层限制。
 function isBlockedFetchHost(hostname) {
-  const h = String(hostname || '').toLowerCase();
+  // v6.8.6：去尾点——"localhost." 是合法 FQDN 写法，之前可绕过全部主机名黑名单
+  const h = String(hostname || '').toLowerCase().replace(/\.+$/, '');
   if (!h) return true;
   // —— 危险主机名 ——
   if (h === 'localhost' || h.endsWith('.localhost')) return true;
@@ -573,8 +593,13 @@ function isBlockedFetchHost(hostname) {
     if (flat === '1') return true;            // ::1 回环
     if (/^fe[89ab]/.test(flat)) return true;  // fe80::/10 链路本地
     if (/^(fc|fd)/.test(flat)) return true;   // fc00::/7 唯一本地
-    if (flat.startsWith('ffff') && flat.length >= 12) { // ::ffff:a.b.c.d 纯十六进制形式
-      const hex = flat.slice(-8);
+    // v6.8.6：::ffff:0:0/96 段内的 IPv4 映射地址。WHATWG URL 总输出压缩形式
+    // （如 http://[::ffff:7f00:1]/ → hostname "[::ffff:7f00:1]"），旧的扁平字符串
+    // 启发式（flat.length >= 12）在此失效。取末 32 位按 IPv4 再判一次；
+    // 点分十进制混合写法（::ffff:127.0.0.1）已由上面的 tail 分支处理。
+    const mMapped = h6.match(/^::ffff:([0-9a-f]{1,4}(?::[0-9a-f]{1,4})?)$/);
+    if (mMapped) {
+      const hex = mMapped[1].split(':').map(p => p.padStart(4, '0')).join('').slice(-8).padStart(8, '0');
       const b = [];
       for (let k = 0; k < 8; k += 2) b.push(parseInt(hex.slice(k, k + 2), 16));
       return isBlockedFetchHost(b.join('.'));
@@ -587,22 +612,47 @@ function isBlockedFetchHost(hostname) {
 async function toolWebFetch(url) {
   url = String(url || '').trim();
   if (!/^https?:\/\//i.test(url)) return 'URL 非法，仅支持 http/https';
-  // v6.8.1 SSRF 防护：先解析 hostname 再放行
-  let fetchHost = '';
-  try { fetchHost = new URL(url).hostname; } catch (e) { return 'URL 非法，仅支持 http/https'; }
-  if (isBlockedFetchHost(fetchHost)) return '该地址禁止抓取（内网 / 本机 / 云元数据地址）';
+  // v6.8.6 SSRF 加固：redirect 改 manual、手写跳转循环。之前 redirect:'follow' 只校验
+  // 初始 URL，重定向到内网/云元数据地址可绕过全部防护。同时流式读取响应体并设字节预算——
+  // 之前 res.text() 全量缓冲后再截断，恶意服务端 15 秒内可推送数百 MB 撑爆 Worker 内存。
+  const UA = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36' };
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 15000);
   try {
-    const res = await fetch(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36' },
-      signal: ctrl.signal, redirect: 'follow'
-    });
+    let current = url;
+    let res = null;
+    for (let hop = 0; hop < 5; hop++) {
+      let fetchHost = '';
+      try { fetchHost = new URL(current).hostname; } catch (e) { return 'URL 非法，仅支持 http/https'; }
+      if (isBlockedFetchHost(fetchHost)) return '该地址禁止抓取（内网 / 本机 / 云元数据地址）';
+      res = await fetch(current, { headers: UA, signal: ctrl.signal, redirect: 'manual' });
+      if (res.status >= 300 && res.status < 400) {
+        const loc = res.headers.get('location');
+        try { if (res.body) await res.body.cancel(); } catch (e) {}
+        if (!loc) return '抓取失败：重定向无目标地址';
+        try { current = new URL(loc, current).href; } catch (e) { return 'URL 非法，仅支持 http/https'; }
+        if (!/^https?:\/\//i.test(current)) return 'URL 非法，仅支持 http/https';
+        res = null;
+        continue;
+      }
+      break;
+    }
+    if (!res) return '抓取失败：重定向次数过多';
     if (!res.ok) return '抓取失败，HTTP ' + res.status;
     const ct = res.headers.get('content-type') || '';
     if (/pdf|image|video|audio|octet-stream/i.test(ct)) return '不支持抓取该类型内容(' + ct + ')';
-    let html = await res.text();
-    if (html.length > 500000) html = html.slice(0, 500000);
+    if (!res.body) return '抓取失败：空响应体';
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let html = '', received = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      received += value.byteLength;
+      if (received > 600000) { try { await reader.cancel(); } catch (e) {} break; }
+      html += dec.decode(value, { stream: true });
+    }
+    html += dec.decode();
     const text = html
       .replace(/<script[\s\S]*?<\/script>/gi, ' ')
       .replace(/<style[\s\S]*?<\/style>/gi, ' ')
@@ -664,7 +714,10 @@ function toolCalculate(expr) {
     const v = parseExpr();
     if (i !== s.length) throw new Error('表达式未完全解析');
     if (!isFinite(v)) return '计算结果非法（可能除零）';
-    return '计算结果：' + String(Math.round(v * 1e10) / 1e10);
+    // v6.8.6：舍入后再判一次——v 本身有限但落在 (1e298, 1e308] 时，v*1e10 会溢出成 Infinity
+    const rounded = Math.round(v * 1e10) / 1e10;
+    if (!isFinite(rounded)) return '计算结果非法（结果超出数值范围）';
+    return '计算结果：' + String(rounded);
   } catch (e) { return '计算失败: ' + e.message; }
 }
 
@@ -683,12 +736,15 @@ async function toolGetWeather(city) {
   city = String(city || '').trim();
   if (!city) return '城市名为空';
   try {
-    const g = await (await fetch('https://geocoding-api.open-meteo.com/v1/search?name=' + encodeURIComponent(city) + '&count=1&language=zh&format=json')).json();
+    // v6.8.6：两次上游调用加 10 秒超时——之前是裸 fetch，open-meteo hung 住会吃满工具 30 秒兜底
+    const g = await (await fetch('https://geocoding-api.open-meteo.com/v1/search?name=' + encodeURIComponent(city) + '&count=1&language=zh&format=json',
+      { signal: AbortSignal.timeout(10000) })).json();
     if (!g.results || !g.results.length) return '找不到城市：' + city;
     const loc = g.results[0];
     const w = await (await fetch('https://api.open-meteo.com/v1/forecast?latitude=' + loc.latitude + '&longitude=' + loc.longitude +
       '&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m' +
-      '&daily=temperature_2m_max,temperature_2m_min,weather_code&timezone=auto&forecast_days=2')).json();
+      '&daily=temperature_2m_max,temperature_2m_min,weather_code&timezone=auto&forecast_days=2',
+      { signal: AbortSignal.timeout(10000) })).json();
     const wm = { 0: '晴', 1: '大致晴', 2: '多云', 3: '阴', 45: '雾', 48: '雾凇', 51: '毛毛雨', 53: '毛毛雨', 55: '毛毛雨', 61: '小雨', 63: '中雨', 65: '大雨', 71: '小雪', 73: '中雪', 75: '大雪', 80: '阵雨', 81: '阵雨', 82: '暴雨', 95: '雷阵雨' };
     const c = w.current, d = w.daily;
     let t = loc.name + '（' + (loc.country || '') + '）当前：' + (wm[c.weather_code] || '未知') +
@@ -733,7 +789,9 @@ async function agentGetMemories(env, chatId) {
 
 async function agentSaveMemory(env, chatId, fact) {
   const arr = await agentGetMemories(env, chatId);
-  fact = String(fact || '').trim().slice(0, 200);
+  // v6.8.6：清洗换行——fact 会以 "- fact" 逐行拼进系统提示词，含 \n 会打破列表结构，
+  // 模型侧可借此注入伪造的提示词行
+  fact = String(fact || '').trim().replace(/[\r\n]+/g, ' ').slice(0, 200);
   if (!fact) return '内容为空，未保存';
   if (arr.some(m => m.fact === fact)) return '已记住过，无需重复保存';
   // v6.6.7：条目带 file 字段；先写 md 镜像再写索引（索引是唯一可信源）
@@ -759,14 +817,17 @@ async function agentForgetMemory(env, chatId, keyword) {
   const kept = arr.filter(m => String(m.fact || '').indexOf(keyword) < 0);
   const removed = arr.length - kept.length;
   if (removed > 0) {
+    // v6.8.6：索引写入必须校验——之前用静默吞错的 storePut，索引写失败却照删 md
+    // 并谎报"已删除"；下次读取时 kbBackfillMd 会按陈旧索引把记忆逐个"复活"。
+    const okIdx = await storePutChecked(env, agentMemKey(chatId), JSON.stringify(kept));
+    if (!okIdx) return { removed: 0, error: '记忆索引写入 R2 失败，未删除任何记忆；请检查 R2 后重试' };
+    mapSetBounded(tgAgentMemCache, chatId, kept);
     // v6.6.7：同步删除被删条目的 md 镜像
     const keptSet = new Set(kept);
     const files = [];
     for (const m of arr) {
       if (!keptSet.has(m) && m && m.file) files.push(kbMemDir(chatId) + m.file);
     }
-    mapSetBounded(tgAgentMemCache, chatId, kept);
-    await storePut(env, agentMemKey(chatId), JSON.stringify(kept));
     if (files.length) await kbDeleteKeys(env, files);
   }
   return { removed };
@@ -1063,8 +1124,12 @@ async function agentGetMode(env, chatId) {
 }
 
 async function agentSetMode(env, chatId, on) {
+  // v6.8.6：校验 R2 写入——之前用静默吞错的 storePut，失败时内存已是新值、R2 里是旧值，
+  // isolate 重启后开关"回滚"，让用户困惑
   mapSetBounded(tgAgentModeCache, chatId, on);
-  await storePut(env, 'agent_mode_' + chatId, on ? '1' : '0');
+  const ok = await storePutChecked(env, 'agent_mode_' + chatId, on ? '1' : '0');
+  if (!ok) tgAgentModeCache.delete(chatId); // 回滚内存缓存，下次读 R2 旧值
+  return ok;
 }
 
 // 记忆分词：英文按词、中文按 2-gram，用于相关性打分
@@ -1627,6 +1692,10 @@ function getChannelConfig(env) {
 // 提取共用的 AI 请求构建逻辑 (DRY原则)
 // tools: 可选，OpenAI 兼容的 tools 数组（Agent 模式用）；图片通道自动忽略
 function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
+  // v6.8.6：空消息守卫——之前 messagesArray 为空时图片分支直接抛 TypeError
+  if (!Array.isArray(messagesArray) || !messagesArray.length) {
+    return { error: '消息为空，请先输入内容。' };
+  }
   const { models, modelMap } = getChannelConfig(env);
 
   if (models.length === 0) {
@@ -1922,7 +1991,9 @@ export default {
                 try { await tgApi('answerCallbackQuery', { callback_query_id: cb.id }).catch(() => {}); } catch (e) {}
                 return;
               }
-              const data = cb.data;
+              // v6.8.6：data 可能为 undefined（Telegram 字段可选），直接 startsWith 会抛错、
+              // 跳过最后的 answerCallbackQuery，导致按钮 loading 永远不消失
+              const data = cb.data || '';
 
               if (data.startsWith('M:')) {
                 const index = parseInt(data.substring(2), 10);
@@ -1965,14 +2036,15 @@ export default {
                 return;
               }
 
-              if (userText === '/clear' || userText === '/new') {
+              // v6.8.6：统一用 isCmd，群组里的 /clear@botname 等写法也能生效
+              if (isCmd(userText, '/clear') || isCmd(userText, '/new')) {
                 await tgClearHistory(env, chatId);
                 await agentClearResumeState(env, chatId);
                 await tgApi('sendMessage', { chat_id: chatId, text: "🧹 上下文已清空，可以开始新的话题了。" });
                 return;
               }
 
-              if (userText === '/help') {
+              if (isCmd(userText, '/help')) {
                 await tgApi('sendMessage', {
                   chat_id: chatId,
                   text: "🤖 命令列表：\n\n"
@@ -1989,7 +2061,7 @@ export default {
                 return;
               }
 
-              if (userText === '/memory') {
+              if (isCmd(userText, '/memory')) {
                 const mems = await agentGetMemories(env, chatId);
                 if (!mems.length) {
                   await tgApi('sendMessage', { chat_id: chatId, text: "🧠 暂无长期记忆。\n\n对我说「记住xxx」即可保存，比如：记住，我养了一只猫叫汤圆" });
@@ -2004,7 +2076,7 @@ export default {
                 return;
               }
 
-              if (userText === '/kb') {
+              if (isCmd(userText, '/kb')) {
                 const mems = await agentGetMemories(env, chatId);
                 let text = '📚 知识库总览\n\n';
                 text += '🧠 长期记忆：共' + mems.length + '条（/memory 查看，/forget 关键词 删除）\n\n';
@@ -2016,28 +2088,33 @@ export default {
                 return;
               }
 
-              if (userText.startsWith('/forget')) {
-                const kw = userText.slice(7).trim();
+              if (isCmd(userText, '/forget')) {
+                // v6.8.6：精确匹配命令词——之前 startsWith 会误伤 "/forgetfulness" 等普通消息
+                // （不可逆误删）；且群组里的 /forget@botname 写法会把 "@botname" 当成关键词
+                const kw = userText.replace(/^\/forget(@\w+)?/, '').trim();
                 if (!kw) {
                   await tgApi('sendMessage', { chat_id: chatId, text: "用法：/forget 关键词\n例如：/forget 猫 —— 删除所有包含「猫」的记忆" });
                 } else {
                   const rr = await agentForgetMemory(env, chatId, kw);
                   await tgApi('sendMessage', {
                     chat_id: chatId,
-                    text: rr.removed > 0 ? '🗑 已删除 ' + rr.removed + ' 条包含「' + kw + '」的记忆。' : '没有找到包含「' + kw + '」的记忆。'
+                    text: rr.error ? '⚠️ ' + rr.error
+                      : (rr.removed > 0 ? '🗑 已删除 ' + rr.removed + ' 条包含「' + kw + '」的记忆。' : '没有找到包含「' + kw + '」的记忆。')
                   });
                 }
                 return;
               }
 
-              if (userText === '/agent') {
+              if (isCmd(userText, '/agent')) {
                 const cur = await agentGetMode(env, chatId);
-                await agentSetMode(env, chatId, !cur);
+                // v6.8.6：agentSetMode 失败时如实提示，不谎报已切换
+                const ok = await agentSetMode(env, chatId, !cur);
                 await tgApi('sendMessage', {
                   chat_id: chatId,
-                  text: !cur
+                  text: !ok ? '⚠️ 模式切换未保存（R2 写入失败），请检查 R2 后重试。'
+                    : (!cur
                     ? "🤖 **Agent 模式已开启**\n\n我会自主规划、调用工具（🔍 联网搜索、📄 网页读取、🧮 精确计算、🌤 天气、🕐 时间），长期记住你告诉我的重要信息，还能用 💾 保存、📚 查阅知识库文档。"
-                    : "💬 **已切换为普通对话模式**\n\n单轮问答，不调用工具、不使用长期记忆。如需 Agent 能力再发送 /agent 切回。",
+                    : "💬 **已切换为普通对话模式**\n\n单轮问答，不调用工具、不使用长期记忆。如需 Agent 能力再发送 /agent 切回。"),
                   parse_mode: "Markdown"
                 });
                 return;
@@ -2046,6 +2123,8 @@ export default {
               let targetModelId = tgUserModels.get(chatId);
               if (!targetModelId) {
                 targetModelId = await storeGet(env, `tg_user_${chatId}`);
+                // v6.8.6：回填内存缓存——之前每次消息都多一次 R2 GET
+                if (targetModelId) mapSetBounded(tgUserModels, chatId, targetModelId);
               }
 
               // 多轮对话：取出历史，拼上本轮用户消息（超限自动裁剪）
@@ -2105,10 +2184,18 @@ export default {
                   } catch (e) {}
                 };
                 // 「继续」：恢复上次暂停的任务；新问题则清掉旧暂停状态
-                const wantResume = /^继续/.test(userText.trim());
+                // v6.8.6：精确匹配——之前是前缀匹配，"继续刚才那个话题吧"这类普通消息会
+                // 错误丢弃本意、去恢复旧的暂停任务；发"继续"但无暂停存档时明确告知，
+                // 不拿"继续"二字开一轮瞎猜的新任务
+                const wantResume = userText.trim() === '继续';
                 let resumeState = null;
                 if (wantResume) resumeState = await agentLoadResumeState(env, chatId);
                 if (!resumeState) await agentClearResumeState(env, chatId);
+                if (wantResume && !resumeState) {
+                  if (pendingMsgId) await tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {});
+                  await tgApi('sendMessage', { chat_id: chatId, text: '没有暂停中的任务。「继续」只能接着做被暂停的长任务，直接说你的问题吧。' });
+                  return;
+                }
                 const runAgentTurn = (allowTools) => {
                   if (resumeState) {
                     return tgAgentResume(env, tgApi, chatId, {
@@ -3005,7 +3092,13 @@ const HTML_CONTENT = `<!DOCTYPE html>
   // AI 输出统一走 safeHtml：先 Markdown 渲染，再做 XSS 清洗。
   // DOMPurify 经 CDN 加载；若加载失败则降级为"解析后取纯文本"，保证永远安全。
   // 注意：本段在外层模板字符串内，不写反斜杠、反引号，避免两层转义破坏代码。
+  // v6.8.6：CDN 可用性探针——marked/hljs 任一加载失败都不应瘫痪整页。
+  // 之前 marked 是裸全局引用，CDN 抖动时 new marked.Renderer() 直接抛错，
+  // 整个内联脚本从该行起全部死亡（发消息/会话/设置/TTS 全挂），与 PWA"离线可用"承诺冲突。
+  var hasMarked = (typeof marked !== 'undefined' && marked && typeof marked.parse === 'function');
+  var hasHljs = (typeof hljs !== 'undefined' && hljs && typeof hljs.highlightElement === 'function');
   function safeHtml(mdText) {
+    if (!hasMarked) return escapeHtml(mdText || '');  // 降级：纯文本显示
     var raw = '';
     try { raw = marked.parse(mdText || ''); } catch (e) { raw = ''; }
     try {
@@ -3016,17 +3109,20 @@ const HTML_CONTENT = `<!DOCTYPE html>
     return tmp.textContent || '';
   }
 
-  const renderer = new marked.Renderer();
-  renderer.code = function(code, language) {
+  if (hasMarked) {
+    const renderer = new marked.Renderer();
+    renderer.code = function(code, language) {
     const displayLang = language || 'text';
     const escapedCode = escapeHtml(code);
     
     let highlightedCode = escapedCode;
-    if (!isCurrentlyStreaming && language && hljs.getLanguage(language)) {
+    // v6.8.6：hljs 缺失时跳过高亮——之前 hljs.getLanguage 在 try 之外裸调，
+    // CDN 失败会导致 marked.parse 抛错、AI 回复气泡空白
+    if (hasHljs && !isCurrentlyStreaming && language && hljs.getLanguage(language)) {
       try {
         highlightedCode = hljs.highlight(code, { language }).value;
       } catch (e) {}
-    } else if (!isCurrentlyStreaming) {
+    } else if (hasHljs && !isCurrentlyStreaming) {
       try {
         highlightedCode = hljs.highlightAuto(code).value;
       } catch (e) {}
@@ -3046,17 +3142,33 @@ const HTML_CONTENT = `<!DOCTYPE html>
   };
 
   marked.setOptions({ breaks: true, renderer: renderer });
+  } // end if (hasMarked)
+
+  // v6.8.6：hljs 缺失时跳过代码高亮——之前三处裸调 highlightElement，
+  // CDN 失败会导致"AI 回复空白"/"误报网络中断"/"切换含代码块会话抛错"
+  function highlightBlocks(root) {
+    if (!hasHljs || !root || !root.querySelectorAll) return;
+    try {
+      root.querySelectorAll('pre code').forEach(function (block) {
+        try { hljs.highlightElement(block); } catch (e) {}
+      });
+    } catch (e) {}
+  }
 
   document.addEventListener('click', function(e) {
     const copyBtn = e.target.closest('.copy-btn');
     if (!copyBtn) return;
     const code = decodeURIComponent(copyBtn.getAttribute('data-code'));
-    navigator.clipboard.writeText(code).then(() => {
-      const span = copyBtn.querySelector('span');
-      const originalText = span.innerText;
-      span.innerText = '已复制';
-      setTimeout(() => { span.innerText = originalText; }, 2000);
-    });
+    // v6.8.6：非安全上下文（http）下 navigator.clipboard 为 undefined，
+    // 之前直接调用抛 TypeError；权限被拒的 rejection 也要吞掉
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(code).then(() => {
+        const span = copyBtn.querySelector('span');
+        const originalText = span.innerText;
+        span.innerText = '已复制';
+        setTimeout(() => { span.innerText = originalText; }, 2000);
+      }).catch(() => {});
+    }
   });
 
   // ===== 语音朗读（Web Speech API，浏览器原生，无需任何 API Key）=====
@@ -3410,7 +3522,9 @@ const HTML_CONTENT = `<!DOCTYPE html>
     }
   }
 
-  function appendMessageDOM(role, content, msgId = null, isError = false) {
+  // v6.8.6：msgId 分支显式标记可信 HTML——之前是裸 innerHTML，未来调用方若传入
+  // AI 内容即构成存储型 XSS；默认走 safeHtml 清洗
+  function appendMessageDOM(role, content, msgId = null, isError = false, trustedHtml = false) {
     let row = msgId ? document.getElementById('row_' + msgId) : null;
     let bubble = msgId ? document.getElementById(msgId) : null;
     
@@ -3430,11 +3544,16 @@ const HTML_CONTENT = `<!DOCTYPE html>
     
     if (role === 'ai') {
       if (msgId) {
-        bubble.innerHTML = content;
+        if (trustedHtml) {
+          bubble.innerHTML = content;
+        } else {
+          bubble.innerHTML = '<div class="message-text markdown-body">' + safeHtml(content) + '</div>';
+          highlightBlocks(bubble);
+        }
       } else {
         isCurrentlyStreaming = false;
         bubble.innerHTML = '<div class="message-text markdown-body">' + safeHtml(content) + '</div>';
-        bubble.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
+        highlightBlocks(bubble);
       }
       ensureSpeakButton(bubble);
     } else {
@@ -3475,7 +3594,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
       '<div class="reasoning-box" style="display:none;"></div>' +
       '<div class="message-text markdown-body">' +
         '<div class="typing-indicator"><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div>' +
-      '</div>', aiMsgId);
+      '</div>', aiMsgId, false, true); // 静态占位 HTML，显式标记可信
     
     const bubble = document.getElementById(aiMsgId);
     isCurrentlyStreaming = true;
@@ -3698,7 +3817,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
       clearAgentProgress();
 
       tBox.innerHTML = safeHtml(aiContent);
-      tBox.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
+      highlightBlocks(tBox);
       scrollArea.scrollTop = scrollArea.scrollHeight;
 
       // 自动朗读（若已在左下角开启）
@@ -3737,12 +3856,16 @@ const HTML_CONTENT = `<!DOCTYPE html>
           currentSession.messages.push({ role: 'assistant', content: aiContent });
           if (rBox && reasoningContent) rBox.remove(); 
         } else {
-          tBox.innerText = '通信断开: ' + error.message; 
+          tBox.innerText = '通信断开: ' + error.message;
           bubble.parentElement.classList.add('error-msg');
-          currentSession.messages.pop(); 
+          currentSession.messages.pop();
+          // v6.8.6：恢复用户输入——之前 429 限流/网络瞬断会永久吞掉已清空的输入框内容
+          // （AuthError 分支早有恢复，通用分支漏了）
+          userInput.value = text;
+          userInput.dispatchEvent(new Event('input'));
         }
       }
-      tBox.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
+      highlightBlocks(tBox);
       saveSessions();
     } finally {
       isCurrentlyStreaming = false;
@@ -3905,9 +4028,11 @@ const HTML_CONTENT = `<!DOCTYPE html>
   init();
 
   // 4) 支持 manifest 快捷方式 /?new=1 —— 直接开一个新会话
+  // v6.8.6：建完即清理 URL 参数——之前每次刷新都会再建一个空会话，堆满会话列表
   try {
     if (new URLSearchParams(location.search).get('new') === '1' && sessions.length > 0) {
       createNewSession();
+      try { history.replaceState(null, '', location.pathname); } catch (e) {}
     }
   } catch (e) {}
 
