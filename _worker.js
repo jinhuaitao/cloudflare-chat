@@ -38,7 +38,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.8.8';
+const APP_VERSION = '6.8.9';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -633,15 +633,29 @@ function isBlockedFetchHost(hostname) {
   return false;
 }
 
+// v6.8.9：用户常直接粘 "github.com/owner/repo" 不带 scheme，之前直接判"URL 非法"。
+// 看着像域名的补上 https:// 再走正常流程（SSRF 校验在补全之后做，不会被绕过）。
+function normalizeFetchUrl(u) {
+  u = String(u || '').trim();
+  if (!u || /^https?:\/\//i.test(u)) return u;
+  if (/^[\w-]+(\.[\w-]+)+(:\d+)?(\/|\?|#|$)/.test(u)) return 'https://' + u;
+  return u;
+}
+
 async function toolWebFetch(url) {
-  url = String(url || '').trim();
+  url = normalizeFetchUrl(url);
   if (!/^https?:\/\//i.test(url)) return 'URL 非法，仅支持 http/https';
   // v6.8.6 SSRF 加固：redirect 改 manual、手写跳转循环。之前 redirect:'follow' 只校验
   // 初始 URL，重定向到内网/云元数据地址可绕过全部防护。同时流式读取响应体并设字节预算——
   // 之前 res.text() 全量缓冲后再截断，恶意服务端 15 秒内可推送数百 MB 撑爆 Worker 内存。
   const UA = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36' };
+  // v6.8.9：超时 / 网络抖动自动重试一次（GET 幂等，重试安全）。
+  // 确定性失败（SSRF 拦截、HTTP 错误状态、空内容等）走下面的 return 直接返回，不重试。
+  let lastErr = '抓取失败';
+  for (let attempt = 1; attempt <= 2; attempt++) {
+  // v6.8.9：单次 12 秒 × 最多 2 次 = 24 秒，留余量不撞单工具 30 秒兜底超时
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 15000);
+  const timer = setTimeout(() => ctrl.abort(), 12000);
   try {
     let current = url;
     let res = null;
@@ -688,8 +702,11 @@ async function toolWebFetch(url) {
     if (!text) return '页面无有效文本内容';
     return text.slice(0, 6000);
   } catch (e) {
-    return '抓取失败: ' + (e.name === 'AbortError' ? '超时' : e.message);
+    // 网络层异常（超时 / DNS / 连接重置等）→ 记下错误，外层 for 循环自动重试一次
+    lastErr = '抓取失败: ' + (e && e.name === 'AbortError' ? '超时' : ((e && e.message) || String(e)));
   } finally { clearTimeout(timer); }
+  }
+  return lastErr + '（已自动重试 1 次）';
 }
 
 // 安全计算器：递归下降解析，绝不使用 eval
