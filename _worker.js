@@ -38,7 +38,9 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.8.3';
+// 后缀 -p1 表示这是本地补丁版（Web Agent 真流式 + 卡死修复），上游仓库无此版本。
+// 发 /help 看到带 -p1 即说明部署的是打过补丁的构建。
+const APP_VERSION = '6.8.3-p1';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -1324,7 +1326,8 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
 
   const deadline = tgAgentDeadline(env, opts);
   return await tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline,
-    (opts && opts.resumeKey) || null, false);
+    (opts && opts.resumeKey) || null, false, undefined,
+    (opts && opts.onDelta) || null, (opts && opts.onReset) || null);
 }
 
 // 「继续」入口：messages 里已包含 system + 历史，直接接着跑
@@ -1336,11 +1339,142 @@ async function tgAgentResume(env, tgApi, chatId, saved, onProgress, opts) {
   // 否则多段「继续」会让上下文无限增长；老版本存档无此字段则回退为旧行为
   const baseLoopStartIdx = (typeof saved.loopStartIdx === 'number' && saved.loopStartIdx >= 0) ? saved.loopStartIdx : undefined;
   return await tgAgentRunLoop(env, tgApi, chatId, saved.targetModelId, saved.messages, tools, allowTools, onProgress, deadline,
-    (opts && opts.resumeKey) || null, true, baseLoopStartIdx);
+    (opts && opts.resumeKey) || null, true, baseLoopStartIdx,
+    (opts && opts.onDelta) || null, (opts && opts.onReset) || null);
 }
 
-async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume, baseLoopStartIdx) {
+// ==================== 上游流式读取（Agent 真流式） ====================
+// 把上游的 SSE 流还原成与「非流式」完全相同的 message 形状：
+//   { content, reasoning, toolCalls, forwarded, imageUrl }
+// 这样 Agent 循环里的 tool_calls 判定、DSML 兜底、熔断、工具执行等逻辑一行都不用改，
+// 变的只是"怎么拿到 msg"。同时把正文 / 推理增量实时回调出去，实现逐字输出。
+//
+// 兼容三种上游形态：
+//   1. 标准 SSE（data: {...}\n\n … data: [DONE]）—— 主流通道
+//   2. 忽略 stream 参数、直接返回完整 JSON —— 走 !sawSSE 兜底
+//   3. 图片生成通道 —— 返回 data[0].url
+// forwarded 表示"正文是否已经推给客户端"，调用方据此决定要不要再补发一次。
+async function readUpstreamMessage(resp, onDelta) {
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let raw = '';          // 完整原文，供非 SSE 兜底解析
+  let buffer = '';       // 行缓冲
+  let content = '';
+  let reasoning = '';
+  let forwarded = false;
+  const toolMap = new Map(); // 按 index 合并流式 tool_calls 分片
+  let sawSSE = false;
+  let sawToolCalls = false;  // 一旦出现工具调用，这一步的后续正文不再外发
+
+  const emit = async (text, kind) => {
+    if (!text || typeof onDelta !== 'function') return;
+    try { await onDelta(text, kind); } catch (e) {}
+    if (kind === 'content') forwarded = true;
+  };
+
+  // 返回 true 表示遇到 [DONE]，可以停止读取
+  const consumeLine = async (line) => {
+    line = line.trim();
+    // 空行、以 ':' 开头的注释（含保活行）直接跳过
+    if (!line || line.charAt(0) === ':') return false;
+    if (line.indexOf('data:') !== 0) return false;
+    sawSSE = true;
+    const payload = line.slice(5).trim();
+    if (payload === '[DONE]') return true;
+    let ev = null;
+    try { ev = JSON.parse(payload); } catch (e) { return false; }
+    if (ev && ev.error) {
+      const err = new Error(ev.error.message || JSON.stringify(ev.error));
+      err.name = 'UpstreamSSEError';
+      throw err;
+    }
+    const choice = ev && ev.choices && ev.choices[0];
+    if (!choice) return false;
+    // 部分通道把完整 message 塞在一个 chunk 里（非增量），delta / message 两种都兼容
+    const d = choice.delta || choice.message || {};
+    const rc = d.reasoning_content || d.reasoning || '';
+    if (rc) { reasoning += rc; await emit(rc, 'reasoning'); }
+    // 先处理 tool_calls：一旦这一步确定是工具调用，紧随其后的正文就不再外发，
+    // 少一次"先显示再撤回"的闪烁（前面已发出的部分仍由调用方 rollback 收回）
+    if (Array.isArray(d.tool_calls) && d.tool_calls.length) {
+      sawToolCalls = true;
+      for (const tc of d.tool_calls) {
+        const idx = typeof tc.index === 'number' ? tc.index : toolMap.size;
+        let slot = toolMap.get(idx);
+        if (!slot) {
+          slot = { id: '', type: 'function', function: { name: '', arguments: '' } };
+          toolMap.set(idx, slot);
+        }
+        if (tc.id) slot.id = tc.id;
+        if (tc.type) slot.type = tc.type;
+        const fn = tc.function || {};
+        // name 只在首个分片里给全，重复出现时不追加；arguments 按规范必须累加
+        if (fn.name && !slot.function.name) slot.function.name = fn.name;
+        if (fn.arguments) slot.function.arguments += fn.arguments;
+      }
+    }
+    if (d.content) {
+      content += d.content;
+      if (!sawToolCalls) await emit(d.content, 'content');
+    }
+    return false;
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = decoder.decode(value, { stream: true });
+    raw += chunk;
+    // 防 OOM：异常巨大的响应体直接掐断（正常对话远达不到 4MB）
+    if (raw.length > 4000000) { try { await reader.cancel(); } catch (e) {} break; }
+    buffer += chunk;
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
+    let stop = false;
+    for (const line of lines) {
+      if (await consumeLine(line)) { stop = true; break; }
+    }
+    if (stop) { try { await reader.cancel(); } catch (e) {} break; }
+  }
+  // 收尾：最后一行可能没有换行符
+  if (buffer.trim()) {
+    try { await consumeLine(buffer); } catch (e) { if (e && e.name === 'UpstreamSSEError') throw e; }
+  }
+
+  // 兜底：上游没有按 SSE 返回（部分通道忽略 stream 参数，直接给完整 JSON）
+  if (!sawSSE) {
+    try {
+      const j = JSON.parse(raw);
+      if (j && j.data && j.data[0] && j.data[0].url) {
+        return { imageUrl: j.data[0].url, content: '', reasoning: '', toolCalls: [], forwarded: false };
+      }
+      const ch = j && j.choices && j.choices[0];
+      const m = ch && (ch.message || ch.delta);
+      if (m) {
+        return {
+          content: m.content || '',
+          reasoning: m.reasoning_content || m.reasoning || '',
+          toolCalls: m.tool_calls || [],
+          forwarded: false
+        };
+      }
+    } catch (e) {}
+  }
+
+  const toolCalls = Array.from(toolMap.keys()).sort((a, b) => a - b).map(k => toolMap.get(k));
+  return { content, reasoning, toolCalls, forwarded };
+}
+
+async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume, baseLoopStartIdx, onDelta, onReset) {
   const maxSteps = agentLimits(env).maxSteps;
+  // 真流式开关：默认开启，向上游请求 stream: true 并边读边转发正文增量。
+  // 若某条通道不支持「流式 + tools」的组合，设 AGENT_STREAM_UPSTREAM=0 退回整段等待。
+  const useUpstreamStream = env.AGENT_STREAM_UPSTREAM !== '0';
+  // 撤回已推给客户端的正文（仅当本轮确实推过内容时才发事件）
+  const rollbackStreamed = async (forwarded) => {
+    if (!forwarded || typeof onReset !== 'function') return;
+    try { await onReset(); } catch (e) {}
+  };
   const lastAssistantText = () => {
     const f = [...messages].reverse().find(m => m.role === 'assistant' && m.content);
     return f ? f.content : '';
@@ -1396,7 +1530,8 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
 
     // 超预算时裁剪本轮循环产生的旧 tool 轮次（成对删除，保证消息序列合法）
     const sendMessages = trimAgentMessages(messages, loopStartIdx, ctxBudget);
-    const cfg = buildAIRequest(env, targetModelId, sendMessages, false, tools);
+    // 真流式：请求 stream: true，正文 / 推理增量边到边推给客户端（AGENT_STREAM_UPSTREAM=0 可关）
+    const cfg = buildAIRequest(env, targetModelId, sendMessages, useUpstreamStream, tools);
     if (cfg.error) return { error: cfg.error };
 
     let resp;
@@ -1435,17 +1570,37 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       return { error: 'API 报错 (' + resp.status + ')：' + String(t).slice(0, 500) };
     }
 
-    const data = await resp.json().catch(() => null);
-    // 图片生成通道：直接返回图片链接（不走工具循环）
-    if (data && data.data && data.data[0] && data.data[0].url) {
-      return { text: '[🖼️ 点击查看生成的图片](' + data.data[0].url + ')', usedTools: false, isImage: true };
+    // 读取上游：流式时正文边到边推给客户端，非流式时整段返回；
+    // 两种形态统一还原成 { content, reasoning, toolCalls, forwarded, imageUrl }
+    let msg;
+    try {
+      msg = await readUpstreamMessage(resp, onDelta);
+    } catch (e) {
+      // 中断分类与上面 fetch 一致：预算耗尽 -> 暂停并保存进度；否则 -> 上游 / 网络错误
+      const nm = e && e.name ? String(e.name) : '';
+      const emsg = String((e && e.message) || '');
+      const aborted = nm === 'AbortError' || nm === 'TimeoutError' || /abort/i.test(emsg);
+      if (aborted) {
+        // 流式过程中可能已经推了半截正文出去，先撤回再收尾
+        await rollbackStreamed(true);
+        if (Date.now() >= deadline - 2000) return await pauseForResume();
+        return { error: '上游响应超时，请重试或换个问法' };
+      }
+      if (nm === 'UpstreamSSEError') return { error: '上游返回错误：' + emsg };
+      return { error: '网络错误：' + (emsg || String(e)) };
     }
-    const msg = data && data.choices && data.choices[0] && data.choices[0].message;
-    if (!msg) return { error: 'AI 没有返回有效内容' };
+
+    // 图片生成通道：直接返回图片链接（不走工具循环）
+    if (msg.imageUrl) {
+      return { text: '[🖼️ 点击查看生成的图片](' + msg.imageUrl + ')', usedTools: false, isImage: true };
+    }
+    if (!msg.content && !msg.toolCalls.length && !msg.reasoning) {
+      return { error: 'AI 没有返回有效内容' };
+    }
 
     // 原生 tool_calls 为空时，尝试从 content 解析 DSML 文本格式工具调用
     // （DeepSeek V3.2/V4 系模型 + 裸透传通道的组合会产生这种输出）
-    let toolCalls = msg.tool_calls || [];
+    let toolCalls = msg.toolCalls || [];
     let assistantText = msg.content || '';
     if (!toolCalls.length && assistantText.indexOf('DSML') !== -1) {
       const dsmlCalls = parseDSMLToolCalls(assistantText);
@@ -1458,20 +1613,28 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
     if (toolCalls.length) assistantMsg.tool_calls = toolCalls;
     // 推理模型（DeepSeek R1 等）多轮工具调用要求回传 reasoning_content，
     // 否则后续轮次会丢失推理上下文；不返回该字段的模型无影响
-    const reasoning = msg.reasoning_content || msg.reasoning || '';
+    const reasoning = msg.reasoning || '';
     if (reasoning) assistantMsg.reasoning_content = reasoning;
     messages.push(assistantMsg);
 
     // 兜底：任何返回给用户的文本都不允许携带 DSML markup
     if (!toolCalls.length) {
       const clean = stripDSMLBlocks(assistantText).trim();
-      let text = clean;
-      if (!text) {
-        text = assistantText.indexOf('DSML') !== -1
+      if (!clean) {
+        // 没有可展示的正文（可能刚把 DSML 标记推了出去）→ 先撤回再给兜底提示
+        await rollbackStreamed(msg.forwarded);
+        const text = assistantText.indexOf('DSML') !== -1
           ? '（工具调用格式解析失败，已隐藏原始标记，请换个问法重试或切换模型）'
           : (reasoning ? '（模型思考后没有给出文字答复，请换个问法重试）' : '（模型返回了空内容，请换个问法重试）');
+        return { text: text, usedTools: step > 0 };
       }
-      return { text: text, usedTools: step > 0 };
+      // 正文已经在流式过程中推给客户端、且清洗后与推出去的完全一致 → 不必重发
+      if (msg.forwarded && clean === assistantText.trim()) {
+        return { text: clean, usedTools: step > 0, streamed: true };
+      }
+      // 其余情况（上游没流式 / 清洗改动了文本）→ 撤回已推内容，由调用方补发干净文本
+      await rollbackStreamed(msg.forwarded);
+      return { text: clean, usedTools: step > 0 };
     }
 
     // 重复调用熔断：连续 3 步工具调用完全相同 → 判定原地打转，直接收尾
@@ -1481,9 +1644,14 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
         callSigHistory[callSigHistory.length - 1] === stepSig &&
         callSigHistory[callSigHistory.length - 2] === stepSig &&
         callSigHistory[callSigHistory.length - 3] === stepSig) {
+      await rollbackStreamed(msg.forwarded);
       const prefix = stripDSMLBlocks(assistantText).trim();
       return { text: (prefix ? prefix + '\n\n' : '') + '（检测到重复调用同一工具，已停止以避免空转；请换个问法或补充信息后重试）', usedTools: true };
     }
+
+    // 这一步是工具调用：流式过程中若已把模型的"开场白"推给了用户，必须撤回 ——
+    // 否则它会和后续的最终答案首尾拼在一起，读起来是错的。
+    await rollbackStreamed(msg.forwarded);
 
     // 进度提示：让用户看到 Agent 在干什么（force 突破节流）
     if (typeof onProgress === 'function') {
@@ -1672,7 +1840,6 @@ async function handleWebAgent(env, body) {
   let webBudgetMs = parseInt(env.WEB_AGENT_TIMEOUT_MS || '90000', 10);
   if (!(webBudgetMs >= 10000)) webBudgetMs = 90000;
   if (webBudgetMs > 240000) webBudgetMs = 240000;
-  const webOpts = { maxRuntimeMs: webBudgetMs };
 
   const stream = new ReadableStream({
     async start(controller) {
@@ -1690,12 +1857,25 @@ async function handleWebAgent(env, body) {
       const ka = setInterval(() => {
         try { controller.enqueue(encoder.encode(': keep-alive ' + Date.now() + '\n\n')); } catch (e) {}
       }, 15000);
+      // 真流式接线：上游的正文 / 推理增量直接以标准 OpenAI delta 事件转发出去，
+      // 前端本来就在按这个格式解析，所以逐字渲染零改动即可生效。
+      // agent_reset 用于撤回被判定为"工具调用开场白"或 DSML 标记的中间文本。
+      const webOpts = {
+        maxRuntimeMs: webBudgetMs,
+        onDelta: async (text, kind) => {
+          if (kind === 'reasoning') send({ choices: [{ delta: { reasoning_content: text } }] });
+          else send({ choices: [{ delta: { content: text } }] });
+        },
+        onReset: async () => { send({ agent_reset: true }); }
+      };
       try {
         const onProgress = async (text) => { send({ agent_progress: String(text).slice(0, 500) }); };
         let r = await tgAgentChat(env, noOpTgApi, webChatId, targetModelId, history, true, onProgress, webOpts);
         if (r.fallback) r = await tgAgentChat(env, noOpTgApi, webChatId, targetModelId, history, false, onProgress, webOpts);
         if (r.error) {
           send({ agent_error: r.error });
+        } else if (r.streamed) {
+          // 正文已经在流式过程中逐字推完了，这里什么都不用补，直接收尾
         } else if (r.text) {
           const t = r.text;
           for (let i = 0; i < t.length; i += 2000) {
@@ -4066,6 +4246,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
           agentProgressT0 = Date.now();
           agentProgressTimer = setInterval(renderAgentProgress, 1000);
         }
+        agentProgressEl.style.display = '';
         agentProgressBase = text;
         renderAgentProgress();
         const distanceToBottom = scrollArea.scrollHeight - scrollArea.scrollTop - scrollArea.clientHeight;
@@ -4073,11 +4254,24 @@ const HTML_CONTENT = `<!DOCTYPE html>
           scrollArea.scrollTop = scrollArea.scrollHeight;
         }
       }
+      // 正文开始流式输出后收起进度条，否则"Agent 思考中"会一直挂在答案上方
+      function hideAgentProgress() {
+        if (agentProgressEl) agentProgressEl.style.display = 'none';
+      }
       function clearAgentProgress() {
         if (agentProgressTimer) { clearInterval(agentProgressTimer); agentProgressTimer = null; }
         if (agentProgressEl && agentProgressEl.parentNode) agentProgressEl.parentNode.removeChild(agentProgressEl);
         agentProgressEl = null;
         agentProgressBase = '';
+      }
+      // 撤回本轮已流式显示的正文：服务端发现刚推来的内容其实是"工具调用开场白"
+      // 或 DSML 标记时会发 agent_reset，让我们清屏重来，避免它和最终答案拼在一起。
+      function resetStreamedText() {
+        aiContent = '';
+        reasoningContent = '';
+        if (rBox) { rBox.style.display = 'none'; rBox.textContent = ''; }
+        tBox.innerHTML = '';
+        if (agentProgressEl) showAgentProgress(agentProgressBase || '🤖 Agent 正在继续…');
       }
 
       // 自动重试提示条（只在断流重试时短暂出现）
@@ -4165,12 +4359,15 @@ const HTML_CONTENT = `<!DOCTYPE html>
             // v6.6.0 Agent 事件：进度展示 / 错误（错误直接抛给外层统一处理，不自动重试，避免工具重复执行）
             // v6.8.1：先做子串快速过滤，再要求整行是合法 JSON 且真的携带对应字段，
             // 避免 AI 正文恰好包含 "agent_progress" 子串时整行被误吞
-            if (line.indexOf('"agent_progress"') > 0 || line.indexOf('"agent_error"') > 0) {
+            if (line.indexOf('"agent_progress"') > 0 || line.indexOf('"agent_error"') > 0 || line.indexOf('"agent_reset"') > 0) {
               let handledAsAgentEvent = false;
               try {
                 const adata = JSON.parse(line.slice(5).trim());
                 if (adata && adata.agent_progress !== undefined) {
                   showAgentProgress(adata.agent_progress);
+                  handledAsAgentEvent = true;
+                } else if (adata && adata.agent_reset !== undefined) {
+                  resetStreamedText();
                   handledAsAgentEvent = true;
                 } else if (adata && adata.agent_error !== undefined) {
                   const ae = new Error(adata.agent_error);
@@ -4197,7 +4394,10 @@ const HTML_CONTENT = `<!DOCTYPE html>
             if (sseData.choices && sseData.choices[0] && sseData.choices[0].delta) {
               const delta = sseData.choices[0].delta;
               if (delta.reasoning_content) reasoningContent += delta.reasoning_content;
-              if (delta.content !== undefined && delta.content !== null) aiContent += delta.content;
+              if (delta.content !== undefined && delta.content !== null && delta.content !== '') {
+                aiContent += delta.content;
+                hideAgentProgress();   // 正文开始输出 → 收起进度条
+              }
               scheduleUpdateUI();
             }
           }
