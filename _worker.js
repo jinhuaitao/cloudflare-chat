@@ -41,7 +41,7 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 // 后缀 -pN 表示这是本地补丁版（p1 卡死修复 + 真流式 / p2 Telegram 流式 /
 // p3 Telegram 预算与硬墙钟），上游仓库无此版本。
 // 发 /help 看到带 -p3 即说明部署的是打过补丁的构建。
-const APP_VERSION = '6.8.3-p6';
+const APP_VERSION = '6.8.3-p7';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -1466,6 +1466,43 @@ function tgAutoContinueSegMs(env) {
 // 内部端点的共享令牌：优先用 TG_WEBHOOK_SECRET，没有就退到 TG_BOT_TOKEN。
 // 两者都只存在于服务端，不会下发到浏览器，足以挡住外部伪造调用。
 function tgAutoContinueToken(env) { return env.TG_WEBHOOK_SECRET || env.TG_BOT_TOKEN || ''; }
+// 自调用基础地址：默认从当前请求的 origin 推导。
+// 已知坑（Cloudflare 官方文档）：使用自定义域名的 Worker，直接 fetch 自己的
+// 自定义域名会确定性报 522。此时把 TG_SELF_BASE_URL 设为 workers.dev 域名
+// （如 https://xxx.workers.dev），自调用就走那条路，不经过自定义域名。
+function tgSelfBaseUrl(env, url) {
+  const v = String(env.TG_SELF_BASE_URL || '').trim().replace(/\/+$/, '');
+  if (/^https:\/\/[^\/:?#]+$/i.test(v)) return v;
+  return url.origin;
+}
+// 自调用 kick：内部端点收到即回 200，单次只等一个 RTT；
+// 522 这类建连问题偶发时，短退避重试一次能扛过去。
+async function tgKickAutoContinue(env, selfBase, body, attempts) {
+  let lastErr = '';
+  const n = attempts > 0 ? attempts : 2;
+  for (let attempt = 1; attempt <= n; attempt++) {
+    try {
+      const rk = await fetch(selfBase + '/tg-auto-continue', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Auto-Continue-Token': tgAutoContinueToken(env) },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(6000)
+      });
+      if (rk && rk.ok) return { ok: true };
+      lastErr = 'HTTP ' + (rk ? rk.status : '无响应');
+    } catch (e) { lastErr = (e && e.message) ? e.message : String(e); }
+    if (attempt < n) await new Promise(r => setTimeout(r, 1000));
+  }
+  return { ok: false, err: lastErr };
+}
+// 按错误给用户指对方向：522 基本就是自定义域名自调用这个已知坑
+function autoKickHint(errText) {
+  if (/522/.test(errText || '')) {
+    return '这是 Cloudflare 已知限制：使用自定义域名的 Worker 不能 fetch 自己的域名（官方文档有写）。'
+      + '请把环境变量 TG_SELF_BASE_URL 设为你的 workers.dev 域名（形如 https://<worker名>.<账号>.workers.dev），重新部署后再试。';
+  }
+  return '请检查 WAF / Cloudflare Access / 防火墙规则是否拦截了站内请求。';
+}
 // 自动续做复用的那条消息的 id（存 R2，保证多段之间编辑的是同一条消息，不刷屏）
 function tgAutoMsgKey(chatId) { return 'tg_auto_msg_' + chatId; }
 
@@ -1543,7 +1580,7 @@ async function tgAutoSendOrEdit(env, tgApi, chatId, msg, text) {
 }
 
 // 跑一段自动续做。返回 'ok'（跑完）/ 'paused'（没跑完，已起下一段）/ 'stop'（终止）。
-async function runTgAutoContinue(env, ctx, chatId, seg, selfUrl) {
+async function runTgAutoContinue(env, ctx, chatId, seg, selfBase) {
   const tgApi = makeTgApi(env);
   const maxSeg = tgAutoContinueMaxSeg(env);
   const segMs = tgAutoContinueSegMs(env);
@@ -1708,21 +1745,11 @@ async function runTgAutoContinue(env, ctx, chatId, seg, selfUrl) {
       // 关键：立刻起下一段。这是"自动"二字的全部实现 —— 用户什么都不用做。
       // 等待内部端点的即时 ACK（它收到请求就回 200，真正的续做在它自己的
       // waitUntil 里跑，所以这里只等一个 RTT）。失败则给用户明确报错，
-      // 而不是返回 'paused' 后石沉大海 —— 这是之前「第 N 段」静默卡死的主因之一。
-      let kickOk = false, kickErr = '';
-      try {
-        const rk = await fetch(selfUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'X-Auto-Continue-Token': tgAutoContinueToken(env) },
-          body: JSON.stringify({ chatId, seg: seg + 1 }),
-          signal: AbortSignal.timeout(10000)
-        });
-        kickOk = !!(rk && rk.ok);
-        if (!kickOk) kickErr = 'HTTP ' + (rk ? rk.status : '无响应');
-      } catch (e) { kickErr = (e && e.message) ? e.message : String(e); }
-      if (!kickOk) {
-        return await giveUp('⚠️ 自动续做链中断：第 ' + seg + ' 段完成后无法启动下一段（' + kickErr + '）。'
-          + '进度已保存，发「继续」可手动接着做；若反复出现，请检查 Worker 域名自访问是否被 WAF / Cloudflare Access / 防火墙规则拦截。');
+      // 而不是返回 'paused' 后石沉大海。
+      const kick = await tgKickAutoContinue(env, selfBase, { chatId, seg: seg + 1 }, 2);
+      if (!kick.ok) {
+        return await giveUp('⚠️ 自动续做链中断：第 ' + seg + ' 段完成后无法启动下一段（' + kick.err + '）。'
+          + '进度已保存，发「继续」可手动接着做。' + autoKickHint(kick.err));
       }
       return 'paused';
     }
@@ -2490,9 +2517,9 @@ export default {
       let seg = body ? parseInt(body.seg, 10) : 1;
       if (!(seg >= 1)) seg = 1;
       if (chatId === undefined || chatId === null) return new Response('OK', { status: 200 });
-      // 自身 URL（保留 origin，路径固定），供本段结束时发起下一段
-      const selfUrl = new URL('/tg-auto-continue', url.origin).toString();
-      ctx.waitUntil(runTgAutoContinue(env, ctx, chatId, seg, selfUrl));
+      // 自调用基础地址：优先用 TG_SELF_BASE_URL（自定义域名自 fetch 会 522，见 tgSelfBaseUrl 注释）
+      const tgSelfBase = tgSelfBaseUrl(env, url);
+      ctx.waitUntil(runTgAutoContinue(env, ctx, chatId, seg, tgSelfBase));
       return new Response('OK', { status: 200 });
     }
 
@@ -2518,14 +2545,14 @@ export default {
 
         // Telegram Bot API 调用工厂（超时默认 15 秒，可用 TG_API_TIMEOUT_MS 调整）
         const tgApi = makeTgApi(env);
-        // 自动续做内部端点地址：本 webhook 暂停后，worker 会 POST 到这里起下一段
-        const autoContinueUrl = new URL('/tg-auto-continue', url.origin).toString();
+        // 自动续做自调用基础地址：优先用 TG_SELF_BASE_URL（自定义域名自 fetch 会 522，见 tgSelfBaseUrl 注释）
+        const tgSelfBase = tgSelfBaseUrl(env, url);
 
         // v6.4.3 根因修复：之前收到 webhook 立刻返回 OK、把全部工作丢进 ctx.waitUntil ——
         // 但 HTTP 响应结束后 waitUntil 最多再延续约 30 秒，超过 30 秒的 Agent 任务会被
         // 静默掐断（pending 消息永远卡在"📄 正在读取网页…"，且无任何错误）。
         // 现在改为在请求上下文内等待处理完成再返回 OK。
-        async function processTelegramUpdate(env, update, tgApi, ctx, autoContinueUrl) {
+        async function processTelegramUpdate(env, update, tgApi, ctx, tgSelfBase) {
           try {
             const { models: modelObjList } = getChannelConfig(env);
             if (modelObjList.length === 0) return;
@@ -2961,25 +2988,15 @@ export default {
               if (autoContinue) {
                 // 等待内部端点的即时 ACK（它收到请求就回 200，真正的续做在它自己的
                 // waitUntil 里跑，所以这里只等一个 RTT，不会吃掉 webhook 预算）。
-                // 失败则立刻给用户明确报错 —— 自调用被 WAF / 防火墙拦掉是之前
-                // 「第 1 段」永远不动最常见的原因，不能再静默过去。
-                let kickOk = false, kickErr = '';
-                try {
-                  const rk = await fetch(autoContinueUrl, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'X-Auto-Continue-Token': tgAutoContinueToken(env) },
-                    body: JSON.stringify({ chatId: chatId, seg: 1 }),
-                    signal: AbortSignal.timeout(10000)
-                  });
-                  kickOk = !!(rk && rk.ok);
-                  if (!kickOk) kickErr = 'HTTP ' + (rk ? rk.status : '无响应');
-                } catch (e) { kickErr = (e && e.message) ? e.message : String(e); }
-                if (!kickOk) {
+                // 失败则立刻给用户明确报错 —— 自调用失败是之前「第 1 段」永远不动
+                // 最常见的原因，不能再静默过去。
+                const kick = await tgKickAutoContinue(env, tgSelfBase, { chatId: chatId, seg: 1 }, 2);
+                if (!kick.ok) {
                   try {
                     const m0 = await tgAutoMsgGet(env, chatId);
                     await tgAutoSendOrEdit(env, tgApi, chatId, m0 && m0.id ? m0 : { id: pendingMsgId },
-                      '⚠️ 自动续做启动失败（' + kickErr + '）：worker 无法调用自己的 /tg-auto-continue 端点。'
-                      + '请检查 WAF / Cloudflare Access / 防火墙规则是否拦截了站内请求，或发「继续」手动接着做（进度已保存）。');
+                      '⚠️ 自动续做启动失败（' + kick.err + '）：worker 无法调用自己的 /tg-auto-continue 端点。'
+                      + autoKickHint(kick.err) + '或发「继续」手动接着做（进度已保存）。');
                     await tgAutoMsgClear(env, chatId);
                     await tgAutoEpochSet(env, chatId, null);
                     if (pendingMsgId) await tgPendingRemove(env, chatId, pendingMsgId);
@@ -3082,7 +3099,7 @@ export default {
         } catch (e) {}
 
         try {
-          await processTelegramUpdate(env, update, tgApi, ctx, autoContinueUrl);
+          await processTelegramUpdate(env, update, tgApi, ctx, tgSelfBase);
         } catch (err) {
           console.log("处理 Telegram 更新异常:", err);
         }
