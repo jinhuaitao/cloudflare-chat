@@ -40,7 +40,7 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 // 应用版本号（/help 显示；发版时同步 package.json）
 // 后缀 -p1 表示这是本地补丁版（Web Agent 真流式 + 卡死修复），上游仓库无此版本。
 // 发 /help 看到带 -p1 即说明部署的是打过补丁的构建。
-const APP_VERSION = '6.8.3-p1';
+const APP_VERSION = '6.8.8';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
