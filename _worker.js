@@ -41,7 +41,7 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 // 后缀 -pN 表示这是本地补丁版（p1 卡死修复 + 真流式 / p2 Telegram 流式 /
 // p3 Telegram 预算与硬墙钟），上游仓库无此版本。
 // 发 /help 看到带 -p3 即说明部署的是打过补丁的构建。
-const APP_VERSION = '6.8.3-p7';
+const APP_VERSION = '6.8.3-p8';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -1466,32 +1466,39 @@ function tgAutoContinueSegMs(env) {
 // 内部端点的共享令牌：优先用 TG_WEBHOOK_SECRET，没有就退到 TG_BOT_TOKEN。
 // 两者都只存在于服务端，不会下发到浏览器，足以挡住外部伪造调用。
 function tgAutoContinueToken(env) { return env.TG_WEBHOOK_SECRET || env.TG_BOT_TOKEN || ''; }
-// 自调用基础地址：默认从当前请求的 origin 推导。
-// 已知坑（Cloudflare 官方文档）：使用自定义域名的 Worker，直接 fetch 自己的
-// 自定义域名会确定性报 522。此时把 TG_SELF_BASE_URL 设为 workers.dev 域名
-// （如 https://xxx.workers.dev），自调用就走那条路，不经过自定义域名。
-function tgSelfBaseUrl(env, url) {
+// 自调用候选基础地址：TG_SELF_BASE_URL 优先（自定义域名自 fetch 会确定性 522，
+// 官方文档有写，此时应指向 workers.dev 域名），其次是当前请求的 origin。
+// 注意：TG_SELF_BASE_URL 填错格式会被忽略（回退到 origin），所以报错里会带上
+// 实际尝试的目标，方便一眼看出变量到底生没生效。
+function tgSelfBases(env, url) {
   const v = String(env.TG_SELF_BASE_URL || '').trim().replace(/\/+$/, '');
-  if (/^https:\/\/[^\/:?#]+$/i.test(v)) return v;
-  return url.origin;
+  const primary = /^https:\/\/[^\/:?#]+$/i.test(v) ? v : url.origin;
+  if (primary === url.origin) return [primary];
+  return [primary, url.origin];
 }
-// 自调用 kick：内部端点收到即回 200，单次只等一个 RTT；
-// 522 这类建连问题偶发时，短退避重试一次能扛过去。
-async function tgKickAutoContinue(env, selfBase, body, attempts) {
+const tgHostOf = (u) => String(u || '').replace(/^https:\/\//i, '');
+// 自调用 kick：按候选地址逐个尝试。内部端点收到即回 200，单次只等一个 RTT；
+// 522 是确定性失败（自定义域名自调用这个已知坑），直接换下一个地址，不重试；
+async function tgKickAutoContinue(env, url, body) {
+  const bases = tgSelfBases(env, url);
   let lastErr = '';
-  const n = attempts > 0 ? attempts : 2;
-  for (let attempt = 1; attempt <= n; attempt++) {
-    try {
-      const rk = await fetch(selfBase + '/tg-auto-continue', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Auto-Continue-Token': tgAutoContinueToken(env) },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(6000)
-      });
-      if (rk && rk.ok) return { ok: true };
-      lastErr = 'HTTP ' + (rk ? rk.status : '无响应');
-    } catch (e) { lastErr = (e && e.message) ? e.message : String(e); }
-    if (attempt < n) await new Promise(r => setTimeout(r, 1000));
+  for (const base of bases) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const rk = await fetch(base + '/tg-auto-continue', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Auto-Continue-Token': tgAutoContinueToken(env) },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(6000)
+        });
+        if (rk && rk.ok) return { ok: true };
+        lastErr = 'HTTP ' + (rk ? rk.status : '无响应') + '（目标 ' + tgHostOf(base) + '）';
+        if (rk && rk.status === 522) break; // 确定性失败，换下一个地址试
+      } catch (e) {
+        lastErr = ((e && e.message) ? e.message : String(e)) + '（目标 ' + tgHostOf(base) + '）';
+      }
+      if (attempt < 2) await new Promise(r => setTimeout(r, 1000));
+    }
   }
   return { ok: false, err: lastErr };
 }
@@ -1580,7 +1587,7 @@ async function tgAutoSendOrEdit(env, tgApi, chatId, msg, text) {
 }
 
 // 跑一段自动续做。返回 'ok'（跑完）/ 'paused'（没跑完，已起下一段）/ 'stop'（终止）。
-async function runTgAutoContinue(env, ctx, chatId, seg, selfBase) {
+async function runTgAutoContinue(env, ctx, chatId, seg, url) {
   const tgApi = makeTgApi(env);
   const maxSeg = tgAutoContinueMaxSeg(env);
   const segMs = tgAutoContinueSegMs(env);
@@ -1746,7 +1753,7 @@ async function runTgAutoContinue(env, ctx, chatId, seg, selfBase) {
       // 等待内部端点的即时 ACK（它收到请求就回 200，真正的续做在它自己的
       // waitUntil 里跑，所以这里只等一个 RTT）。失败则给用户明确报错，
       // 而不是返回 'paused' 后石沉大海。
-      const kick = await tgKickAutoContinue(env, selfBase, { chatId, seg: seg + 1 }, 2);
+      const kick = await tgKickAutoContinue(env, url, { chatId, seg: seg + 1 });
       if (!kick.ok) {
         return await giveUp('⚠️ 自动续做链中断：第 ' + seg + ' 段完成后无法启动下一段（' + kick.err + '）。'
           + '进度已保存，发「继续」可手动接着做。' + autoKickHint(kick.err));
@@ -2517,9 +2524,8 @@ export default {
       let seg = body ? parseInt(body.seg, 10) : 1;
       if (!(seg >= 1)) seg = 1;
       if (chatId === undefined || chatId === null) return new Response('OK', { status: 200 });
-      // 自调用基础地址：优先用 TG_SELF_BASE_URL（自定义域名自 fetch 会 522，见 tgSelfBaseUrl 注释）
-      const tgSelfBase = tgSelfBaseUrl(env, url);
-      ctx.waitUntil(runTgAutoContinue(env, ctx, chatId, seg, tgSelfBase));
+      // 自调用基础地址在 runTgAutoContinue 内部按 TG_SELF_BASE_URL / origin 自动选择
+      ctx.waitUntil(runTgAutoContinue(env, ctx, chatId, seg, url));
       return new Response('OK', { status: 200 });
     }
 
@@ -2545,14 +2551,12 @@ export default {
 
         // Telegram Bot API 调用工厂（超时默认 15 秒，可用 TG_API_TIMEOUT_MS 调整）
         const tgApi = makeTgApi(env);
-        // 自动续做自调用基础地址：优先用 TG_SELF_BASE_URL（自定义域名自 fetch 会 522，见 tgSelfBaseUrl 注释）
-        const tgSelfBase = tgSelfBaseUrl(env, url);
 
         // v6.4.3 根因修复：之前收到 webhook 立刻返回 OK、把全部工作丢进 ctx.waitUntil ——
         // 但 HTTP 响应结束后 waitUntil 最多再延续约 30 秒，超过 30 秒的 Agent 任务会被
         // 静默掐断（pending 消息永远卡在"📄 正在读取网页…"，且无任何错误）。
         // 现在改为在请求上下文内等待处理完成再返回 OK。
-        async function processTelegramUpdate(env, update, tgApi, ctx, tgSelfBase) {
+        async function processTelegramUpdate(env, update, tgApi, ctx) {
           try {
             const { models: modelObjList } = getChannelConfig(env);
             if (modelObjList.length === 0) return;
@@ -2990,7 +2994,7 @@ export default {
                 // waitUntil 里跑，所以这里只等一个 RTT，不会吃掉 webhook 预算）。
                 // 失败则立刻给用户明确报错 —— 自调用失败是之前「第 1 段」永远不动
                 // 最常见的原因，不能再静默过去。
-                const kick = await tgKickAutoContinue(env, tgSelfBase, { chatId: chatId, seg: 1 }, 2);
+                const kick = await tgKickAutoContinue(env, url, { chatId: chatId, seg: 1 });
                 if (!kick.ok) {
                   try {
                     const m0 = await tgAutoMsgGet(env, chatId);
@@ -3099,7 +3103,7 @@ export default {
         } catch (e) {}
 
         try {
-          await processTelegramUpdate(env, update, tgApi, ctx, tgSelfBase);
+          await processTelegramUpdate(env, update, tgApi, ctx);
         } catch (err) {
           console.log("处理 Telegram 更新异常:", err);
         }
