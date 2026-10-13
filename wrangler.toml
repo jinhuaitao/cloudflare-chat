@@ -1,6 +1,11 @@
 name = "cloudflare-chat"
 main = "_worker.js"
 compatibility_date = "2024-03-20"
+# 补丁（p7+）：worker 自调用（自动续做的 /tg-auto-continue）必须经过公网边缘
+# 回环重新进入 worker。Cloudflare 官方文档指出，不开这个 flag 时自调用会被
+# 路由到 zone 的源站、跳过 worker 本体（无源站时表现为 522/404）。
+# 配合 TG_SELF_BASE_URL 环境变量（把自调用指向 workers.dev 域名）使用。
+compatibility_flags = ["global_fetch_strictly_public"]
 
 # 保留控制台里手动添加的环境变量，避免每次部署被配置文件同步清空
 keep_vars = true
