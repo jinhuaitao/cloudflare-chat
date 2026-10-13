@@ -38,7 +38,7 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-const APP_VERSION = '6.8.8';
+const APP_VERSION = '6.8.3';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -1424,7 +1424,14 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
 
     if (!resp.ok) {
       const t = await resp.text().catch(() => '');
-      if (allowTools && /tool/i.test(t) && step === 0) return { fallback: true };
+      // 降级判定：通道不支持 tools 时的报错五花八门（Invalid parameter: functions、
+      // unsupported parameter、400 Bad Request…），只认 "tool" 关键词会漏判，
+      // 用户就会拿到一个红色 API 报错而不是自动降级。首步拿到 4xx 一律先降级成
+      // 普通对话重试一次 —— 带工具的请求代价远高于多跑一次无工具的请求。
+      if (allowTools && step === 0 &&
+          ((resp.status >= 400 && resp.status < 500) || /tool|function|unsupported/i.test(t))) {
+        return { fallback: true };
+      }
       return { error: 'API 报错 (' + resp.status + ')：' + String(t).slice(0, 500) };
     }
 
@@ -1627,7 +1634,7 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
 
   // max_tokens 可配：环境变量 MAX_TOKENS，默认 4096，上限 32000
   let maxTokens = parseInt(env.MAX_TOKENS || '4096', 10);
-  if (!(maxTokens > 0)) maxTokens = 4096;
+  if (!(maxTokens > 0)) maxTokens = 16384;
   if (maxTokens > 32000) maxTokens = 32000;
 
   const payload = isImageAPI ? {
@@ -1659,6 +1666,14 @@ async function handleWebAgent(env, body) {
   // Web 无 Telegram 上下文：typing 心跳直接 no-op
   const noOpTgApi = () => Promise.resolve({ ok: true });
 
+  // Web 单轮预算：浏览器是长连接，不需要 Telegram 那套 55 秒妥协，但沿用
+  // AGENT_TIMEOUT_MS 的 240 秒默认值会让用户对着"思考中"干等 4 分钟。
+  // 90 秒足以覆盖绝大多数问题，超时立刻给明确结论。可用 WEB_AGENT_TIMEOUT_MS 覆盖。
+  let webBudgetMs = parseInt(env.WEB_AGENT_TIMEOUT_MS || '90000', 10);
+  if (!(webBudgetMs >= 10000)) webBudgetMs = 90000;
+  if (webBudgetMs > 240000) webBudgetMs = 240000;
+  const webOpts = { maxRuntimeMs: webBudgetMs };
+
   const stream = new ReadableStream({
     async start(controller) {
       const send = (obj) => {
@@ -1668,11 +1683,17 @@ async function handleWebAgent(env, body) {
         try { controller.enqueue(encoder.encode('data: [DONE]\n\n')); } catch (e) {}
         try { controller.close(); } catch (e) {}
       };
+      // 保活心跳：Agent 单步等上游可能长达一两分钟，期间零字节的连接会被浏览器 /
+      // 中间层判为空闲并掐断；掐断后前端拿不到 [DONE]，就会落到"连接意外中断"。
+      // 每 15 秒发一个以 ':' 开头的 SSE 注释行 —— 按 SSE 规范客户端会忽略，
+      // 前端也只解析 'data:' 开头的行，因此不会污染正文。
+      const ka = setInterval(() => {
+        try { controller.enqueue(encoder.encode(': keep-alive ' + Date.now() + '\n\n')); } catch (e) {}
+      }, 15000);
       try {
         const onProgress = async (text) => { send({ agent_progress: String(text).slice(0, 500) }); };
-        // opts 留空：Web 用完整 AGENT_TIMEOUT_MS 预算（浏览器长连接，无 60 秒重发问题），不做断点续做
-        let r = await tgAgentChat(env, noOpTgApi, webChatId, targetModelId, history, true, onProgress, {});
-        if (r.fallback) r = await tgAgentChat(env, noOpTgApi, webChatId, targetModelId, history, false, onProgress, {});
+        let r = await tgAgentChat(env, noOpTgApi, webChatId, targetModelId, history, true, onProgress, webOpts);
+        if (r.fallback) r = await tgAgentChat(env, noOpTgApi, webChatId, targetModelId, history, false, onProgress, webOpts);
         if (r.error) {
           send({ agent_error: r.error });
         } else if (r.text) {
@@ -1685,6 +1706,8 @@ async function handleWebAgent(env, body) {
         }
       } catch (e) {
         send({ agent_error: '⚠️ Agent 执行出错：' + (e && e.message ? e.message : String(e)) });
+      } finally {
+        clearInterval(ka);
       }
       done();
     }
@@ -3979,6 +4002,11 @@ const HTML_CONTENT = `<!DOCTYPE html>
       let aiContent = '';
       let reasoningContent = '';
       let gotDone = false; // 是否收到 SSE 正常结束标记 data: [DONE]
+      // 空闲看门狗：超过该时长没收到任何 SSE 字节就主动断开。服务端每 15 秒发一次
+      // 保活注释行，正常情况下永远不会触发；只有服务端假死 / 连接半开时才会命中，
+      // 否则 reader.read() 会永远挂着，界面就一直停在打字动画上。
+      const AGENT_IDLE_TIMEOUT_MS = 90000;
+      let idleTimedOut = false; // 区分"用户手动中止"与"看门狗中止"
 
       const rBox = bubble.querySelector('.reasoning-box');
       const tBox = bubble.querySelector('.message-text');
@@ -4019,22 +4047,37 @@ const HTML_CONTENT = `<!DOCTYPE html>
       }
 
       // v6.6.0 Agent 进度条（气泡内，收到正文结束 / 出错 / 中止时清除）
+      // 进度事件每步才来一次，而单步等上游可能一两分钟。这里用本地秒表持续刷新
+      // "已等待 N 秒"，让用户确知连接还活着，不必怀疑界面卡死。
       let agentProgressEl = null;
+      let agentProgressBase = '';
+      let agentProgressT0 = 0;
+      let agentProgressTimer = null;
+      function renderAgentProgress() {
+        if (!agentProgressEl) return;
+        const s = Math.round((Date.now() - agentProgressT0) / 1000);
+        agentProgressEl.textContent = agentProgressBase + (s >= 3 ? '\\n（已等待 ' + s + ' 秒）' : '');
+      }
       function showAgentProgress(text) {
         if (!agentProgressEl) {
           agentProgressEl = document.createElement('div');
           agentProgressEl.className = 'agent-progress';
           bubble.appendChild(agentProgressEl);
+          agentProgressT0 = Date.now();
+          agentProgressTimer = setInterval(renderAgentProgress, 1000);
         }
-        agentProgressEl.textContent = text;
+        agentProgressBase = text;
+        renderAgentProgress();
         const distanceToBottom = scrollArea.scrollHeight - scrollArea.scrollTop - scrollArea.clientHeight;
         if (distanceToBottom < 120) {
           scrollArea.scrollTop = scrollArea.scrollHeight;
         }
       }
       function clearAgentProgress() {
+        if (agentProgressTimer) { clearInterval(agentProgressTimer); agentProgressTimer = null; }
         if (agentProgressEl && agentProgressEl.parentNode) agentProgressEl.parentNode.removeChild(agentProgressEl);
         agentProgressEl = null;
+        agentProgressBase = '';
       }
 
       // 自动重试提示条（只在断流重试时短暂出现）
@@ -4093,9 +4136,22 @@ const HTML_CONTENT = `<!DOCTYPE html>
         const decoder = new TextDecoder('utf-8');
         let buffer = '';
 
+        idleTimedOut = false;
+        let idleTimer = null;
+        function bumpIdle() {
+          if (idleTimer) clearTimeout(idleTimer);
+          idleTimer = setTimeout(function () {
+            idleTimedOut = true;
+            try { currentAbortController.abort(); } catch (e) {}
+          }, AGENT_IDLE_TIMEOUT_MS);
+        }
+        bumpIdle();
+
+        try {
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
+          bumpIdle();
 
           buffer += decoder.decode(value, { stream: true });
           let lines = buffer.split('\\n');
@@ -4127,18 +4183,27 @@ const HTML_CONTENT = `<!DOCTYPE html>
               if (handledAsAgentEvent) continue;
               // 不是真正的 Agent 事件 → 回落到下面的普通 SSE 解析，不吞行
             }
-            try {
-              const data = JSON.parse(line.slice(5).trim());
-              if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
-
-              if (data.choices && data.choices[0].delta) {
-                const delta = data.choices[0].delta;
-                if (delta.reasoning_content) reasoningContent += delta.reasoning_content;
-                if (delta.content !== undefined && delta.content !== null) aiContent += delta.content;
-                scheduleUpdateUI();
-              }
-            } catch (e) {}
+            // 普通 SSE 解析：解析失败（多半是被截断的半行）静默跳过即可；
+            // 但 data.error 是服务端明确的失败信号，必须抛出去 —— 之前整段包在
+            // try{}catch(e){} 里，服务端返回的错误被无声吞掉，用户只看到空回复。
+            let sseData = null;
+            try { sseData = JSON.parse(line.slice(5).trim()); } catch (e) { sseData = null; }
+            if (!sseData) continue;
+            if (sseData.error) {
+              const de = new Error(sseData.error.message || JSON.stringify(sseData.error));
+              de.name = 'ServerError';
+              throw de;
+            }
+            if (sseData.choices && sseData.choices[0] && sseData.choices[0].delta) {
+              const delta = sseData.choices[0].delta;
+              if (delta.reasoning_content) reasoningContent += delta.reasoning_content;
+              if (delta.content !== undefined && delta.content !== null) aiContent += delta.content;
+              scheduleUpdateUI();
+            }
           }
+        }
+        } finally {
+          if (idleTimer) clearTimeout(idleTimer);
         }
 
         if (!gotDone && buffer.trim() && buffer.trim().startsWith('data:') && !buffer.includes('[DONE]')) {
@@ -4164,14 +4229,33 @@ const HTML_CONTENT = `<!DOCTYPE html>
         try {
           await runOnce();
         } catch (e) {
-          // 用户手动中止、口令问题：不重试，直接走统一错误处理
-          if (e.name === 'AbortError' || e.name === 'AuthError') { setRetryNotice(null); throw e; }
+          const en = (e && e.name) || '';
+          // 口令问题 / 服务端明确报错 / 空闲超时：不重试，直接走统一错误处理
+          if (en === 'AuthError' || en === 'ServerError' || en === 'IdleTimeout') {
+            setRetryNotice(null);
+            throw e;
+          }
+          // 看门狗触发的 abort 和用户手动中止都是 AbortError，靠 idleTimedOut 区分
+          if (en === 'AbortError') {
+            setRetryNotice(null);
+            if (idleTimedOut) {
+              const ie = new Error('超过 ' + Math.round(AGENT_IDLE_TIMEOUT_MS / 1000) + ' 秒没有收到服务端任何数据，连接可能已中断，请重试');
+              ie.name = 'IdleTimeout';
+              throw ie;
+            }
+            throw e;
+          }
           streamError = e;
         }
         if (gotDone) break;
+        // 关键顺序：必须先把错误对象补全，再判断是否重试。
+        // 之前 agentMode 的 break 排在补错之前，连接被干净关闭（read 返回 done 而不抛错）
+        // 且没收到 [DONE] 时会执行 throw null，紧接着 catch 里读 error.name 又抛一次
+        // TypeError，异常从 catch 内部逃出，气泡里的打字动画永远得不到替换 ——
+        // 这就是用户看到的"一直是思考中"。
+        if (!streamError) streamError = new Error('连接意外中断（未收到结束标记）');
         // v6.6.0 Agent 模式不自动重试：重跑会重复执行工具（重复搜索/重复记忆），中断直接走错误展示
         if (agentMode) break;
-        if (!streamError) streamError = new Error('连接意外中断（未收到结束标记）');
         if (attempt > MAX_AUTO_RETRY) break;
         resetStreamUI();
         setRetryNotice('连接意外中断，正在自动重试（第 ' + attempt + ' 次）…');
@@ -4199,6 +4283,9 @@ const HTML_CONTENT = `<!DOCTYPE html>
       saveSessions();
       
     } catch (error) {
+      // 兜底：error 绝不能是 null / undefined，否则下面读 error.name 会再抛一次
+      // TypeError，异常从 catch 内部逃出，气泡里的打字动画永远得不到替换
+      if (!error) error = new Error('连接意外中断（未收到结束标记）');
       isCurrentlyStreaming = false;
       clearAgentProgress();
       const tBox = bubble.querySelector('.message-text');
@@ -4238,6 +4325,17 @@ const HTML_CONTENT = `<!DOCTYPE html>
       saveSessions();
     } finally {
       isCurrentlyStreaming = false;
+      // 最后一道保险：无论上面走了哪条分支、甚至 catch 里再抛异常，都不允许气泡
+      // 停在打字动画上，也不允许进度秒表继续跑。若检测到残留的 typing-indicator，
+      // 一律替换成明确提示。
+      try {
+        clearAgentProgress();
+        const tb = bubble.querySelector('.message-text');
+        if (tb && tb.querySelector('.typing-indicator')) {
+          tb.innerHTML = '<span style="color:#ef4444;font-size:14px;font-weight:600;">连接中断，未收到回复，请重试</span>';
+          bubble.parentElement.classList.add('error-msg');
+        }
+      } catch (e) {}
       currentAbortController = null;
       statusDot.classList.remove('generating'); 
       syncRegenButtons();   // 生成结束：末尾 AI 回复的「重新生成」恢复可用
