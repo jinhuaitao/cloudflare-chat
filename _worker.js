@@ -41,7 +41,7 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 // 后缀 -pN 表示这是本地补丁版（p1 卡死修复 + 真流式 / p2 Telegram 流式 /
 // p3 Telegram 预算与硬墙钟），上游仓库无此版本。
 // 发 /help 看到带 -p3 即说明部署的是打过补丁的构建。
-const APP_VERSION = '6.8.3-p3';
+const APP_VERSION = '6.8.3-p4';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -1289,6 +1289,55 @@ function describeToolCall(name, args) {
 // 预算耗尽不再终结任务，而是把 ReAct 循环的 messages 存到 R2，
 // 用户发「继续」即用全新预算接着跑，超长任务可分多段完成。
 function tgAgentResumeKey(chatId) { return 'tg_agent_' + chatId; }
+
+// 「占位消息」登记：worker 被平台掐断（CPU 超限 / Telegram 60 秒断连）时，
+// 它连一句错误都发不出去 —— 占位消息会永远停在"Agent 思考中…"。
+// 把占位消息 id 落库，下一次收到消息时兜底收掉，用户就不会无限干等。
+// 用**数组**而不是单条：用户完全可能在上一轮还没结束时又发一条新消息，
+// 单条登记会被新的一轮直接覆盖，那条孤儿占位就永远没人管了。
+function tgPendingKey(chatId) { return 'tg_pending_' + chatId; }
+
+async function tgPendingLoad(env, chatId) {
+  try {
+    const raw = await storeGet(env, tgPendingKey(chatId));
+    if (!raw) return [];
+    const p = JSON.parse(raw);
+    if (Array.isArray(p)) return p.filter(x => x && x.id);
+    if (p && p.id) return [{ id: p.id, at: p.at || 0 }];   // 兼容更早的单条登记格式
+    return [];
+  } catch (e) { return []; }
+}
+async function tgPendingSave(env, chatId, list) {
+  try {
+    if (list && list.length) await storePut(env, tgPendingKey(chatId), JSON.stringify(list));
+    else await storeDelete(env, tgPendingKey(chatId));
+  } catch (e) {}
+}
+
+// 兜底收掉上一轮遗留的占位消息。判据是「登记时间距今超过 staleMs」——
+// 正常一轮最长就是本轮预算 + 收尾，所以 staleMs 传「预算 + 15 秒」，
+// 不会误伤正在跑的那一轮。即便真的误判，那条消息随后也会被最终的正文编辑
+// 覆盖成真正的答案，所以是自愈的，不会把用户带偏。
+async function tgCleanupStalePending(env, tgApi, chatId, staleMs) {
+  const limit = (staleMs && staleMs > 10000) ? staleMs : 75000;
+  const list = await tgPendingLoad(env, chatId);
+  if (!list.length) return;
+  const now = Date.now();
+  const keep = [], stale = [];
+  for (const it of list) (now - (it.at || 0) >= limit ? stale : keep).push(it);
+  if (!stale.length) return;
+  await tgPendingSave(env, chatId, keep);
+  for (const it of stale) {
+    try {
+      await tgApi('editMessageText', {
+        chat_id: chatId,
+        message_id: it.id,
+        text: '⚠️ 上一轮任务被中断了（超过平台时限被强制结束），请重试或发「继续」接着做。'
+      }, TG_QUICK_API_TIMEOUT_MS);
+    } catch (e) {}
+  }
+}
+
 async function agentSaveResumeState(env, chatId, state) {
   if (!env.R2) return false;
   try {
@@ -1450,9 +1499,14 @@ async function readUpstreamMessage(resp, onDelta) {
     const { done, value } = await reader.read();
     if (done) break;
     const chunk = decoder.decode(value, { stream: true });
-    raw += chunk;
-    // 防 OOM：异常巨大的响应体直接掐断（正常对话远达不到 4MB）
-    if (raw.length > 4000000) { try { await reader.cancel(); } catch (e) {} break; }
+    // raw 只在「上游其实没按 SSE 返回」的兜底解析里用得到。一旦确认是 SSE 就
+    // 不再累积 —— 反复拼接几 MB 字符串本身就吃 CPU，而 Workers 的 CPU 配额很紧
+    // （免费版尤其），CPU 超限会被静默掐断，表现就是用户看到"思考中"然后没反应。
+    if (!sawSSE) {
+      raw += chunk;
+      // 防 OOM：异常巨大的非 SSE 响应体直接掐断（正常对话远达不到 2MB）
+      if (raw.length > 2000000) { try { await reader.cancel(); } catch (e) {} break; }
+    }
     buffer += chunk;
     const lines = buffer.split('\n');
     buffer = lines.pop();
@@ -2268,6 +2322,23 @@ export default {
               history.push({ role: "user", content: userText });
               history = tgTrimHistory(history, env);
 
+              // webhook 单轮预算：Telegram 约 60 秒无响应会断开连接，而**客户端断开后
+              // worker 会被一起 cancel** —— 收尾消息发不出去，用户就永远停在那句
+              // "Agent 思考中…"上。这是最常见的"没反应"，所以预算不能贴着 60 秒，
+              // 必须留足余量：默认 45 秒，另扣 TG_WEBHOOK_RESERVE_MS（默认 6 秒）做收尾。
+              // 可用 TG_WEBHOOK_BUDGET_MS 调整（10 秒 ~ 240 秒）。
+              // 超预算的任务会暂停并保存进度，用户发「继续」即接着做。
+              let webhookBudgetMs = parseInt(env.TG_WEBHOOK_BUDGET_MS || '45000', 10);
+              if (!(webhookBudgetMs >= 10000)) webhookBudgetMs = 45000;
+              if (webhookBudgetMs > 240000) webhookBudgetMs = 240000;
+
+              // 先兜底收掉上一轮遗留的「思考中」占位消息：worker 被平台掐断时
+              // 收尾消息发不出去，占位会永远停在那里。这里在下一轮开工前收掉并说明，
+              // 不依赖 worker 自己能活到收尾。判据按本轮预算推导（预算 + 15 秒），
+              // 所以上一轮只要还在预算内正常跑，就绝不会被误收。
+              await tgCleanupStalePending(env, tgApi, chatId, webhookBudgetMs + 15000);
+
+              const turnT0 = Date.now();
               const sendActionPromise = tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
               const pendingMsgPromise = tgApi('sendMessage', {
                 chat_id: chatId,
@@ -2282,21 +2353,21 @@ export default {
               }).catch(() => null);
 
               const [, pendingMsgId] = await Promise.all([sendActionPromise, pendingMsgPromise]);
+              // 登记占位消息 id，供下一轮兜底清理；正常走到收尾时会摘掉自己的那一条。
+              // 追加而不是覆盖：用户可能在上一轮没结束时又发一条，两条占位都要有主。
+              if (pendingMsgId) {
+                try {
+                  const list = await tgPendingLoad(env, chatId);
+                  list.push({ id: pendingMsgId, at: turnT0 });
+                  await tgPendingSave(env, chatId, list.length > 5 ? list.slice(-5) : list);
+                } catch (e) {}
+              }
 
               // ===== Agent 主流程：自主规划 → 工具调用 → 汇总作答 =====
               const useAgent = await agentGetMode(env, chatId);
               let replyText = null;
               let agentErr = null;
 
-              // webhook 单轮预算：Telegram 约 60 秒无响应会断开连接，而**客户端断开后
-              // worker 会被一起 cancel** —— 收尾消息发不出去，用户就永远停在那句
-              // "Agent 思考中…"上。这是最常见的"没反应"，所以预算不能贴着 60 秒，
-              // 必须留足余量：默认 45 秒，另扣 TG_WEBHOOK_RESERVE_MS（默认 6 秒）做收尾。
-              // 可用 TG_WEBHOOK_BUDGET_MS 调整（10 秒 ~ 240 秒）。
-              // 超预算的任务会暂停并保存进度，用户发「继续」即接着做。
-              let webhookBudgetMs = parseInt(env.TG_WEBHOOK_BUDGET_MS || '45000', 10);
-              if (!(webhookBudgetMs >= 10000)) webhookBudgetMs = 45000;
-              if (webhookBudgetMs > 240000) webhookBudgetMs = 240000;
               // 整轮共享同一个硬墙钟：「首步带工具失败 → 降级重试」是两次 tgAgentChat，
               // 各自算预算会让总时长直接翻倍
               const agentDeadline = Date.now() + Math.max(3000, webhookBudgetMs - tgReplyReserveMs(env, webhookBudgetMs));
@@ -2416,6 +2487,14 @@ export default {
                   // 正常完成（非暂停）后清理断点；暂停时新状态已在内部保存
                   if (!r.paused) await agentClearResumeState(env, chatId);
                 }
+                // 一行式回合摘要：排查"卡住"时 wrangler tail 直接能看到每轮的耗时与结局。
+                // 关键看 elapsed 是否逼近 budget —— 逼近就说明又被平台掐断了。
+                console.log('[cloudflare-chat] tg回合 chat=' + chatId
+                  + ' elapsed=' + (Date.now() - turnT0) + 'ms'
+                  + ' budget=' + webhookBudgetMs + 'ms'
+                  + ' 结局=' + (r.error ? 'error' : (r.paused ? 'paused' : 'ok'))
+                  + ' 正文=' + (r.text ? r.text.length : 0) + '字'
+                  + (r.error ? ' 错误=' + String(r.error).slice(0, 200) : ''));
               } else {
                 // 普通模式：单次问答（与旧版行为一致，不调用工具）
                 const aiConfig = buildAIRequest(env, targetModelId, history, false);
@@ -2466,6 +2545,15 @@ export default {
                     agentErr = "⚠️ AI 接口请求失败，请稍后再试。";
                   }
                 }
+              }
+
+              // 走到收尾阶段，把本轮自己的占位登记摘掉（无论下面走哪条分支）。
+              // 只摘自己那条：别的聊天/上一轮的登记不归本轮管。
+              if (pendingMsgId) {
+                try {
+                  const list = await tgPendingLoad(env, chatId);
+                  await tgPendingSave(env, chatId, list.filter(x => x.id !== pendingMsgId));
+                } catch (e) {}
               }
 
               if (agentErr) {
