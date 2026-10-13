@@ -17,6 +17,13 @@
 - 至少一个兼容 OpenAI 接口格式的 API 通道（OpenAI、通义千问、DeepSeek 等均可）
 
 ---
+# 部署
+
+## 方式一
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/jinhuaitao/cloudflare-chat)
+
+## 方式二
 
 # 第一步：在 Cloudflare 中导入 Git 存储库部署
 
