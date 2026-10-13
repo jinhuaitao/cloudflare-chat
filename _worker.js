@@ -41,7 +41,7 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 // 后缀 -pN 表示这是本地补丁版（p1 卡死修复 + 真流式 / p2 Telegram 流式 /
 // p3 Telegram 预算与硬墙钟），上游仓库无此版本。
 // 发 /help 看到带 -p3 即说明部署的是打过补丁的构建。
-const APP_VERSION = '6.8.3-p11';
+const APP_VERSION = '6.8.3-p12';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -1505,27 +1505,33 @@ function tgSelfBases(env, url) {
 const tgHostOf = (u) => String(u || '').replace(/^https:\/\//i, '');
 // 自调用 kick：按候选地址逐个尝试，单次只等一个 RTT（内部端点收到即回 200）。
 // timeoutMs 按调用场景给：webhook 内（60 秒预算）可给 8 秒；段尾（waitUntil
-// 额度内）只给 2 秒 —— 超时不断链（POST 大概率已发出），真正确定性失败
-// （4xx/5xx）才报错。
+// 额度内）只给 2 秒。
+// p12 at-least-once：body 里带 kickId，超时后用**同一个 kickId**重试一次 ——
+// endpoint 侧去重，重复的 kick 直接回 OK 不会起重复段。所以重试是安全的，
+// 不会像以前那样"不敢重试怕起两段"。两次都超时才判失败，走明确报错。
 async function tgKickAutoContinue(env, url, body, timeoutMs) {
   const bases = tgSelfBases(env, url);
   const tms = timeoutMs > 0 ? timeoutMs : 2000;
+  if (!body.kickId) body.kickId = newKickId();
   let lastErr = '';
   for (const base of bases) {
-    try {
-      const rk = await fetch(base + '/tg-auto-continue', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Auto-Continue-Token': tgAutoContinueToken(env) },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(tms)
-      });
-      if (rk && rk.ok) return { ok: true };
-      lastErr = 'HTTP ' + (rk ? rk.status : '无响应') + '（目标 ' + tgHostOf(base) + '）';
-      if (rk && rk.status === 522) continue; // 确定性失败：换下一个地址试
-      return { ok: false, err: lastErr }; // 其他 HTTP 失败：确定性失败，直接返回
-    } catch (e) {
-      lastErr = ((e && e.message) ? e.message : String(e)) + '（目标 ' + tgHostOf(base) + '）';
-      // 超时/网络异常：不确定 POST 是否发出，换下一个地址试
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const rk = await fetch(base + '/tg-auto-continue', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Auto-Continue-Token': tgAutoContinueToken(env) },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(tms)
+        });
+        if (rk && rk.ok) return { ok: true };
+        lastErr = 'HTTP ' + (rk ? rk.status : '无响应') + '（目标 ' + tgHostOf(base) + '）';
+        if (rk && rk.status === 522) break; // 确定性失败：换下一个地址试，不重试
+        return { ok: false, err: lastErr }; // 其他 HTTP 失败：确定性失败，直接返回
+      } catch (e) {
+        lastErr = ((e && e.message) ? e.message : String(e)) + '（目标 ' + tgHostOf(base) + '）';
+        // 超时/网络异常：用同一个 kickId 再试一次（去重保证安全）。
+        // 两次都超时 → 判失败，调用方走明确报错，不再静默假设"已发出"。
+      }
     }
   }
   return { ok: false, err: lastErr };
@@ -1590,6 +1596,78 @@ async function tgAutoTotalSegClear(env, chatId) {
   try { await storeDelete(env, tgAutoTotalSegKey(chatId)); } catch (e) {}
 }
 function newAutoEpoch() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
+// ===== 自动续做统一状态（p12 方案 B：状态收敛）=====
+// 把原来分散的 3 个 R2 键（tg_auto_msg_ / tg_auto_epoch_ / tg_auto_total_seg_）
+// 收成 1 个 JSON，原子读写，消除多键不一致的整类问题。
+// state 形状：{v:1, epoch, seg, totalSeg, msgId, at, segAt, updatedAt}
+// 注意：tg_agent_（断点，体积大、读写模式不同）和 tg_pending_（通用占位兜底）保持独立。
+function tgAutoStateKey(chatId) { return 'tg_auto_' + chatId; }
+async function tgAutoStateGet(env, chatId) {
+  try {
+    const raw = await storeGet(env, tgAutoStateKey(chatId));
+    if (raw) {
+      const s = JSON.parse(raw);
+      // 两种有效形态：活跃链（epoch+msgId 都在）、休眠（maxSeg giveUp 后，
+      // epoch 已空但 totalSeg 保留，供下次手动「继续」接着计数）
+      if (s && (s.msgId || s.totalSeg)) return s;
+    }
+  } catch (e) {}
+  // 迁移兜底：新键没有时，尝试从老键组装（部署切换瞬间在飞的链不受影响）
+  try {
+    const msg = await tgAutoMsgGet(env, chatId);
+    if (msg && msg.id) {
+      const epoch = msg.epoch || await tgAutoEpochGet(env, chatId);
+      if (epoch) {
+        const totalSeg = await tgAutoTotalSegGet(env, chatId);
+        const s = {
+          v: 1, epoch,
+          seg: msg.seg || 1,
+          totalSeg: totalSeg > 0 ? totalSeg : (msg.totalSeg || msg.seg || 1),
+          msgId: msg.id, at: msg.at || Date.now(), segAt: msg.segAt || Date.now(),
+          updatedAt: Date.now()
+        };
+        await tgAutoStateSave(env, chatId, s); // 写回新键，下次直接命中
+        return s;
+      }
+    }
+    // 老键只有 totalSeg（上次 giveUp 保留的）：组装休眠态
+    const totalSeg = await tgAutoTotalSegGet(env, chatId);
+    if (totalSeg > 0) {
+      return { v: 1, epoch: null, seg: 0, totalSeg, msgId: null, updatedAt: Date.now() };
+    }
+  } catch (e) {}
+  return null;
+}
+async function tgAutoStateSave(env, chatId, state) {
+  try {
+    state.updatedAt = Date.now();
+    await storePut(env, tgAutoStateKey(chatId), JSON.stringify(state));
+  } catch (e) {}
+}
+async function tgAutoStateClear(env, chatId) {
+  try { await storeDelete(env, tgAutoStateKey(chatId)); } catch (e) {}
+  // 顺手清掉老键，防止新旧混用
+  try { await storeDelete(env, tgAutoMsgKey(chatId)); } catch (e) {}
+  try { await storeDelete(env, tgAutoEpochKey(chatId)); } catch (e) {}
+  try { await storeDelete(env, tgAutoTotalSegKey(chatId)); } catch (e) {}
+}
+// kick 去重：at-least-once 语义下，超时重试用同一个 kickId，
+// endpoint 见过就直接回 OK，不会重复起段。
+function tgKickDedupKey(kickId) { return 'tg_kick_' + kickId; }
+async function tgKickDedupCheck(env, kickId) {
+  // 返回 true 表示已处理过（重复），false 表示首次
+  if (!env.R2 || !kickId) return false;
+  try {
+    const raw = await env.R2.get(tgKickDedupKey(kickId)).then(o => o ? o.text() : null);
+    if (raw) {
+      const at = parseInt(raw, 10);
+      if (Date.now() - at < 5 * 60 * 1000) return true; // 5 分钟内算重复
+    }
+    await env.R2.put(tgKickDedupKey(kickId), String(Date.now()));
+  } catch (e) {}
+  return false;
+}
+function newKickId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 10); }
 // 刷新 pending 登记里某条消息的时间戳：自动续做会跑很多段，远超"预算 + 15 秒"
 // 的过期阈值，不刷新就会被下一轮的"过期占位"兜底误判成僵尸消息。
 async function tgPendingTouch(env, chatId, msgId) {
@@ -1643,25 +1721,24 @@ async function runTgAutoContinue(env, ctx, chatId, seg, totalSeg, url, t0) {
   // Agent 的 deadline 从 t0（额度起点）锚定，保证收尾有硬保证的时间 ——
   // 这是修复"跑几段后没反应"的关键：以前按段开始时间算，前置稍慢就整段被掐断。
   const TAIL_RESERVE_MS = 9000;
-  // 本段链的代际校验：进度消息登记与 epoch 必须成对出现且一致，否则说明这条链
-  // 已被新的暂停 / 新消息取代 —— 静默收工，绝不复活僵尸链去跑别人的任务。
+  // 本段链的代际校验：统一状态里的 epoch 必须和本段持有的 rec.epoch 一致，
+  // 否则说明这条链已被新的暂停 / 新消息取代 —— 静默收工，绝不复活僵尸链。
   // ms：R2 限时，超时按"没读到"处理（段尾用短超时保活，段首用长超时保准）。
   const chainAlive = async (rec, ms) => {
     try {
       if (!rec || !rec.epoch) return false;
-      const cur = await withTimeout(tgAutoEpochGet(env, chatId), ms || 3000);
-      return !!cur && cur === rec.epoch;
+      const cur = await withTimeout(tgAutoStateGet(env, chatId), ms || 3000);
+      return !!cur && cur.epoch === rec.epoch;
     } catch (e) { return false; }
   };
-  const autoMsg0 = await withTimeout(tgAutoMsgGet(env, chatId), 6000);
+  const st0 = await withTimeout(tgAutoStateGet(env, chatId), 6000);
 
   if (!env.R2) {
     // 以前这里静默 return，用户只会看到「第 N 段」永远不动 —— 改成明确报错
-    if (autoMsg0 && autoMsg0.id) {
-      await tgAutoSendOrEdit(env, tgApi, chatId, autoMsg0, '⚠️ 自动续做需要绑定 R2 才能运行（进度存档无处可存），已停止。');
-      await tgAutoMsgClear(env, chatId);
-      await tgAutoEpochSet(env, chatId, null);
-      await tgPendingRemove(env, chatId, autoMsg0.id);
+    if (st0 && st0.msgId) {
+      await tgAutoSendOrEdit(env, tgApi, chatId, { id: st0.msgId }, '⚠️ 自动续做需要绑定 R2 才能运行（进度存档无处可存），已停止。');
+      await tgAutoStateClear(env, chatId);
+      await tgPendingRemove(env, chatId, st0.msgId);
     }
     return 'stop';
   }
@@ -1669,47 +1746,49 @@ async function runTgAutoContinue(env, ctx, chatId, seg, totalSeg, url, t0) {
   // 取回暂停存档；取不到说明任务已完成 / 已过期 / 已被新问题清掉 —— 直接收工
   const saved = await withTimeout(agentLoadResumeState(env, chatId), 6000);
   if (!saved) {
-    if (autoMsg0 && autoMsg0.id && seg <= 1) {
+    if (st0 && st0.msgId && seg <= 1) {
       // 第 1 段：消息登记还在但存档丢了 = 真正的异常（R2 读取失败），必须让用户看见；
       // 登记也没了 = 链已被新消息取代，走静默收工（新消息分支已给出「已停止」说明）。
-      await tgAutoSendOrEdit(env, tgApi, chatId, autoMsg0, '⚠️ 自动续做异常：进度存档丢失（R2 读取失败或已被清理），请重试或发「继续」手动接着做。');
-      await tgAutoMsgClear(env, chatId);
-      await tgAutoEpochSet(env, chatId, null);
-      await tgPendingRemove(env, chatId, autoMsg0.id);
-    } else if (autoMsg0 && autoMsg0.id) {
-      await tgAutoMsgClear(env, chatId);
-      await tgAutoEpochSet(env, chatId, null);
+      await tgAutoSendOrEdit(env, tgApi, chatId, { id: st0.msgId }, '⚠️ 自动续做异常：进度存档丢失（R2 读取失败或已被清理），请重试或发「继续」手动接着做。');
+      await tgAutoStateClear(env, chatId);
+      await tgPendingRemove(env, chatId, st0.msgId);
+    } else if (st0 && st0.msgId) {
+      await tgAutoStateClear(env, chatId);
     }
     return 'stop';
   }
   // 代际校验：旧链（已被新暂停 / 新消息取代）到此为止，不再往下跑
-  if (!(await chainAlive(autoMsg0, 6000))) return 'stop';
+  if (!(await chainAlive(st0, 6000))) return 'stop';
 
-  const giveUp = async (why) => {
-    const m = await withTimeout(tgAutoMsgGet(env, chatId), 3000);
+  // giveUp：收尾。preserveTotal=true 时保留累计段数（休眠态），供下次手动「继续」；
+  // 否则彻底清理（含 totalSeg）。P2-1 收敛：以前 totalSeg 的保存散落在外易遗漏。
+  const giveUp = async (why, preserveTotal) => {
+    const m = await withTimeout(tgAutoStateGet(env, chatId), 3000);
     // 链已被取代（新消息/新暂停）时不再往那条消息上写东西 —— 新分支已经给出过说明
     if (!(await chainAlive(m, 2000))) {
-      if (m && m.id) { try { await tgPendingRemove(env, chatId, m.id); } catch (e) {} }
+      if (m && m.msgId) { try { await tgPendingRemove(env, chatId, m.msgId); } catch (e) {} }
       return 'stop';
     }
-    await tgAutoSendOrEdit(env, tgApi, chatId, m, why);
-    await tgAutoMsgClear(env, chatId);
-    await tgAutoEpochSet(env, chatId, null);
-    if (m && m.id) await tgPendingRemove(env, chatId, m.id);
+    await tgAutoSendOrEdit(env, tgApi, chatId, { id: m.msgId }, why);
+    if (preserveTotal && totalSeg > 0) {
+      await tgAutoStateSave(env, chatId, { v: 1, epoch: null, seg: 0, totalSeg, msgId: null });
+    } else {
+      await tgAutoStateClear(env, chatId);
+    }
+    if (m && m.msgId) await tgPendingRemove(env, chatId, m.msgId);
     return 'stop';
   };
 
   if (seg > maxSeg) {
-    // 段数用尽：累计段数存下来，手动「继续」时新链从 totalSeg+1 接着显示
-    await tgAutoTotalSegSet(env, chatId, totalSeg);
-    return await giveUp('⏸️ 已自动续做 ' + totalSeg + ' 段仍未完成，先停在这里。发送「继续」可接着做。');
+    return await giveUp('⏸️ 已自动续做 ' + totalSeg + ' 段仍未完成，先停在这里。发送「继续」可接着做。', true);
   }
 
   // 复用同一条进度消息；第一段没有就新建一条（并登记进 pending，链断了也能被兜底收掉）。
   // seg>1 却找不到记录 = 链已被新消息/清空打断 → 静默收工，别再自己往下跑。
   // （上面的 chainAlive 已保证：能走到这里的登记一定属于本代链。）
-  let msg = autoMsg0;
-  if (!msg || !msg.id) {
+  let msgId = st0 && st0.msgId ? st0.msgId : null;
+  let curEpoch = st0 && st0.epoch ? st0.epoch : null;
+  if (!msgId) {
     if (seg > 1) return 'stop';
     let id = null;
     try {
@@ -1720,28 +1799,32 @@ async function runTgAutoContinue(env, ctx, chatId, seg, totalSeg, url, t0) {
       if (r && r.ok) { const d = await r.json(); id = d && d.result ? d.result.message_id : null; }
     } catch (e) {}
     if (!id) return 'stop';
-    msg = { id, at: Date.now(), epoch: await tgAutoEpochGet(env, chatId), seg, totalSeg, segAt: Date.now() };
-    await tgAutoMsgSave(env, chatId, msg);
+    msgId = id;
+    // 新链第一段：epoch 应已由 webhook 写入；兜底读一次
+    if (!curEpoch) curEpoch = (await tgAutoStateGet(env, chatId) || {}).epoch || null;
+    await tgAutoStateSave(env, chatId, {
+      v: 1, epoch: curEpoch, seg, totalSeg,
+      msgId, at: Date.now(), segAt: Date.now()
+    });
     try {
       const list = await tgPendingLoad(env, chatId);
       list.push({ id, at: Date.now() });
       await tgPendingSave(env, chatId, list.length > 5 ? list.slice(-5) : list);
     } catch (e) {}
   } else {
-    msg.at = Date.now();
-    msg.seg = seg;
-    msg.totalSeg = totalSeg;
-    msg.segAt = Date.now();
     // 限时：R2 慢只吃 Agent 的时间（deadline 已锚定），不能无限挂起
-    await withTimeout(tgAutoMsgSave(env, chatId, msg), 3000);
-    await withTimeout(tgPendingTouch(env, chatId, msg.id), 3000);
+    await withTimeout(tgAutoStateSave(env, chatId, {
+      v: 1, epoch: curEpoch, seg, totalSeg,
+      msgId, at: Date.now(), segAt: Date.now()
+    }), 3000);
+    await withTimeout(tgPendingTouch(env, chatId, msgId), 3000);
   }
 
   // 每段开头把这条消息刷成当前段号。关闭流式编辑（TG_STREAM_EDIT_MS=0）时
   // onProgress 是空操作，不在这里补一刀的话用户会一直看到「第 1 段」不动。
   try {
     await tgApi('editMessageText', {
-      chat_id: chatId, message_id: msg.id,
+      chat_id: chatId, message_id: msgId,
       text: '🔄 任务较长，正在自动继续（第 ' + totalSeg + ' 段）…'
     }, TG_QUICK_API_TIMEOUT_MS);
   } catch (e) {}
@@ -1757,7 +1840,7 @@ async function runTgAutoContinue(env, ctx, chatId, seg, totalSeg, url, t0) {
     const text = stream.buf ? stream.buf.slice(0, 3900) : stream.progress;
     if (text === stream.lastSent) return;
     stream.inFlight = true;
-    try { await tgApi('editMessageText', { chat_id: chatId, message_id: msg.id, text }, TG_QUICK_API_TIMEOUT_MS); }
+    try { await tgApi('editMessageText', { chat_id: chatId, message_id: msgId, text }, TG_QUICK_API_TIMEOUT_MS); }
     catch (e) {} finally { stream.lastSent = text; stream.inFlight = false; }
   };
   const startStream = () => { if (streamEnabled && !stream.timer) stream.timer = setInterval(() => { flush(); }, streamEditMs); };
@@ -1806,41 +1889,34 @@ async function runTgAutoContinue(env, ctx, chatId, seg, totalSeg, url, t0) {
     if (seg < maxSeg) {
       // 起下一段前再核对一次代际：本段跑的这段时间里可能来了新消息 / 新暂停
       // （2 秒限时，超时则放行保活——下段开头还会再核对一次）
-      const recNow = await withTimeout(tgAutoMsgGet(env, chatId), 2000);
+      const recNow = await withTimeout(tgAutoStateGet(env, chatId), 2000);
       if (!(await chainAlive(recNow, 2000))) return 'stop';
       // 关键：立刻起下一段。这是"自动"二字的全部实现 —— 用户什么都不用做。
-      // 快速单次确认（2 秒）：成功或确定性失败（4xx/5xx）都立刻有结论；
-      // 超时/网络异常则不断链（POST 大概率已发出），真断了由兜底清理接住。
+      // p12 at-least-once：kick 带 kickId，超时用同一 kickId 重试一次，
+      // endpoint 去重保证不会起重复段。两次都失败才走明确报错。
       const kick = await tgKickAutoContinue(env, url, { chatId, seg: seg + 1, totalSeg: totalSeg + 1 }, 2000);
       if (!kick.ok) {
-        if (/^HTTP [45]/.test(kick.err || '')) {
-          return await giveUp('⚠️ 自动续做链中断：第 ' + totalSeg + ' 段完成后无法启动下一段（' + kick.err + '）。'
-            + '进度已保存，发「继续」可手动接着做。' + autoKickHint(kick.err));
-        }
-        return 'paused';
+        return await giveUp('⚠️ 自动续做链中断：第 ' + totalSeg + ' 段完成后无法启动下一段（' + kick.err + '）。'
+          + '进度已保存，发「继续」可手动接着做。' + autoKickHint(kick.err));
       }
       return 'paused';
     }
-    // 段数用尽：累计段数存下来，手动「继续」时新链从 totalSeg+1 接着显示
-    await tgAutoTotalSegSet(env, chatId, totalSeg);
-    return await giveUp('⏸️ 已自动续做 ' + totalSeg + ' 段仍未完成，先停在这里。发送「继续」可接着做。');
+    return await giveUp('⏸️ 已自动续做 ' + totalSeg + ' 段仍未完成，先停在这里。发送「继续」可接着做。', true);
   }
 
   // ===== 跑完：把结果写进同一条消息，并清理所有中间状态 =====
   // 写回前最后核对一次代际：本段跑的这段时间里若来了新消息，旧链的答案不能
   // 覆盖掉那条「⏹️ 上一轮长任务已停止」，否则用户会看到串台的答案
-  const recEnd = await withTimeout(tgAutoMsgGet(env, chatId), 2000);
+  const recEnd = await withTimeout(tgAutoStateGet(env, chatId), 2000);
   if (!(await chainAlive(recEnd, 2000))) {
-    try { await tgPendingRemove(env, chatId, msg.id); } catch (e) {}
+    try { await tgPendingRemove(env, chatId, msgId); } catch (e) {}
     return 'stop';
   }
   const text = r.text || '（本次任务没有产出内容）';
-  await tgAutoSendOrEdit(env, tgApi, chatId, msg, text);
-  await tgAutoMsgClear(env, chatId);
-  await tgAutoEpochSet(env, chatId, null);
-  await tgPendingRemove(env, chatId, msg.id);
+  await tgAutoSendOrEdit(env, tgApi, chatId, { id: msgId }, text);
+  await tgAutoStateClear(env, chatId);
+  await tgPendingRemove(env, chatId, msgId);
   await agentClearResumeState(env, chatId);
-  await tgAutoTotalSegClear(env, chatId);
 
   // 记入多轮历史：用暂停存档里带的原始提问补齐 user 消息，保持 user/assistant 交替
   if (!r.isImage && text) {
@@ -2600,6 +2676,12 @@ export default {
       let totalSeg = body ? parseInt(body.totalSeg, 10) : seg;
       if (!(totalSeg >= 1)) totalSeg = seg;
       if (chatId === undefined || chatId === null) return new Response('OK', { status: 200 });
+      // p12 at-least-once 去重：同一个 kickId 重复打过来（超时重试），直接回 OK，
+      // 不会重复起段。注意去重检查放在鉴权之后、启动 waitUntil 之前。
+      const kickId = body ? body.kickId : null;
+      if (kickId && await tgKickDedupCheck(env, kickId)) {
+        return new Response('OK', { status: 200 });
+      }
       // 自调用基础地址在 runTgAutoContinue 内部按 TG_SELF_BASE_URL / origin 自动选择；
       // t0 传进去做整段预算的锚点
       ctx.waitUntil(runTgAutoContinue(env, ctx, chatId, seg, totalSeg, url, t0));
@@ -2698,8 +2780,7 @@ export default {
               if (userText === '/clear' || userText === '/new') {
                 await tgClearHistory(env, chatId);
                 await agentClearResumeState(env, chatId);
-                await tgAutoMsgClear(env, chatId);
-                await tgAutoTotalSegClear(env, chatId);
+                await tgAutoStateClear(env, chatId);
                 await tgApi('sendMessage', { chat_id: chatId, text: "🧹 上下文已清空，可以开始新的话题了。" });
                 return;
               }
@@ -2841,20 +2922,18 @@ export default {
               // "正在自动继续…"，链的下一段也会继续跑、和新问题抢上下文。
               if (!wantResume) {
                 try {
-                  const prev = await tgAutoMsgGet(env, chatId);
-                  if (prev && prev.id) {
-                    await tgPendingRemove(env, chatId, prev.id);
+                  const prev = await tgAutoStateGet(env, chatId);
+                  if (prev && prev.msgId) {
+                    await tgPendingRemove(env, chatId, prev.msgId);
                     await tgApi('editMessageText', {
-                      chat_id: chatId, message_id: prev.id,
+                      chat_id: chatId, message_id: prev.msgId,
                       text: '⏹️ 上一轮长任务已停止（你发了新消息）。'
                     }, TG_QUICK_API_TIMEOUT_MS).catch(() => {});
                   }
-                  await tgAutoMsgClear(env, chatId);
-                  // 同步作废旧链的代际：正在跑的旧段在下一个关键点会自己停下，
+                  // 统一清理：状态、代际、累计段数一次清掉。
+                  // 正在跑的旧段在下一个 chainAlive 关键点看到 epoch 对不上会自己停下，
                   // 不会复活旧任务、也不会覆盖这条「已停止」提示
-                  await tgAutoEpochSet(env, chatId, null);
-                  // 新问题 = 新任务，累计段数清零
-                  await tgAutoTotalSegClear(env, chatId);
+                  await tgAutoStateClear(env, chatId);
                 } catch (e) {}
               }
 
@@ -2968,14 +3047,16 @@ export default {
                   autoContinue = true;
                   replyText = null;
                   try {
-                    // 新开一条自动续做链：生成代际标识写入 R2，旧链各段看到对不上就会自己停下，
-                    // 不会复活、不会和新链抢同一条进度消息。
+                    // 新开一条自动续做链：生成代际标识写入统一状态，旧链各段在
+                    // chainAlive 看到 epoch 对不上就会自己停下，不会复活、不会抢消息。
                     // 累计段号接着上次的往后排（手动「继续」后是第 9 段起），而不是回到第 1 段。
                     const epoch = newAutoEpoch();
-                    const prevTotal = await tgAutoTotalSegGet(env, chatId);
-                    autoStartTotalSeg = prevTotal + 1;
-                    await tgAutoEpochSet(env, chatId, epoch);
-                    await tgAutoMsgSave(env, chatId, { id: pendingMsgId, at: Date.now(), epoch, seg: 1, totalSeg: autoStartTotalSeg, segAt: Date.now() });
+                    const prevSt = await tgAutoStateGet(env, chatId);
+                    autoStartTotalSeg = (prevSt && prevSt.totalSeg > 0 ? prevSt.totalSeg : 0) + 1;
+                    await tgAutoStateSave(env, chatId, {
+                      v: 1, epoch, seg: 1, totalSeg: autoStartTotalSeg,
+                      msgId: pendingMsgId, at: Date.now(), segAt: Date.now()
+                    });
                     await tgApi('editMessageText', {
                       chat_id: chatId, message_id: pendingMsgId,
                       text: '🔄 任务较长，正在自动继续（第 ' + autoStartTotalSeg + ' 段）…'
@@ -2989,10 +3070,10 @@ export default {
                     history = tgTrimHistory(history, env);
                     await tgSaveHistory(env, chatId, history);
                   }
-                  // 正常完成（非暂停）后清理断点与累计段数；暂停时新状态已在内部保存
+                  // 正常完成（非暂停）后清理断点与自动续做状态；暂停时新状态已在内部保存
                   if (!r.paused) {
                     await agentClearResumeState(env, chatId);
-                    await tgAutoTotalSegClear(env, chatId);
+                    await tgAutoStateClear(env, chatId);
                   }
                 }
                 // 一行式回合摘要：排查"卡住"时 wrangler tail 直接能看到每轮的耗时与结局。
@@ -3086,12 +3167,11 @@ export default {
                 const kick = await tgKickAutoContinue(env, url, { chatId: chatId, seg: 1, totalSeg: autoStartTotalSeg }, 8000);
                 if (!kick.ok) {
                   try {
-                    const m0 = await tgAutoMsgGet(env, chatId);
-                    await tgAutoSendOrEdit(env, tgApi, chatId, m0 && m0.id ? m0 : { id: pendingMsgId },
+                    const m0 = await tgAutoStateGet(env, chatId);
+                    await tgAutoSendOrEdit(env, tgApi, chatId, m0 && m0.msgId ? { id: m0.msgId } : { id: pendingMsgId },
                       '⚠️ 自动续做启动失败（' + kick.err + '）：worker 无法调用自己的 /tg-auto-continue 端点。'
                       + autoKickHint(kick.err) + '或发「继续」手动接着做（进度已保存）。');
-                    await tgAutoMsgClear(env, chatId);
-                    await tgAutoEpochSet(env, chatId, null);
+                    await tgAutoStateClear(env, chatId);
                     if (pendingMsgId) await tgPendingRemove(env, chatId, pendingMsgId);
                   } catch (e) {}
                   return;
