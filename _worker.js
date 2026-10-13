@@ -1627,7 +1627,7 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
 
   // max_tokens 可配：环境变量 MAX_TOKENS，默认 4096，上限 32000
   let maxTokens = parseInt(env.MAX_TOKENS || '4096', 10);
-  if (!(maxTokens > 0)) maxTokens = 16384;
+  if (!(maxTokens > 0)) maxTokens = 4096;
   if (maxTokens > 32000) maxTokens = 32000;
 
   const payload = isImageAPI ? {
