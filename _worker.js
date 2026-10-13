@@ -1625,9 +1625,9 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
   // 图片模型只认 images/generations 接口地址，不再按模型名猜测，避免误伤
   const isImageAPI = apiUrl.includes('images/generations');
 
-  // max_tokens 可配：环境变量 MAX_TOKENS，默认 16384，上限 32000
-  let maxTokens = parseInt(env.MAX_TOKENS || '16384', 10);
-  if (!(maxTokens > 0)) maxTokens = 16384;
+  // max_tokens 可配：环境变量 MAX_TOKENS，默认 8192，上限 32000
+  let maxTokens = parseInt(env.MAX_TOKENS || '8192', 10);
+  if (!(maxTokens > 0)) maxTokens = 8192;
   if (maxTokens > 32000) maxTokens = 32000;
 
   const payload = isImageAPI ? {
