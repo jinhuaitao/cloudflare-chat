@@ -1433,8 +1433,11 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
     if (data && data.data && data.data[0] && data.data[0].url) {
       return { text: '[🖼️ 点击查看生成的图片](' + data.data[0].url + ')', usedTools: false, isImage: true };
     }
-    const msg = data && data.choices && data.choices[0] && data.choices[0].message;
+    const choice0 = data && data.choices && data.choices[0];
+    const msg = choice0 && choice0.message;
     if (!msg) return { error: 'AI 没有返回有效内容' };
+    // 上游结束原因：length 表示 max_tokens 被用光（推理模型常常全花在思考上）
+    const agentFinishReason = choice0.finish_reason || '';
 
     // 原生 tool_calls 为空时，尝试从 content 解析 DSML 文本格式工具调用
     // （DeepSeek V3.2/V4 系模型 + 裸透传通道的组合会产生这种输出）
@@ -1462,7 +1465,9 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       if (!text) {
         text = assistantText.indexOf('DSML') !== -1
           ? '（工具调用格式解析失败，已隐藏原始标记，请换个问法重试或切换模型）'
-          : (reasoning ? '（模型思考后没有给出文字答复，请换个问法重试）' : '（模型返回了空内容，请换个问法重试）');
+          : (agentFinishReason === 'length'
+              ? '（模型在思考阶段就用满了 max_tokens 预算，没来得及输出正文。可在环境变量里调大 MAX_TOKENS 后重试）'
+              : (reasoning ? '（模型思考后没有给出文字答复，请换个问法重试）' : '（模型返回了空内容，请换个问法重试）'));
       }
       return { text: text, usedTools: step > 0 };
     }
@@ -1627,7 +1632,7 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
 
   // max_tokens 可配：环境变量 MAX_TOKENS，默认 4096，上限 32000
   let maxTokens = parseInt(env.MAX_TOKENS || '4096', 10);
-  if (!(maxTokens > 0)) maxTokens = 16384;
+  if (!(maxTokens > 0)) maxTokens = 4096;
   if (maxTokens > 32000) maxTokens = 32000;
 
   const payload = isImageAPI ? {
@@ -2864,6 +2869,36 @@ const HTML_CONTENT = `<!DOCTYPE html>
     }
     .reasoning-box::-webkit-scrollbar { width: 4px; }
     .reasoning-box::-webkit-scrollbar-thumb { background: rgba(128, 128, 128, .3); border-radius: 4px; }
+    /* 思考内容本身从不截断，只是默认折叠到 160px；超长时给一个展开开关 */
+    .reasoning-box.expanded { max-height: none; }
+    .reasoning-toggle {
+      display: inline-flex; align-items: center; gap: 4px;
+      margin: -6px 0 14px; padding: 3px 9px;
+      border: 1px solid var(--border); border-radius: 999px;
+      background: var(--panel); color: var(--text-2);
+      font-family: inherit; font-size: 12px; cursor: pointer;
+      transition: background .12s ease, color .12s ease;
+    }
+    .reasoning-toggle:hover { background: var(--bg-soft); color: var(--text); }
+    .reasoning-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+    /* 长度截断提示条：上游 finish_reason=length 时出现，避免"写一半突然停住"被当成正常结束 */
+    .truncate-notice {
+      display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+      margin-top: 10px; padding: 8px 12px;
+      border: 1px solid var(--warn-border); border-radius: 10px;
+      background: var(--warn-bg); color: var(--warn-text);
+      font-size: 12.5px; line-height: 1.5;
+    }
+    .truncate-notice .btn-continue {
+      margin-left: auto; padding: 3px 10px;
+      border: 1px solid var(--warn-border); border-radius: 999px;
+      background: transparent; color: var(--warn-text);
+      font-family: inherit; font-size: 12px; font-weight: 550; cursor: pointer;
+      transition: background .12s ease;
+    }
+    .truncate-notice .btn-continue:hover { background: rgba(186, 117, 23, .14); }
+    .truncate-notice .btn-continue:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
     .msg-actions {
       display: flex; gap: 2px; align-items: center;
@@ -3594,6 +3629,76 @@ const HTML_CONTENT = `<!DOCTYPE html>
     await sendMessage();                  // 复用原发送流程，不改动它的逻辑
   }
 
+  // 思考内容本身从不截断（reasoningContent 一路累加），只是 .reasoning-box 默认折叠到 160px。
+  // 超出时挂一个「展开全部思考」开关，让用户知道下面还有内容。
+  function syncReasoningToggle(bubble) {
+    if (!bubble) return;
+    const r = bubble.querySelector('.reasoning-box');
+    let btn = bubble.querySelector('.reasoning-toggle');
+    // 思考框被移除或仍处于 display:none 时不挂开关
+    const usable = !!(r && r.style.display !== 'none' && r.scrollHeight > r.clientHeight + 4);
+    if (!usable) { if (btn) btn.remove(); return; }
+    if (btn) return;
+    btn = document.createElement('button');
+    btn.className = 'reasoning-toggle';
+    btn.type = 'button';
+    btn.textContent = '展开全部思考';
+    btn.setAttribute('aria-expanded', 'false');
+    btn.addEventListener('click', function () {
+      const on = r.classList.toggle('expanded');
+      btn.textContent = on ? '收起思考' : '展开全部思考';
+      btn.setAttribute('aria-expanded', on ? 'true' : 'false');
+    });
+    if (r.parentNode) r.parentNode.insertBefore(btn, r.nextSibling);
+  }
+
+  // 截断提示条只挂在最后一条 AI 回复上：旧回复的提示条点了也只会从对话末尾继续，容易误解
+  function syncTruncateNotices() {
+    const rows = Array.prototype.slice.call(messagesDiv.querySelectorAll('.message-row'));
+    let lastAiRow = null;
+    for (let i = rows.length - 1; i >= 0; i--) {
+      if (rows[i].classList.contains('ai')) { lastAiRow = rows[i]; break; }
+    }
+    rows.forEach((r) => {
+      const bubble = r.querySelector('.message-bubble');
+      if (!bubble) return;
+      const el = r.querySelector('.truncate-notice');
+      const shouldHave = (r === lastAiRow) && !isCurrentlyStreaming && bubble.__truncated === true;
+      if (shouldHave && !el) {
+        const box = document.createElement('div');
+        box.className = 'truncate-notice';
+        const txt = document.createElement('span');
+        txt.textContent = '内容达到 max_tokens 上限被截断，不是模型自己停的。';
+        const go = document.createElement('button');
+        go.className = 'btn-continue';
+        go.type = 'button';
+        go.textContent = '继续生成';
+        go.title = '从中断处接着往下写';
+        go.addEventListener('click', () => continueGeneration());
+        box.appendChild(txt);
+        box.appendChild(go);
+        bubble.appendChild(box);
+      } else if (!shouldHave && el) {
+        el.remove();
+      }
+    });
+  }
+
+  // 从对话末尾接着写：保留已截断的回复，补一条续写指令重跑一次
+  async function continueGeneration() {
+    if (isCurrentlyStreaming) return;
+    stopSpeaking();
+    userInput.value = '请从中断的地方继续输出，不要重复前面已经生成的内容。';
+    userInput.dispatchEvent(new Event('input'));
+    await sendMessage();
+  }
+
+  // 生成态相关控件的统一刷新入口（重新生成按钮 + 截断提示条）
+  function syncMessageControls() {
+    syncRegenButtons();
+    syncTruncateNotices();
+  }
+
   // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 key（nvidia_ai_sessions）的数据自动迁移
   const STORAGE_KEY = 'cfchat_sessions';
   const LEGACY_STORAGE_KEY = 'nvidia_ai_sessions';
@@ -3888,7 +3993,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
         const uiRole = msg.role === 'assistant' ? 'ai' : msg.role;
         appendMessageDOM(uiRole, msg.content, null, false);
       }); 
-      syncRegenButtons();
+      syncMessageControls();
     }
   }
 
@@ -3953,7 +4058,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
     appendMessageDOM('user', text);
     currentSession.messages.push({ role: 'user', content: text });
     saveSessions();
-    syncRegenButtons();   // 上一轮的 AI 回复不再是最后一条，收起它的「重新生成」
+    syncMessageControls();   // 上一轮的 AI 回复不再是最后一条，收起它的「重新生成」
 
     const aiMsgId = 'ai_' + Date.now();
     // 字符串拼接替换模板字符串
@@ -3965,7 +4070,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
     
     const bubble = document.getElementById(aiMsgId);
     isCurrentlyStreaming = true;
-    syncRegenButtons();   // 进入生成态：收起上一轮的「重新生成」
+    syncMessageControls();   // 进入生成态：收起上一轮的「重新生成」
     
     currentAbortController = new AbortController();
     sendBtn.classList.remove('active');
@@ -3979,6 +4084,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
       let aiContent = '';
       let reasoningContent = '';
       let gotDone = false; // 是否收到 SSE 正常结束标记 data: [DONE]
+      let finishReason = ''; // 上游结束原因：length 表示被 max_tokens 截断
 
       const rBox = bubble.querySelector('.reasoning-box');
       const tBox = bubble.querySelector('.message-text');
@@ -4058,6 +4164,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
         aiContent = '';
         reasoningContent = '';
         gotDone = false;
+        finishReason = '';
         clearAgentProgress();
         if (rBox) { rBox.style.display = 'none'; rBox.textContent = ''; }
         tBox.innerHTML = '';
@@ -4137,6 +4244,10 @@ const HTML_CONTENT = `<!DOCTYPE html>
                 if (delta.content !== undefined && delta.content !== null) aiContent += delta.content;
                 scheduleUpdateUI();
               }
+              // 记录结束原因：有些上游只在最后一块 delta 上带 finish_reason
+              if (data.choices && data.choices[0].finish_reason) {
+                finishReason = data.choices[0].finish_reason;
+              }
             } catch (e) {}
           }
         }
@@ -4148,6 +4259,9 @@ const HTML_CONTENT = `<!DOCTYPE html>
               const delta = data.choices[0].delta;
               if (delta.reasoning_content) reasoningContent += delta.reasoning_content;
               if (delta.content) aiContent += delta.content;
+            }
+            if (data.choices && data.choices[0].finish_reason) {
+              finishReason = data.choices[0].finish_reason;
             }
           } catch(e) {}
         }
@@ -4189,13 +4303,33 @@ const HTML_CONTENT = `<!DOCTYPE html>
       bubble.__rawText = aiContent;   // 供「复制」取原始 Markdown
       scrollArea.scrollTop = scrollArea.scrollHeight;
 
+      // 思考框内容从不截断，只是默认折叠到 160px：超长时补一个展开开关
+      syncReasoningToggle(bubble);
+
+      // 上游因 max_tokens 耗尽而结束（finish_reason=length）时标记出来，
+      // 否则用户只会看到"回复写一半突然停住"，误以为是模型自己结束的。
+      // 正文为空的情况上面已经给了专门提示，这里不再重复，改用「重新生成」
+      bubble.__truncated = (finishReason === 'length') && !!(aiContent && aiContent.trim());
+
+      if (aiContent && aiContent.trim()) {
+        currentSession.messages.push({ role: 'assistant', content: aiContent });
+      } else {
+        // 空正文不入库：空 assistant 消息回传给上游会让后续请求直接报错。
+        // 同时把"模型返回空内容"换成可操作的提示（多半是推理吃光了 token 预算）
+        bubble.__rawText = '';
+        tBox.innerHTML = '<div style="color: var(--text-2); font-size: 13.5px; line-height: 1.6;">' +
+          (reasoningContent
+            ? '模型把 token 预算都用在了思考上，没有输出正文。可在环境变量里调大 MAX_TOKENS 后重试。'
+            : '模型没有返回任何内容，请换个问法重试。') + '</div>';
+        bubble.parentElement.classList.add('error-msg');
+      }
+
       // 自动朗读（若已在左下角开启）
       if (autoSpeak && aiContent && aiContent.trim()) {
         const sb = bubble.querySelector('.speak-btn');
         if (sb) toggleSpeak(sb, bubble);
       }
-      
-      currentSession.messages.push({ role: 'assistant', content: aiContent }); 
+
       saveSessions();
       
     } catch (error) {
@@ -4240,7 +4374,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
       isCurrentlyStreaming = false;
       currentAbortController = null;
       statusDot.classList.remove('generating'); 
-      syncRegenButtons();   // 生成结束：末尾 AI 回复的「重新生成」恢复可用
+      syncMessageControls();   // 生成结束：末尾 AI 回复的「重新生成」恢复可用
       
       sendBtn.classList.remove('stop-mode');
       sendBtn.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>';
