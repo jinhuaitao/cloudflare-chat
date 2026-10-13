@@ -34,61 +34,6 @@ const SSE_HEADERS = {
   'Connection': 'keep-alive',
 };
 
-// SSE 心跳间隔。Cloudflare 边缘对空闲连接有 100 秒超时（就是 524 那个 100 秒）：
-// 只要这么久没有数据流过就掐断，哪怕上游还在闷头生成。45 秒补一次，留足余量。
-const SSE_HEARTBEAT_MS = 45000;
-
-// 给任意 SSE 流加心跳保活：数据照常透传，只在「上游长时间不吐字」时补一个
-// SSE 注释行（以冒号开头，按规范客户端会忽略，不会污染正文）。
-// 注意只在行首补：上游可能把一行切成多个 chunk，插在半个 JSON 中间会毁掉这一行。
-function withSseHeartbeat(body, intervalMs) {
-  if (!body || typeof body.getReader !== 'function') return body;
-  const reader = body.getReader();
-  const encoder = new TextEncoder();
-  let timer = null;
-  let atLineStart = true; // 上一次转发出去的字节是否以 \n 结尾
-  const clear = () => { if (timer) { clearTimeout(timer); timer = null; } };
-  return new ReadableStream({
-    start(controller) {
-      const arm = () => {
-        clear();
-        timer = setTimeout(() => {
-          if (!atLineStart) { arm(); return; } // 半行中间不能插，等这行收完再说
-          try {
-            controller.enqueue(encoder.encode(': ping\n\n'));
-          } catch (e) {
-            clear();
-            return;
-          }
-          arm();
-        }, intervalMs);
-      };
-      arm();
-      (async () => {
-        try {
-          for (;;) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            clear();
-            controller.enqueue(value);
-            if (value && value.length) atLineStart = value[value.length - 1] === 10;
-            arm();
-          }
-        } catch (e) {
-          // 上游中断：正常收尾，让客户端按「未收到结束标记」自行判定
-        } finally {
-          clear();
-          try { controller.close(); } catch (e) {}
-        }
-      })();
-    },
-    cancel(reason) {
-      clear();
-      try { reader.cancel(reason); } catch (e) {}
-    },
-  });
-}
-
 const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
@@ -1488,11 +1433,8 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
     if (data && data.data && data.data[0] && data.data[0].url) {
       return { text: '[🖼️ 点击查看生成的图片](' + data.data[0].url + ')', usedTools: false, isImage: true };
     }
-    const choice0 = data && data.choices && data.choices[0];
-    const msg = choice0 && choice0.message;
+    const msg = data && data.choices && data.choices[0] && data.choices[0].message;
     if (!msg) return { error: 'AI 没有返回有效内容' };
-    // 上游结束原因：length 表示 max_tokens 被用光（推理模型常常全花在思考上）
-    const agentFinishReason = choice0.finish_reason || '';
 
     // 原生 tool_calls 为空时，尝试从 content 解析 DSML 文本格式工具调用
     // （DeepSeek V3.2/V4 系模型 + 裸透传通道的组合会产生这种输出）
@@ -1520,9 +1462,7 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       if (!text) {
         text = assistantText.indexOf('DSML') !== -1
           ? '（工具调用格式解析失败，已隐藏原始标记，请换个问法重试或切换模型）'
-          : (agentFinishReason === 'length'
-              ? '（模型在思考阶段就用满了 max_tokens 预算，没来得及输出正文。可在环境变量里调大 MAX_TOKENS 后重试）'
-              : (reasoning ? '（模型思考后没有给出文字答复，请换个问法重试）' : '（模型返回了空内容，请换个问法重试）'));
+          : (reasoning ? '（模型思考后没有给出文字答复，请换个问法重试）' : '（模型返回了空内容，请换个问法重试）');
       }
       return { text: text, usedTools: step > 0 };
     }
@@ -1687,7 +1627,7 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
 
   // max_tokens 可配：环境变量 MAX_TOKENS，默认 4096，上限 32000
   let maxTokens = parseInt(env.MAX_TOKENS || '4096', 10);
-  if (!(maxTokens > 0)) maxTokens = 4096;
+  if (!(maxTokens > 0)) maxTokens = 16384;
   if (maxTokens > 32000) maxTokens = 32000;
 
   const payload = isImageAPI ? {
@@ -1750,8 +1690,7 @@ async function handleWebAgent(env, body) {
     }
   });
 
-  // Agent 单步最长可跑 180 秒，期间不吐任何字节，不加心跳会被边缘按空闲掐断
-  return new Response(withSseHeartbeat(stream, SSE_HEARTBEAT_MS), { headers: SSE_HEADERS });
+  return new Response(stream, { headers: SSE_HEADERS });
 }
 
 export default {
@@ -1856,9 +1795,7 @@ export default {
         }
 
         if (!isImageAPI) {
-          // 透传上游 SSE，同时补心跳：上游推理停顿超过 100 秒时，
-          // Cloudflare 边缘会按空闲超时掐断连接（客户端表现为「未收到结束标记」）
-          return new Response(withSseHeartbeat(upstreamResponse.body, SSE_HEARTBEAT_MS), { headers: SSE_HEADERS });
+          return new Response(upstreamResponse.body, { headers: SSE_HEADERS });
         } else {
           const responseData = await upstreamResponse.json();
           let imageUrlOrText = "图片生成失败或未返回格式";
@@ -2927,36 +2864,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
     }
     .reasoning-box::-webkit-scrollbar { width: 4px; }
     .reasoning-box::-webkit-scrollbar-thumb { background: rgba(128, 128, 128, .3); border-radius: 4px; }
-    /* 思考内容本身从不截断，只是默认折叠到 160px；超长时给一个展开开关 */
-    .reasoning-box.expanded { max-height: none; }
-    .reasoning-toggle {
-      display: inline-flex; align-items: center; gap: 4px;
-      margin: -6px 0 14px; padding: 3px 9px;
-      border: 1px solid var(--border); border-radius: 999px;
-      background: var(--panel); color: var(--text-2);
-      font-family: inherit; font-size: 12px; cursor: pointer;
-      transition: background .12s ease, color .12s ease;
-    }
-    .reasoning-toggle:hover { background: var(--bg-soft); color: var(--text); }
-    .reasoning-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-
-    /* 长度截断提示条：上游 finish_reason=length 时出现，避免"写一半突然停住"被当成正常结束 */
-    .truncate-notice {
-      display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-      margin-top: 10px; padding: 8px 12px;
-      border: 1px solid var(--warn-border); border-radius: 10px;
-      background: var(--warn-bg); color: var(--warn-text);
-      font-size: 12.5px; line-height: 1.5;
-    }
-    .truncate-notice .btn-continue {
-      margin-left: auto; padding: 3px 10px;
-      border: 1px solid var(--warn-border); border-radius: 999px;
-      background: transparent; color: var(--warn-text);
-      font-family: inherit; font-size: 12px; font-weight: 550; cursor: pointer;
-      transition: background .12s ease;
-    }
-    .truncate-notice .btn-continue:hover { background: rgba(186, 117, 23, .14); }
-    .truncate-notice .btn-continue:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
     .msg-actions {
       display: flex; gap: 2px; align-items: center;
@@ -3687,81 +3594,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
     await sendMessage();                  // 复用原发送流程，不改动它的逻辑
   }
 
-  // 思考内容本身从不截断（reasoningContent 一路累加），只是 .reasoning-box 默认折叠到 160px。
-  // 超出时挂一个「展开全部思考」开关，让用户知道下面还有内容。
-  function syncReasoningToggle(bubble) {
-    if (!bubble) return;
-    const r = bubble.querySelector('.reasoning-box');
-    let btn = bubble.querySelector('.reasoning-toggle');
-    // 思考框被移除或仍处于 display:none 时不挂开关
-    const usable = !!(r && r.style.display !== 'none' && r.scrollHeight > r.clientHeight + 4);
-    if (!usable) { if (btn) btn.remove(); return; }
-    if (btn) return;
-    btn = document.createElement('button');
-    btn.className = 'reasoning-toggle';
-    btn.type = 'button';
-    btn.textContent = '展开全部思考';
-    btn.setAttribute('aria-expanded', 'false');
-    btn.addEventListener('click', function () {
-      const on = r.classList.toggle('expanded');
-      btn.textContent = on ? '收起思考' : '展开全部思考';
-      btn.setAttribute('aria-expanded', on ? 'true' : 'false');
-    });
-    if (r.parentNode) r.parentNode.insertBefore(btn, r.nextSibling);
-  }
-
-  // 收尾提示条只挂在最后一条 AI 回复上：旧回复的提示条点了也只会从对话末尾继续，容易误解
-  function syncCompletionNotices() {
-    const rows = Array.prototype.slice.call(messagesDiv.querySelectorAll('.message-row'));
-    let lastAiRow = null;
-    for (let i = rows.length - 1; i >= 0; i--) {
-      if (rows[i].classList.contains('ai')) { lastAiRow = rows[i]; break; }
-    }
-    rows.forEach((r) => {
-      const bubble = r.querySelector('.message-bubble');
-      if (!bubble) return;
-      const kind = bubble.__notice;
-      const shouldHave = (r === lastAiRow) && !isCurrentlyStreaming && !!kind;
-      let el = r.querySelector('.truncate-notice');
-      if (!shouldHave) { if (el) el.remove(); return; }
-      const label = kind === 'length'
-        ? '内容达到 max_tokens 上限被截断，不是模型自己停的。'
-        : '连接中断，已保留已生成的内容。';
-      if (!el) {
-        el = document.createElement('div');
-        el.className = 'truncate-notice';
-        const txt = document.createElement('span');
-        txt.className = 'notice-text';
-        const go = document.createElement('button');
-        go.className = 'btn-continue';
-        go.type = 'button';
-        go.textContent = '继续生成';
-        go.title = '从中断处接着往下写';
-        go.addEventListener('click', () => continueGeneration());
-        el.appendChild(txt);
-        el.appendChild(go);
-        bubble.appendChild(el);
-      }
-      const t = el.querySelector('.notice-text');
-      if (t) t.textContent = label;
-    });
-  }
-
-  // 从对话末尾接着写：保留已截断的回复，补一条续写指令重跑一次
-  async function continueGeneration() {
-    if (isCurrentlyStreaming) return;
-    stopSpeaking();
-    userInput.value = '请从中断的地方继续输出，不要重复前面已经生成的内容。';
-    userInput.dispatchEvent(new Event('input'));
-    await sendMessage();
-  }
-
-  // 生成态相关控件的统一刷新入口（重新生成按钮 + 收尾提示条）
-  function syncMessageControls() {
-    syncRegenButtons();
-    syncCompletionNotices();
-  }
-
   // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 key（nvidia_ai_sessions）的数据自动迁移
   const STORAGE_KEY = 'cfchat_sessions';
   const LEGACY_STORAGE_KEY = 'nvidia_ai_sessions';
@@ -4056,7 +3888,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
         const uiRole = msg.role === 'assistant' ? 'ai' : msg.role;
         appendMessageDOM(uiRole, msg.content, null, false);
       }); 
-      syncMessageControls();
+      syncRegenButtons();
     }
   }
 
@@ -4121,7 +3953,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
     appendMessageDOM('user', text);
     currentSession.messages.push({ role: 'user', content: text });
     saveSessions();
-    syncMessageControls();   // 上一轮的 AI 回复不再是最后一条，收起它的「重新生成」
+    syncRegenButtons();   // 上一轮的 AI 回复不再是最后一条，收起它的「重新生成」
 
     const aiMsgId = 'ai_' + Date.now();
     // 字符串拼接替换模板字符串
@@ -4133,35 +3965,22 @@ const HTML_CONTENT = `<!DOCTYPE html>
     
     const bubble = document.getElementById(aiMsgId);
     isCurrentlyStreaming = true;
-    syncMessageControls();   // 进入生成态：收起上一轮的「重新生成」
+    syncRegenButtons();   // 进入生成态：收起上一轮的「重新生成」
     
     currentAbortController = new AbortController();
     sendBtn.classList.remove('active');
     sendBtn.classList.add('stop-mode');
     sendBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12" rx="2" ry="2"></rect></svg>';
 
-    // 这些状态必须声明在 try 之外：catch 分支同样要用它们。
-    // 原代码把它们声明在 try 内（let 是块级作用域），导致「已保留当前生成的内容」
-    // 和「生成已手动中止」两条提示一执行就抛 ReferenceError，从来没显示出来过。
-    let aiContent = '';
-    let reasoningContent = '';
-    let gotDone = false; // 是否收到 SSE 正常结束标记 data: [DONE]
-    let finishReason = ''; // 上游结束原因：length 表示被 max_tokens 截断
-    let rBox = null;
-
-    // 完成判定：收到 [DONE] 或上游给出了 finish_reason，都算正常结束。
-    // 只认 [DONE] 会把「上游发完 finish_reason 就关流」误判成断流，触发假重试。
-    const streamCompleted = () => gotDone || !!finishReason;
-    // 已生成内容达到这个量就不再清空重来：长生成下重来只会同样断在同一处，白白丢掉已有内容
-    const PARTIAL_KEEP_MIN = 80;
-    const hasPartialContent = () =>
-      (aiContent && aiContent.trim().length >= PARTIAL_KEEP_MIN) || reasoningContent.length >= PARTIAL_KEEP_MIN;
-
     try {
       const reqHeaders = { 'Content-Type': 'application/json' };
       if (accessToken) reqHeaders['X-Access-Token'] = accessToken;
 
-      rBox = bubble.querySelector('.reasoning-box');
+      let aiContent = '';
+      let reasoningContent = '';
+      let gotDone = false; // 是否收到 SSE 正常结束标记 data: [DONE]
+
+      const rBox = bubble.querySelector('.reasoning-box');
       const tBox = bubble.querySelector('.message-text');
 
       let isRenderPending = false;
@@ -4239,7 +4058,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
         aiContent = '';
         reasoningContent = '';
         gotDone = false;
-        finishReason = '';
         clearAgentProgress();
         if (rBox) { rBox.style.display = 'none'; rBox.textContent = ''; }
         tBox.innerHTML = '';
@@ -4319,10 +4137,6 @@ const HTML_CONTENT = `<!DOCTYPE html>
                 if (delta.content !== undefined && delta.content !== null) aiContent += delta.content;
                 scheduleUpdateUI();
               }
-              // 记录结束原因：有些上游只在最后一块 delta 上带 finish_reason
-              if (data.choices && data.choices[0].finish_reason) {
-                finishReason = data.choices[0].finish_reason;
-              }
             } catch (e) {}
           }
         }
@@ -4335,16 +4149,12 @@ const HTML_CONTENT = `<!DOCTYPE html>
               if (delta.reasoning_content) reasoningContent += delta.reasoning_content;
               if (delta.content) aiContent += delta.content;
             }
-            if (data.choices && data.choices[0].finish_reason) {
-              finishReason = data.choices[0].finish_reason;
-            }
           } catch(e) {}
         }
       }
 
-      // 主循环：深度思考时间越长越容易撞上边缘掐流/网络抖动，未正常结束就退避重试。
-      // 但只在「什么都没拿到」时才重试 —— 一旦已有实质内容，清空重来是纯亏：
-      // 生成越久越容易断，断得越晚丢得越多，重来还是那么久，又断，永远出不来。
+      // 主循环：深度思考时间越长越容易撞上边缘掐流/网络抖动，
+      // 未收到 [DONE] 即视为异常中断，指数退避后自动重试。
       const MAX_AUTO_RETRY = 3;
       let attempt = 0;
       let streamError = null;
@@ -4358,19 +4168,17 @@ const HTML_CONTENT = `<!DOCTYPE html>
           if (e.name === 'AbortError' || e.name === 'AuthError') { setRetryNotice(null); throw e; }
           streamError = e;
         }
-        if (streamCompleted()) break;
+        if (gotDone) break;
         // v6.6.0 Agent 模式不自动重试：重跑会重复执行工具（重复搜索/重复记忆），中断直接走错误展示
         if (agentMode) break;
         if (!streamError) streamError = new Error('连接意外中断（未收到结束标记）');
-        if (hasPartialContent()) break;   // 保留已生成内容，交给下面的收尾提示处理
         if (attempt > MAX_AUTO_RETRY) break;
         resetStreamUI();
         setRetryNotice('连接意外中断，正在自动重试（第 ' + attempt + ' 次）…');
         await new Promise(function (resolve) { setTimeout(resolve, 1200 * attempt); });
       }
       setRetryNotice(null);
-      // 既没正常结束、又一点内容都没拿到，才算真失败
-      if (!streamCompleted() && !hasPartialContent()) throw streamError;
+      if (!gotDone) throw streamError;
 
       isCurrentlyStreaming = false;
       if (!reasoningContent && rBox) rBox.remove();
@@ -4381,40 +4189,13 @@ const HTML_CONTENT = `<!DOCTYPE html>
       bubble.__rawText = aiContent;   // 供「复制」取原始 Markdown
       scrollArea.scrollTop = scrollArea.scrollHeight;
 
-      // 思考框内容从不截断，只是默认折叠到 160px：超长时补一个展开开关
-      syncReasoningToggle(bubble);
-
-      // 收尾提示：被 max_tokens 截断、或连接中断但已保住内容，都明确说明并给「继续生成」。
-      // 正文为空的情况下面有专门提示，这里不重复，让用户走「重新生成」
-      if (!(aiContent && aiContent.trim())) {
-        bubble.__notice = null;
-      } else if (finishReason === 'length') {
-        bubble.__notice = 'length';
-      } else if (!streamCompleted()) {
-        bubble.__notice = 'interrupted';
-      } else {
-        bubble.__notice = null;
-      }
-
-      if (aiContent && aiContent.trim()) {
-        currentSession.messages.push({ role: 'assistant', content: aiContent });
-      } else {
-        // 空正文不入库：空 assistant 消息回传给上游会让后续请求直接报错。
-        // 同时把"模型返回空内容"换成可操作的提示（多半是推理吃光了 token 预算）
-        bubble.__rawText = '';
-        tBox.innerHTML = '<div style="color: var(--text-2); font-size: 13.5px; line-height: 1.6;">' +
-          (reasoningContent
-            ? '模型把 token 预算都用在了思考上，没有输出正文。可在环境变量里调大 MAX_TOKENS 后重试。'
-            : '模型没有返回任何内容，请换个问法重试。') + '</div>';
-        bubble.parentElement.classList.add('error-msg');
-      }
-
       // 自动朗读（若已在左下角开启）
       if (autoSpeak && aiContent && aiContent.trim()) {
         const sb = bubble.querySelector('.speak-btn');
         if (sb) toggleSpeak(sb, bubble);
       }
-
+      
+      currentSession.messages.push({ role: 'assistant', content: aiContent }); 
       saveSessions();
       
     } catch (error) {
@@ -4444,8 +4225,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
         if (aiContent || reasoningContent) {
           // 字符串拼接替换模板字符串，彻底规避 CF 编辑器转义 Bug
           tBox.innerHTML = safeHtml(aiContent) + '<br><br><span style="color: #ef4444; font-size: 13px; font-weight: 500;">(⚠️ 网络连接中断，已保留当前生成的内容。错误: ' + escapeHtml(error.message) + ')</span>';
-          // 空正文不入库：空 assistant 消息回传给上游会让后续请求直接报错
-          if (aiContent && aiContent.trim()) currentSession.messages.push({ role: 'assistant', content: aiContent });
+          currentSession.messages.push({ role: 'assistant', content: aiContent });
           bubble.__rawText = aiContent;
           if (rBox && reasoningContent) rBox.remove(); 
         } else {
@@ -4460,7 +4240,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
       isCurrentlyStreaming = false;
       currentAbortController = null;
       statusDot.classList.remove('generating'); 
-      syncMessageControls();   // 生成结束：末尾 AI 回复的「重新生成」恢复可用
+      syncRegenButtons();   // 生成结束：末尾 AI 回复的「重新生成」恢复可用
       
       sendBtn.classList.remove('stop-mode');
       sendBtn.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>';
