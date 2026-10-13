@@ -38,10 +38,9 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-// 后缀 -pN 表示这是本地补丁版（p1 卡死修复 + 真流式 / p2 Telegram 流式 /
-// p3 Telegram 预算与硬墙钟），上游仓库无此版本。
-// 发 /help 看到带 -p3 即说明部署的是打过补丁的构建。
-const APP_VERSION = '6.8.3-p13';
+// 后缀 -p1 表示这是本地补丁版（Web Agent 真流式 + 卡死修复），上游仓库无此版本。
+// 发 /help 看到带 -p1 即说明部署的是打过补丁的构建。
+const APP_VERSION = '6.8.8';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -274,19 +273,13 @@ async function kbBackfillMd(env, chatId, arr) {
   if (puts.length) await Promise.all(puts);
   return indexChanged;
 }
-async function storeGet(env, key, ms) {
+async function storeGet(env, key) {
   if (!env.R2) return null;
   try {
-    const p = env.R2.get(key).then(obj => obj ? obj.text() : null);
-    // ms>0 时限时返回：自动续做跑在 waitUntil 额度里，无限挂起的 R2 会让整段
-    // 被平台掐断、下一段发不出去。不传 ms 时保持原行为。
-    if (ms > 0) return await Promise.race([p, new Promise(res => setTimeout(() => res(null), ms))]);
-    return await p;
-  } catch (e) { return null; }
-}
-// 限时执行：超时返回 null（调用方按"没读到"处理）。同上，给关键路径兜底。
-function withTimeout(p, ms) {
-  return Promise.race([p, new Promise(res => setTimeout(() => res(null), ms))]);
+    const obj = await env.R2.get(key);
+    if (obj) return await obj.text();
+  } catch (e) {}
+  return null;
 }
 
 async function storePut(env, key, value) {
@@ -457,16 +450,11 @@ function getAgentTools() {
   ];
 }
 
-async function execAgentTool(name, args, env, chatId, budgetMs) {
+async function execAgentTool(name, args, env, chatId) {
   // 兜底超时：单个工具最长执行时间，防止 abort 信号无法中断 hung 住的请求体
   // （如永不结束的流式响应）。可通过 AGENT_TOOL_TIMEOUT_MS 调整，默认 30 秒。
   let toolTimeoutMs = parseInt(env.AGENT_TOOL_TIMEOUT_MS || '30000', 10);
   if (!(toolTimeoutMs > 0)) toolTimeoutMs = 30000;
-  // 调用方（Agent 循环）把单工具上限压进本轮剩余预算：否则一个卡住的工具
-  // （默认 30 秒）能把整个 webhook 请求拖过 Telegram 的 60 秒红线。
-  // 注意：预算不足时仍然是"跑 + 超时返回提示"，不能直接跳过 —— assistant 的
-  // tool_calls 必须配齐 tool 结果，否则暂停存档的消息序列非法，续做会失败。
-  if (budgetMs > 0 && budgetMs < toolTimeoutMs) toolTimeoutMs = budgetMs;
   let timer;
   try {
     const run = (async () => {
@@ -1258,19 +1246,6 @@ function trimAgentMessages(messages, loopStartIdx, budget) {
   return out;
 }
 
-// 数已完成的 Agent 步数：从 loopStartIdx 起，每条 role=assistant 的消息算一步
-// （与 trimAgentMessages 的"轮次"口径一致）。用于进度显示的累计步号，
-// 避免跨段/跨「继续」时步号重置（第 3 步后突然又显示第 1 步）。
-function countAgentSteps(messages, loopStartIdx) {
-  const arr = Array.isArray(messages) ? messages : [];
-  let start = Math.max(0, Math.min(loopStartIdx | 0, arr.length));
-  let n = 0;
-  for (let i = start; i < arr.length; i++) {
-    if (arr[i] && arr[i].role === 'assistant') n++;
-  }
-  return n;
-}
-
 // ==================== Telegram Agent：主循环 ====================
 // ReAct 风格：LLM 决策 → 执行工具 → 结果回填 → 最多 MAX_STEPS 步。
 // 通道/模型不支持 tools 参数时返回 { fallback: true }，由调用方降级为普通对话。
@@ -1308,65 +1283,11 @@ function describeToolCall(name, args) {
 // 预算耗尽不再终结任务，而是把 ReAct 循环的 messages 存到 R2，
 // 用户发「继续」即用全新预算接着跑，超长任务可分多段完成。
 function tgAgentResumeKey(chatId) { return 'tg_agent_' + chatId; }
-
-// 「占位消息」登记：worker 被平台掐断（CPU 超限 / Telegram 60 秒断连）时，
-// 它连一句错误都发不出去 —— 占位消息会永远停在"Agent 思考中…"。
-// 把占位消息 id 落库，下一次收到消息时兜底收掉，用户就不会无限干等。
-// 用**数组**而不是单条：用户完全可能在上一轮还没结束时又发一条新消息，
-// 单条登记会被新的一轮直接覆盖，那条孤儿占位就永远没人管了。
-function tgPendingKey(chatId) { return 'tg_pending_' + chatId; }
-
-async function tgPendingLoad(env, chatId) {
-  try {
-    const raw = await storeGet(env, tgPendingKey(chatId));
-    if (!raw) return [];
-    const p = JSON.parse(raw);
-    if (Array.isArray(p)) return p.filter(x => x && x.id);
-    if (p && p.id) return [{ id: p.id, at: p.at || 0 }];   // 兼容更早的单条登记格式
-    return [];
-  } catch (e) { return []; }
-}
-async function tgPendingSave(env, chatId, list) {
-  try {
-    if (list && list.length) await storePut(env, tgPendingKey(chatId), JSON.stringify(list));
-    else await storeDelete(env, tgPendingKey(chatId));
-  } catch (e) {}
-}
-
-// 兜底收掉上一轮遗留的占位消息。判据是「登记时间距今超过 staleMs」——
-// 正常一轮最长就是本轮预算 + 收尾，所以 staleMs 传「预算 + 15 秒」，
-// 不会误伤正在跑的那一轮。即便真的误判，那条消息随后也会被最终的正文编辑
-// 覆盖成真正的答案，所以是自愈的，不会把用户带偏。
-async function tgCleanupStalePending(env, tgApi, chatId, staleMs) {
-  const limit = (staleMs && staleMs > 10000) ? staleMs : 75000;
-  const list = await tgPendingLoad(env, chatId);
-  if (!list.length) return;
-  const now = Date.now();
-  const keep = [], stale = [];
-  for (const it of list) (now - (it.at || 0) >= limit ? stale : keep).push(it);
-  if (!stale.length) return;
-  await tgPendingSave(env, chatId, keep);
-  for (const it of stale) {
-    try {
-      await tgApi('editMessageText', {
-        chat_id: chatId,
-        message_id: it.id,
-        text: '⚠️ 上一轮任务被中断了（超过平台时限被强制结束），请重试或发「继续」接着做。'
-      }, TG_QUICK_API_TIMEOUT_MS);
-    } catch (e) {}
-  }
-}
-
 async function agentSaveResumeState(env, chatId, state) {
   if (!env.R2) return false;
   try {
-    // 限时 4 秒：暂停存档发生在 Agent 预算耗尽之后（段尾），无限挂起会直接
-    // 把整段拖过平台的 waitUntil 额度，导致下一段发不出去
-    const ok = await Promise.race([
-      storePut(env, tgAgentResumeKey(chatId), JSON.stringify(state)).then(() => true),
-      new Promise(res => setTimeout(() => res(false), 4000))
-    ]);
-    return ok;
+    await storePut(env, tgAgentResumeKey(chatId), JSON.stringify(state));
+    return true;
   } catch (e) { return false; }
 }
 async function agentLoadResumeState(env, chatId) {
@@ -1375,11 +1296,10 @@ async function agentLoadResumeState(env, chatId) {
   try {
     const s = JSON.parse(raw);
     if (!s || !Array.isArray(s.messages) || !s.messages.length) return null;
-    // 30 分钟过期：太旧的任务上下文已无意义。返回 expired 标记而非 null，
-    // 让调用方能区分"从没暂停过"和"暂停过但过期了"，给出明确提示（P1-1）。
+    // 30 分钟过期：太旧的任务上下文已无意义
     if (Date.now() - (s.savedAt || 0) > 30 * 60 * 1000) {
       await agentClearResumeState(env, chatId);
-      return { expired: true };
+      return null;
     }
     return s;
   } catch (e) { return null; }
@@ -1388,32 +1308,12 @@ async function agentClearResumeState(env, chatId) {
   try { await storeDelete(env, tgAgentResumeKey(chatId)); } catch (e) {}
 }
 
-// 进度 / 流式编辑的超时：这类调用只是"锦上添花"，卡住了也不该拖垮整轮。
-const TG_QUICK_API_TIMEOUT_MS = 5000;
-
-// 收尾预留（毫秒）：pauseForResume（R2 存档）/ 最终 sendMessage / 历史落库都要时间。
-// 必须从「Agent 可用时间」里扣掉 —— 否则收尾动作本身就跑到 Telegram 的 60 秒红线之外。
-function tgReplyReserveMs(env, budgetMs) {
-  let r = parseInt(env.TG_WEBHOOK_RESERVE_MS || '6000', 10);
-  if (!(r >= 0)) r = 6000;
-  if (r > 30000) r = 30000;
-  // 小预算场景（自测时可能设成 10 秒）不能被收尾预留吃掉大半，最多占预算的 1/4
-  if (budgetMs > 0) r = Math.min(r, Math.round(budgetMs * 0.25));
-  return r;
-}
-
 function tgAgentDeadline(env, opts) {
-  // 整轮共享的硬墙钟：由调用方（Telegram webhook）算一次后通过 opts.deadline 传进来。
-  // 必须共享 —— 「首步带工具失败 → 降级重试」是两次 tgAgentChat 调用，
-  // 各自算预算会让总时长直接翻倍（55s + 55s），必然撞穿 Telegram 的 60 秒红线
-  // 而被 cancel，用户就永远停在那句"Agent 思考中…"上。
-  if (opts && opts.deadline > 0) return opts.deadline;
   let timeoutMs = agentLimits(env).timeoutMs;
   // webhook 场景传入 maxRuntimeMs：HTTP 响应必须在 Telegram 因超时重发 update
   // 之前返回（约 60 秒），取两者较小值，避免整体预算形同虚设
   if (opts && opts.maxRuntimeMs > 0 && opts.maxRuntimeMs < timeoutMs) timeoutMs = opts.maxRuntimeMs;
-  // 扣掉收尾预留后才是真正能跑 Agent 的时间
-  return Date.now() + Math.max(3000, timeoutMs - tgReplyReserveMs(env, timeoutMs));
+  return Date.now() + timeoutMs;
 }
 
 async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTools, onProgress, opts) {
@@ -1427,7 +1327,7 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
   const deadline = tgAgentDeadline(env, opts);
   return await tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline,
     (opts && opts.resumeKey) || null, false, undefined,
-    (opts && opts.onDelta) || null, (opts && opts.onReset) || null, query);
+    (opts && opts.onDelta) || null, (opts && opts.onReset) || null);
 }
 
 // 「继续」入口：messages 里已包含 system + 历史，直接接着跑
@@ -1438,508 +1338,9 @@ async function tgAgentResume(env, tgApi, chatId, saved, onProgress, opts) {
   // v6.8.1：把首次运行时的 loopStartIdx 带回来，裁剪才能触及之前各段的老轮次，
   // 否则多段「继续」会让上下文无限增长；老版本存档无此字段则回退为旧行为
   const baseLoopStartIdx = (typeof saved.loopStartIdx === 'number' && saved.loopStartIdx >= 0) ? saved.loopStartIdx : undefined;
-  // 累计步数也带回来（防裁剪导致从消息里数不准）；老存档无此字段则回退为从消息里数
-  const savedStepCount = (typeof saved.totalSteps === 'number' && saved.totalSteps >= 0) ? saved.totalSteps : undefined;
   return await tgAgentRunLoop(env, tgApi, chatId, saved.targetModelId, saved.messages, tools, allowTools, onProgress, deadline,
     (opts && opts.resumeKey) || null, true, baseLoopStartIdx,
-    (opts && opts.onDelta) || null, (opts && opts.onReset) || null, saved.userText || null, savedStepCount);
-}
-
-// Telegram Bot API 调用工厂（webhook 与自动续做共用）。
-// timeoutMs 可选：进度 / 流式编辑这类"锦上添花"的调用用更短的超时 ——
-// 默认 15 秒对最终回复合适，但对进度编辑太长（Telegram 偶发卡两次就是 30 秒）。
-function makeTgApi(env) {
-  let tgApiTimeoutMs = parseInt(env.TG_API_TIMEOUT_MS || '15000', 10);
-  if (!(tgApiTimeoutMs > 0)) tgApiTimeoutMs = 15000;
-  return (method, body, timeoutMs) => fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/${method}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(timeoutMs > 0 ? timeoutMs : tgApiTimeoutMs)
-  });
-}
-
-// ==================== Telegram 自动续做（auto-continue） ====================
-// 原行为：单轮预算（默认 45 秒）用尽 → 存档 + 回一句"发送「继续」"→ 等用户手打。
-// 新行为：暂停后由 worker **主动**向自己的 /tg-auto-continue 端点发一次内部请求，
-// 自己把任务接着跑完，用户全程不用做任何事。
-//
-// 为什么必须换一次 invocation 才能"自动继续"：
-//   1) Telegram 约 60 秒收不到响应就断开，客户端一断 Cloudflare 会把 worker 一起
-//      cancel —— 所以单个 webhook 请求里不可能跑超过 ~60 秒；
-//   2) "先把响应返回、再靠 ctx.waitUntil 接着跑" 只有约 30 秒额度
-//      （v6.4.3 踩过的坑，见下方注释），不够跑一段 Agent。
-//   换成一次全新的 HTTP 请求，这两条限制全部重置：新请求有自己的预算、
-//   自己的 waitUntil 额度，于是超长任务可以一段接一段地跑下去。
-//
-// 生命周期（每段都长这样）：
-//   收到请求 → 立刻 ACK(200) → 在 ctx.waitUntil 里跑一段(≤28s) →
-//   没跑完就再发一次 /tg-auto-continue（下一段），跑完就把结果写进同一条消息。
-function tgAutoContinueEnabled(env) { return env.TG_AUTO_CONTINUE !== '0'; }
-function tgAutoContinueMaxSeg(env) {
-  let n = parseInt(env.TG_AUTO_CONTINUE_MAX_SEGMENTS || '8', 10);
-  if (!(n > 0)) n = 8;
-  if (n > 30) n = 30;
-  return n;
-}
-// 每段预算：必须小于 waitUntil 的 ~30 秒额度，否则这一段自己就会被平台掐断。
-// 默认 25 秒，允许 8 ~ 28 秒。
-function tgAutoContinueSegMs(env) {
-  let ms = parseInt(env.TG_AUTO_CONTINUE_SEGMENT_MS || '25000', 10);
-  if (!(ms >= 8000)) ms = 25000;
-  if (ms > 28000) ms = 28000;
-  return ms;
-}
-// 内部端点的共享令牌：优先用 TG_WEBHOOK_SECRET，没有就退到 TG_BOT_TOKEN。
-// 两者都只存在于服务端，不会下发到浏览器，足以挡住外部伪造调用。
-function tgAutoContinueToken(env) { return env.TG_WEBHOOK_SECRET || env.TG_BOT_TOKEN || ''; }
-// 自调用候选基础地址：TG_SELF_BASE_URL 优先（自定义域名自 fetch 会确定性 522，
-// 官方文档有写，此时应指向 workers.dev 域名），其次是当前请求的 origin。
-// 注意：TG_SELF_BASE_URL 填错格式会被忽略（回退到 origin），所以报错里会带上
-// 实际尝试的目标，方便一眼看出变量到底生没生效。
-function tgSelfBases(env, url) {
-  const v = String(env.TG_SELF_BASE_URL || '').trim().replace(/\/+$/, '');
-  const primary = /^https:\/\/[^\/:?#]+$/i.test(v) ? v : url.origin;
-  if (primary === url.origin) return [primary];
-  return [primary, url.origin];
-}
-const tgHostOf = (u) => String(u || '').replace(/^https:\/\//i, '');
-// 自调用 kick：按候选地址逐个尝试，单次只等一个 RTT（内部端点收到即回 200）。
-// timeoutMs 按调用场景给：webhook 内（60 秒预算）可给 8 秒；段尾（waitUntil
-// 额度内）只给 2 秒。
-// p12 at-least-once：body 里带 kickId，超时后用**同一个 kickId**重试一次 ——
-// endpoint 侧去重，重复的 kick 直接回 OK 不会起重复段。所以重试是安全的，
-// 不会像以前那样"不敢重试怕起两段"。两次都超时才判失败，走明确报错。
-async function tgKickAutoContinue(env, url, body, timeoutMs) {
-  const bases = tgSelfBases(env, url);
-  const tms = timeoutMs > 0 ? timeoutMs : 2000;
-  if (!body.kickId) body.kickId = newKickId();
-  let lastErr = '';
-  for (const base of bases) {
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        const rk = await fetch(base + '/tg-auto-continue', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'X-Auto-Continue-Token': tgAutoContinueToken(env) },
-          body: JSON.stringify(body),
-          signal: AbortSignal.timeout(tms)
-        });
-        if (rk && rk.ok) return { ok: true };
-        lastErr = 'HTTP ' + (rk ? rk.status : '无响应') + '（目标 ' + tgHostOf(base) + '）';
-        if (rk && rk.status === 522) break; // 确定性失败：换下一个地址试，不重试
-        return { ok: false, err: lastErr }; // 其他 HTTP 失败：确定性失败，直接返回
-      } catch (e) {
-        lastErr = ((e && e.message) ? e.message : String(e)) + '（目标 ' + tgHostOf(base) + '）';
-        // 超时/网络异常：用同一个 kickId 再试一次（去重保证安全）。
-        // 两次都超时 → 判失败，调用方走明确报错，不再静默假设"已发出"。
-      }
-    }
-  }
-  return { ok: false, err: lastErr };
-}
-// 按错误给用户指对方向：522 基本就是自定义域名自调用这个已知坑
-function autoKickHint(errText) {
-  if (/522/.test(errText || '')) {
-    return '这是 Cloudflare 已知限制：使用自定义域名的 Worker 不能 fetch 自己的域名（官方文档有写）。'
-      + '请把环境变量 TG_SELF_BASE_URL 设为你的 workers.dev 域名（形如 https://<worker名>.<账号>.workers.dev），重新部署后再试。';
-  }
-  return '请检查 WAF / Cloudflare Access / 防火墙规则是否拦截了站内请求。';
-}
-// ===== 以下为 p12 已废弃的老状态函数，仅供 tgAutoStateGet 迁移兜底使用 =====
-// 新代码一律走 tgAutoStateGet/Save/Clear。待线上所有链都跑过一次新版本后可删除。
-// 自动续做复用的那条消息的 id（存 R2，保证多段之间编辑的是同一条消息，不刷屏）
-function tgAutoMsgKey(chatId) { return 'tg_auto_msg_' + chatId; }
-
-async function tgAutoMsgGet(env, chatId) {
-  try {
-    const raw = await storeGet(env, tgAutoMsgKey(chatId));
-    if (!raw) return null;
-    const m = JSON.parse(raw);
-    return (m && m.id) ? m : null;
-  } catch (e) { return null; }
-}
-async function tgAutoMsgSave(env, chatId, msg) {
-  try { await storePut(env, tgAutoMsgKey(chatId), JSON.stringify(msg)); } catch (e) {}
-}
-async function tgAutoMsgClear(env, chatId) {
-  try { await storeDelete(env, tgAutoMsgKey(chatId)); } catch (e) {}
-}
-// 自动续做链的代际标识：同一 chatId 在同一时间只承认一条有效的链。
-// webhook 暂停开新链时生成新 epoch 并写入；新消息（非「继续」）到来时删除；
-// 正在跑的旧链各段在关键点核对 epoch，对不上就静默收工 —— 防止僵尸链复活、
-// 两条链并行跑同一份存档互相覆盖、以及旧链覆盖新消息的「已停止」提示。
-function tgAutoEpochKey(chatId) { return 'tg_auto_epoch_' + chatId; }
-async function tgAutoEpochGet(env, chatId) {
-  try { return await storeGet(env, tgAutoEpochKey(chatId)); } catch (e) { return null; }
-}
-async function tgAutoEpochSet(env, chatId, epoch) {
-  try {
-    if (epoch) await storePut(env, tgAutoEpochKey(chatId), epoch);
-    else await storeDelete(env, tgAutoEpochKey(chatId));
-  } catch (e) {}
-}
-// 自动续做累计段数：手动「继续」后新开链时，段号从累计值往后接着显示
-// （第 9 段、第 10 段…），而不是回到「第 1 段」让人以为任务重开了。
-// 任务正常完成 / 发新消息 / /clear 时清零；段数用尽 giveUp 时保留，供下次「继续」接着累加。
-function tgAutoTotalSegKey(chatId) { return 'tg_auto_total_seg_' + chatId; }
-async function tgAutoTotalSegGet(env, chatId) {
-  try {
-    const raw = await storeGet(env, tgAutoTotalSegKey(chatId));
-    const n = parseInt(raw, 10);
-    return n > 0 ? n : 0;
-  } catch (e) { return 0; }
-}
-async function tgAutoTotalSegSet(env, chatId, n) {
-  try {
-    if (n > 0) await storePut(env, tgAutoTotalSegKey(chatId), String(n));
-    else await storeDelete(env, tgAutoTotalSegKey(chatId));
-  } catch (e) {}
-}
-async function tgAutoTotalSegClear(env, chatId) {
-  try { await storeDelete(env, tgAutoTotalSegKey(chatId)); } catch (e) {}
-}
-function newAutoEpoch() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
-// ===== 自动续做统一状态（p12 方案 B：状态收敛）=====
-// 把原来分散的 3 个 R2 键（tg_auto_msg_ / tg_auto_epoch_ / tg_auto_total_seg_）
-// 收成 1 个 JSON，原子读写，消除多键不一致的整类问题。
-// state 形状：{v:1, epoch, seg, totalSeg, msgId, at, segAt, updatedAt}
-// 注意：tg_agent_（断点，体积大、读写模式不同）和 tg_pending_（通用占位兜底）保持独立。
-function tgAutoStateKey(chatId) { return 'tg_auto_' + chatId; }
-async function tgAutoStateGet(env, chatId) {
-  try {
-    const raw = await storeGet(env, tgAutoStateKey(chatId));
-    if (raw) {
-      const s = JSON.parse(raw);
-      // 两种有效形态：活跃链（epoch+msgId 都在）、休眠（maxSeg giveUp 后，
-      // epoch 已空但 totalSeg 保留，供下次手动「继续」接着计数）
-      if (s && (s.msgId || s.totalSeg)) return s;
-    }
-  } catch (e) {}
-  // 迁移兜底：新键没有时，尝试从老键组装（部署切换瞬间在飞的链不受影响）
-  try {
-    const msg = await tgAutoMsgGet(env, chatId);
-    if (msg && msg.id) {
-      const epoch = msg.epoch || await tgAutoEpochGet(env, chatId);
-      if (epoch) {
-        const totalSeg = await tgAutoTotalSegGet(env, chatId);
-        const s = {
-          v: 1, epoch,
-          seg: msg.seg || 1,
-          totalSeg: totalSeg > 0 ? totalSeg : (msg.totalSeg || msg.seg || 1),
-          msgId: msg.id, at: msg.at || Date.now(), segAt: msg.segAt || Date.now(),
-          updatedAt: Date.now()
-        };
-        await tgAutoStateSave(env, chatId, s); // 写回新键，下次直接命中
-        return s;
-      }
-    }
-    // 老键只有 totalSeg（上次 giveUp 保留的）：组装休眠态
-    const totalSeg = await tgAutoTotalSegGet(env, chatId);
-    if (totalSeg > 0) {
-      return { v: 1, epoch: null, seg: 0, totalSeg, msgId: null, updatedAt: Date.now() };
-    }
-  } catch (e) {}
-  return null;
-}
-async function tgAutoStateSave(env, chatId, state) {
-  try {
-    state.updatedAt = Date.now();
-    await storePut(env, tgAutoStateKey(chatId), JSON.stringify(state));
-  } catch (e) {}
-}
-async function tgAutoStateClear(env, chatId) {
-  try { await storeDelete(env, tgAutoStateKey(chatId)); } catch (e) {}
-  // 顺手清掉老键，防止新旧混用
-  try { await storeDelete(env, tgAutoMsgKey(chatId)); } catch (e) {}
-  try { await storeDelete(env, tgAutoEpochKey(chatId)); } catch (e) {}
-  try { await storeDelete(env, tgAutoTotalSegKey(chatId)); } catch (e) {}
-}
-// kick 去重：at-least-once 语义下，超时重试用同一个 kickId，
-// endpoint 见过就直接回 OK，不会重复起段。
-function tgKickDedupKey(kickId) { return 'tg_kick_' + kickId; }
-async function tgKickDedupCheck(env, kickId) {
-  // 返回 true 表示已处理过（重复），false 表示首次
-  if (!env.R2 || !kickId) return false;
-  try {
-    const raw = await env.R2.get(tgKickDedupKey(kickId)).then(o => o ? o.text() : null);
-    if (raw) {
-      const at = parseInt(raw, 10);
-      if (Date.now() - at < 5 * 60 * 1000) return true; // 5 分钟内算重复
-    }
-    await env.R2.put(tgKickDedupKey(kickId), String(Date.now()));
-  } catch (e) {}
-  return false;
-}
-function newKickId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 10); }
-// 刷新 pending 登记里某条消息的时间戳：自动续做会跑很多段，远超"预算 + 15 秒"
-// 的过期阈值，不刷新就会被下一轮的"过期占位"兜底误判成僵尸消息。
-async function tgPendingTouch(env, chatId, msgId) {
-  try {
-    const list = await tgPendingLoad(env, chatId);
-    let hit = false;
-    for (const it of list) if (it.id === msgId) { it.at = Date.now(); hit = true; }
-    if (!hit) list.push({ id: msgId, at: Date.now() });
-    await tgPendingSave(env, chatId, list.length > 5 ? list.slice(-5) : list);
-  } catch (e) {}
-}
-async function tgPendingRemove(env, chatId, msgId) {
-  try {
-    const list = await tgPendingLoad(env, chatId);
-    await tgPendingSave(env, chatId, list.filter(x => x.id !== msgId));
-  } catch (e) {}
-}
-// 原地编辑成正式文本（Markdown 失败退回纯文本）；「内容未改变」视为成功
-async function tgAutoEdit(env, tgApi, chatId, msgId, text, useMarkdown) {
-  try {
-    const r = await tgApi('editMessageText', useMarkdown
-      ? { chat_id: chatId, message_id: msgId, text, parse_mode: 'Markdown' }
-      : { chat_id: chatId, message_id: msgId, text }, TG_QUICK_API_TIMEOUT_MS);
-    if (r && r.ok) return true;
-    const body = await r.text().catch(() => '');
-    return /message is not modified/i.test(body);
-  } catch (e) { return false; }
-}
-// 把一段话落到「那条消息」上：能编辑就原地编辑，编辑不了才删掉重发
-async function tgAutoSendOrEdit(env, tgApi, chatId, msg, text) {
-  text = String(text == null ? '' : text);
-  if (msg && msg.id) {
-    if (await tgAutoEdit(env, tgApi, chatId, msg.id, text, true)) return;
-    if (await tgAutoEdit(env, tgApi, chatId, msg.id, text, false)) return;
-    // 收尾调用全部用短超时：自动续做跑在响应返回后的 waitUntil 里（约 30 秒额度），
-    // 一次 15 秒的 hung 就可能让整段被平台掐断，链就静默断了
-    await tgApi('deleteMessage', { chat_id: chatId, message_id: msg.id }, TG_QUICK_API_TIMEOUT_MS).catch(() => {});
-    await tgPendingRemove(env, chatId, msg.id);
-  }
-  for (let s = 0; s < text.length; s += 4000) {
-    await tgApi('sendMessage', { chat_id: chatId, text: text.slice(s, s + 4000) }, TG_QUICK_API_TIMEOUT_MS).catch(() => {});
-  }
-}
-
-// 跑一段自动续做。返回 'ok'（跑完）/ 'paused'（没跑完，已起下一段）/ 'stop'（终止）。
-async function runTgAutoContinue(env, ctx, chatId, seg, totalSeg, url, t0) {
-  const tgApi = makeTgApi(env);
-  const maxSeg = tgAutoContinueMaxSeg(env);
-  const segMs = tgAutoContinueSegMs(env);
-  // 段尾预留（毫秒）：R2 存档 + 代际核对 + 起下一段，必须在 waitUntil 额度内完成。
-  // Agent 的 deadline 从 t0（额度起点）锚定，保证收尾有硬保证的时间 ——
-  // 这是修复"跑几段后没反应"的关键：以前按段开始时间算，前置稍慢就整段被掐断。
-  const TAIL_RESERVE_MS = 9000;
-  // 本段链的代际校验：统一状态里的 epoch 必须和本段持有的 rec.epoch 一致，
-  // 否则说明这条链已被新的暂停 / 新消息取代 —— 静默收工，绝不复活僵尸链。
-  // ms：R2 限时，超时按"没读到"处理（段尾用短超时保活，段首用长超时保准）。
-  // P2-2：R2 超时导致的"没读到"会打日志，不再和"链被取代"混为一谈完全静默。
-  const chainAlive = async (rec, ms) => {
-    try {
-      if (!rec || !rec.epoch) return false;
-      const cur = await withTimeout(tgAutoStateGet(env, chatId), ms || 3000);
-      if (!cur) {
-        console.log('[cloudflare-chat] chainAlive chat=' + chatId + ' R2 读取超时(' + ms + 'ms)，按链已死处理');
-        return false;
-      }
-      return cur.epoch === rec.epoch;
-    } catch (e) { return false; }
-  };
-  const st0 = await withTimeout(tgAutoStateGet(env, chatId), 6000);
-
-  if (!env.R2) {
-    // 以前这里静默 return，用户只会看到「第 N 段」永远不动 —— 改成明确报错
-    if (st0 && st0.msgId) {
-      await tgAutoSendOrEdit(env, tgApi, chatId, { id: st0.msgId }, '⚠️ 自动续做需要绑定 R2 才能运行（进度存档无处可存），已停止。');
-      await tgAutoStateClear(env, chatId);
-      await tgPendingRemove(env, chatId, st0.msgId);
-    }
-    return 'stop';
-  }
-
-  // 取回暂停存档；取不到说明任务已完成 / 已过期 / 已被新问题清掉 —— 直接收工
-  const saved = await withTimeout(agentLoadResumeState(env, chatId), 6000);
-  if (!saved || saved.expired) {
-    if (st0 && st0.msgId && seg <= 1) {
-      // 第 1 段：消息登记还在但存档丢了/过期了 = 需要用户看见的异常；
-      // 登记也没了 = 链已被新消息取代，走静默收工（新消息分支已给出「已停止」说明）。
-      const why = (saved && saved.expired)
-        ? '⚠️ 自动续做异常：进度存档已过期（超过 30 分钟），请重新描述任务或发「继续」重试。'
-        : '⚠️ 自动续做异常：进度存档丢失（R2 读取失败或已被清理），请重试或发「继续」手动接着做。';
-      await tgAutoSendOrEdit(env, tgApi, chatId, { id: st0.msgId }, why);
-      await tgAutoStateClear(env, chatId);
-      await tgPendingRemove(env, chatId, st0.msgId);
-    } else if (st0 && st0.msgId) {
-      await tgAutoStateClear(env, chatId);
-    }
-    return 'stop';
-  }
-  // 代际校验：旧链（已被新暂停 / 新消息取代）到此为止，不再往下跑
-  if (!(await chainAlive(st0, 6000))) return 'stop';
-
-  // giveUp：收尾。preserveTotal=true 时保留累计段数（休眠态），供下次手动「继续」；
-  // 否则彻底清理（含 totalSeg）。P2-1 收敛：以前 totalSeg 的保存散落在外易遗漏。
-  const giveUp = async (why, preserveTotal) => {
-    const m = await withTimeout(tgAutoStateGet(env, chatId), 3000);
-    // 链已被取代（新消息/新暂停）时不再往那条消息上写东西 —— 新分支已经给出过说明
-    if (!(await chainAlive(m, 2000))) {
-      if (m && m.msgId) { try { await tgPendingRemove(env, chatId, m.msgId); } catch (e) {} }
-      return 'stop';
-    }
-    await tgAutoSendOrEdit(env, tgApi, chatId, { id: m.msgId }, why);
-    if (preserveTotal && totalSeg > 0) {
-      await tgAutoStateSave(env, chatId, { v: 1, epoch: null, seg: 0, totalSeg, msgId: null });
-    } else {
-      await tgAutoStateClear(env, chatId);
-    }
-    if (m && m.msgId) await tgPendingRemove(env, chatId, m.msgId);
-    return 'stop';
-  };
-
-  if (seg > maxSeg) {
-    return await giveUp('⏸️ 已自动续做 ' + totalSeg + ' 段仍未完成，先停在这里。发送「继续」可接着做。', true);
-  }
-
-  // 复用同一条进度消息；第一段没有就新建一条（并登记进 pending，链断了也能被兜底收掉）。
-  // seg>1 却找不到记录 = 链已被新消息/清空打断 → 静默收工，别再自己往下跑。
-  // （上面的 chainAlive 已保证：能走到这里的登记一定属于本代链。）
-  let msgId = st0 && st0.msgId ? st0.msgId : null;
-  let curEpoch = st0 && st0.epoch ? st0.epoch : null;
-  if (!msgId) {
-    if (seg > 1) return 'stop';
-    let id = null;
-    try {
-      const r = await tgApi('sendMessage', {
-        chat_id: chatId,
-        text: '🔄 任务较长，正在自动继续（第 ' + totalSeg + ' 段）…'
-      }, TG_QUICK_API_TIMEOUT_MS);
-      if (r && r.ok) { const d = await r.json(); id = d && d.result ? d.result.message_id : null; }
-    } catch (e) {}
-    if (!id) return 'stop';
-    msgId = id;
-    // 新链第一段：epoch 应已由 webhook 写入；兜底读一次
-    if (!curEpoch) curEpoch = (await tgAutoStateGet(env, chatId) || {}).epoch || null;
-    await tgAutoStateSave(env, chatId, {
-      v: 1, epoch: curEpoch, seg, totalSeg,
-      msgId, at: Date.now(), segAt: Date.now()
-    });
-    try {
-      const list = await tgPendingLoad(env, chatId);
-      list.push({ id, at: Date.now() });
-      await tgPendingSave(env, chatId, list.length > 5 ? list.slice(-5) : list);
-    } catch (e) {}
-  } else {
-    // 限时：R2 慢只吃 Agent 的时间（deadline 已锚定），不能无限挂起
-    await withTimeout(tgAutoStateSave(env, chatId, {
-      v: 1, epoch: curEpoch, seg, totalSeg,
-      msgId, at: Date.now(), segAt: Date.now()
-    }), 3000);
-    await withTimeout(tgPendingTouch(env, chatId, msgId), 3000);
-  }
-
-  // 每段开头把这条消息刷成当前段号。关闭流式编辑（TG_STREAM_EDIT_MS=0）时
-  // onProgress 是空操作，不在这里补一刀的话用户会一直看到「第 1 段」不动。
-  try {
-    await tgApi('editMessageText', {
-      chat_id: chatId, message_id: msgId,
-      text: '🔄 任务较长，正在自动继续（第 ' + totalSeg + ' 段）…'
-    }, TG_QUICK_API_TIMEOUT_MS);
-  } catch (e) {}
-
-  // 流式：把正文增量节流写进同一条消息（与 webhook 里那套逻辑同构）
-  let streamEditMs = parseInt(env.TG_STREAM_EDIT_MS || '2000', 10);
-  if (!(streamEditMs >= 0)) streamEditMs = 2000;
-  if (streamEditMs > 10000) streamEditMs = 10000;
-  const streamEnabled = streamEditMs > 0;
-  const stream = { buf: '', progress: '🔄 任务较长，正在自动继续（第 ' + totalSeg + ' 段）…', lastSent: '', timer: null, inFlight: false };
-  const flush = async () => {
-    if (!streamEnabled || stream.inFlight) return;
-    const text = stream.buf ? stream.buf.slice(0, 3900) : stream.progress;
-    if (text === stream.lastSent) return;
-    stream.inFlight = true;
-    try { await tgApi('editMessageText', { chat_id: chatId, message_id: msgId, text }, TG_QUICK_API_TIMEOUT_MS); }
-    catch (e) {} finally { stream.lastSent = text; stream.inFlight = false; }
-  };
-  const startStream = () => { if (streamEnabled && !stream.timer) stream.timer = setInterval(() => { flush(); }, streamEditMs); };
-  const stopStream = () => { if (stream.timer) { clearInterval(stream.timer); stream.timer = null; } };
-  let lastProgressEdit = 0;
-  const onProgress = async (text, force) => {
-    stream.buf = '';                       // 上一步正文作废，改回显示进度
-    stream.progress = String(text).slice(0, 4000);
-    const now = Date.now();
-    if (!force && now - lastProgressEdit < 1500) return;
-    lastProgressEdit = now;
-    await flush();
-  };
-
-  const opts = {
-    // 从 t0（额度起点）锚定：Agent 必须在窗口结束前 TAIL_RESERVE_MS 停下，
-    // 把"R2 存档 + 代际核对 + 起下一段"的收尾时间硬留出来
-    deadline: Math.max(Date.now() + 3000, t0 + segMs - TAIL_RESERVE_MS),
-    maxRuntimeMs: segMs,
-    resumeKey: tgAgentResumeKey(chatId),
-    onDelta: streamEnabled ? (text, kind) => {
-      if (kind !== 'content') return;
-      stream.buf += text;
-      startStream();
-    } : null,
-    onReset: streamEnabled ? () => { stream.buf = ''; } : null
-  };
-
-  let r;
-  try {
-    startStream();
-    r = await tgAgentResume(env, tgApi, chatId, saved, onProgress, opts);
-    // 通道不支持 tools 时降级重试一次（与首轮 tgAgentChat 的降级逻辑对齐）
-    if (r && r.fallback) {
-      r = await tgAgentResume(env, tgApi, chatId, { targetModelId: saved.targetModelId, allowTools: false, messages: saved.messages, loopStartIdx: saved.loopStartIdx, userText: saved.userText }, onProgress, opts);
-    }
-  } catch (e) {
-    r = { error: '⚠️ 自动续做出错：' + (e && e.message ? e.message : String(e)) };
-  } finally {
-    stopStream();
-  }
-
-  if (r.error) return await giveUp(r.error);
-
-  if (r.paused) {
-    if (seg < maxSeg) {
-      // 起下一段前再核对一次代际：本段跑的这段时间里可能来了新消息 / 新暂停
-      // （2 秒限时，超时则放行保活——下段开头还会再核对一次）
-      const recNow = await withTimeout(tgAutoStateGet(env, chatId), 2000);
-      if (!(await chainAlive(recNow, 2000))) return 'stop';
-      // 关键：立刻起下一段。这是"自动"二字的全部实现 —— 用户什么都不用做。
-      // p12 at-least-once：kick 带 kickId，超时用同一 kickId 重试一次，
-      // endpoint 去重保证不会起重复段。两次都失败才走明确报错。
-      const kick = await tgKickAutoContinue(env, url, { chatId, seg: seg + 1, totalSeg: totalSeg + 1 }, 2000);
-      if (!kick.ok) {
-        return await giveUp('⚠️ 自动续做链中断：第 ' + totalSeg + ' 段完成后无法启动下一段（' + kick.err + '）。'
-          + '进度已保存，发「继续」可手动接着做。' + autoKickHint(kick.err));
-      }
-      return 'paused';
-    }
-    return await giveUp('⏸️ 已自动续做 ' + totalSeg + ' 段仍未完成，先停在这里。发送「继续」可接着做。', true);
-  }
-
-  // ===== 跑完：把结果写进同一条消息，并清理所有中间状态 =====
-  // 写回前最后核对一次代际：本段跑的这段时间里若来了新消息，旧链的答案不能
-  // 覆盖掉那条「⏹️ 上一轮长任务已停止」，否则用户会看到串台的答案
-  const recEnd = await withTimeout(tgAutoStateGet(env, chatId), 2000);
-  if (!(await chainAlive(recEnd, 2000))) {
-    try { await tgPendingRemove(env, chatId, msgId); } catch (e) {}
-    return 'stop';
-  }
-  const text = r.text || '（本次任务没有产出内容）';
-  await tgAutoSendOrEdit(env, tgApi, chatId, { id: msgId }, text);
-  await tgAutoStateClear(env, chatId);
-  await tgPendingRemove(env, chatId, msgId);
-  await agentClearResumeState(env, chatId);
-
-  // 记入多轮历史：用暂停存档里带的原始提问补齐 user 消息，保持 user/assistant 交替
-  if (!r.isImage && text) {
-    try {
-      let hist = await tgGetHistory(env, chatId);
-      if (saved.userText) hist.push({ role: 'user', content: String(saved.userText) });
-      hist.push({ role: 'assistant', content: text });
-      hist = tgTrimHistory(hist, env);
-      await tgSaveHistory(env, chatId, hist);
-    } catch (e) {}
-  }
-  return 'ok';
+    (opts && opts.onDelta) || null, (opts && opts.onReset) || null);
 }
 
 // ==================== 上游流式读取（Agent 真流式） ====================
@@ -2023,14 +1424,9 @@ async function readUpstreamMessage(resp, onDelta) {
     const { done, value } = await reader.read();
     if (done) break;
     const chunk = decoder.decode(value, { stream: true });
-    // raw 只在「上游其实没按 SSE 返回」的兜底解析里用得到。一旦确认是 SSE 就
-    // 不再累积 —— 反复拼接几 MB 字符串本身就吃 CPU，而 Workers 的 CPU 配额很紧
-    // （免费版尤其），CPU 超限会被静默掐断，表现就是用户看到"思考中"然后没反应。
-    if (!sawSSE) {
-      raw += chunk;
-      // 防 OOM：异常巨大的非 SSE 响应体直接掐断（正常对话远达不到 2MB）
-      if (raw.length > 2000000) { try { await reader.cancel(); } catch (e) {} break; }
-    }
+    raw += chunk;
+    // 防 OOM：异常巨大的响应体直接掐断（正常对话远达不到 4MB）
+    if (raw.length > 4000000) { try { await reader.cancel(); } catch (e) {} break; }
     buffer += chunk;
     const lines = buffer.split('\n');
     buffer = lines.pop();
@@ -2069,12 +1465,11 @@ async function readUpstreamMessage(resp, onDelta) {
   return { content, reasoning, toolCalls, forwarded };
 }
 
-async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume, baseLoopStartIdx, onDelta, onReset, originUserText, savedStepCount) {
+async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume, baseLoopStartIdx, onDelta, onReset) {
   const maxSteps = agentLimits(env).maxSteps;
   // 真流式开关：默认开启，向上游请求 stream: true 并边读边转发正文增量。
-  // 只在调用方真的提供了 onDelta 时才请求流式 —— 否则增量没人消费，白白多一个
-  // 「通道不支持 stream + tools 组合」的风险面（Telegram 关闭流式编辑时就走这条）。
-  const useUpstreamStream = env.AGENT_STREAM_UPSTREAM !== '0' && typeof onDelta === 'function';
+  // 若某条通道不支持「流式 + tools」的组合，设 AGENT_STREAM_UPSTREAM=0 退回整段等待。
+  const useUpstreamStream = env.AGENT_STREAM_UPSTREAM !== '0';
   // 撤回已推给客户端的正文（仅当本轮确实推过内容时才发事件）
   const rollbackStreamed = async (forwarded) => {
     if (!forwarded || typeof onReset !== 'function') return;
@@ -2093,27 +1488,20 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
   const loopStartIdx = (typeof baseLoopStartIdx === 'number' && baseLoopStartIdx >= 0)
     ? Math.min(baseLoopStartIdx, messages.length)
     : messages.length;
-  // 累计步数基数：恢复时传入存档里的 totalSteps（防裁剪导致计数丢失）；
-  // 新任务则从消息里数（此时为 0）。显示用 baseStepCount + step + 1，保证跨段单调递增。
-  const baseStepCount = (typeof savedStepCount === 'number' && savedStepCount >= 0)
-    ? savedStepCount
-    : countAgentSteps(messages, loopStartIdx);
   // 上下文预算（字符数，env AGENT_CONTEXT_BUDGET 可配，默认 24000）
   let ctxBudget = parseInt(env.AGENT_CONTEXT_BUDGET || '24000', 10);
   if (!(ctxBudget > 0)) ctxBudget = 24000;
   // 超时暂停：保存循环状态，用户发「继续」即恢复。无 R2 时退化为直接终结。
   // v6.8.1：保存前先按上下文预算裁剪本轮老轮次（trim 只删 loopStartIdx 之后的消息，
   // 该下标本身不受影响，可原样存档），否则多段「继续」会让存档与发送量无限增长。
-  const pauseForResume = async (stepIdx) => {
+  const pauseForResume = async () => {
     const t = stripDSMLBlocks(lastAssistantText());
     let saved = false;
     if (resumeKey) {
       saved = await agentSaveResumeState(env, chatId, {
         v: 1, savedAt: Date.now(), chatId, targetModelId, allowTools,
-        userText: originUserText || undefined,
         messages: trimAgentMessages(messages, loopStartIdx, ctxBudget),
-        loopStartIdx: loopStartIdx,
-        totalSteps: baseStepCount + (stepIdx || 0)
+        loopStartIdx: loopStartIdx
       });
     }
     if (saved) {
@@ -2131,8 +1519,8 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
   // 重复调用熔断：记录每步工具调用签名，连续 3 步完全相同即判定模型原地打转
   const callSigHistory = [];
   for (let step = 0; step < maxSteps; step++) {
-    if (Date.now() > deadline) return await pauseForResume(step);
-    const stepLabel = '🤖 Agent 思考中' + (isResume ? '（继续）' : '') + '（第 ' + (baseStepCount + step + 1) + ' 步）…';
+    if (Date.now() > deadline) return await pauseForResume();
+    const stepLabel = '🤖 Agent 思考中' + (isResume ? '（继续）' : '') + '（第 ' + (step + 1) + ' 步）…';
     // 每步开始先报进度：LLM 长思考时用户也能看到活着
     if (typeof onProgress === 'function') {
       try { await onProgress(stepLabel); } catch (e) {}
@@ -2148,16 +1536,14 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
 
     let resp;
     try {
-      // 单步超时 = 剩余预算，绝不越过 deadline。以前这里有 15 秒下限
-      // （Math.max(15000, ...)），导致临近 deadline 的一步还能再多跑 15 秒，
-      // 把整轮推过 Telegram 的 60 秒红线 → worker 被 cancel → 用户永远卡在"思考中"。
-      const remainMs = deadline - Date.now();
-      if (remainMs < 2000) return await pauseForResume(step);
+      // 单步超时取 3 分钟与整体剩余预算的较小值：避免整体 deadline 已过，
+      // 还被一次上游调用拖住几分钟（webhook 必须在 Telegram 重发前返回）
+      const remainMs = Math.max(0, deadline - Date.now());
       resp = await fetch(cfg.apiUrl, {
         method: 'POST',
         headers: { 'Authorization': 'Bearer ' + cfg.currentApiKey, 'Content-Type': 'application/json' },
         body: JSON.stringify(cfg.payload),
-        signal: AbortSignal.timeout(Math.min(180000, remainMs))
+        signal: AbortSignal.timeout(Math.max(15000, Math.min(180000, remainMs)))
       });
     } catch (e) {
       // 中断分类：AbortSignal.timeout() 抛的是 TimeoutError（不是 AbortError），
@@ -2166,7 +1552,7 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       const nm = e && e.name ? String(e.name) : '';
       const msg = String((e && e.message) || '');
       const aborted = nm === 'AbortError' || nm === 'TimeoutError' || /abort/i.test(msg);
-      if (aborted && Date.now() >= deadline - 2000) return await pauseForResume(step);
+      if (aborted && Date.now() >= deadline - 2000) return await pauseForResume();
       if (aborted) return { error: '上游响应超时，请重试或换个问法' };
       return { error: '网络错误：' + (msg || String(e)) };
     }
@@ -2197,7 +1583,7 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       if (aborted) {
         // 流式过程中可能已经推了半截正文出去，先撤回再收尾
         await rollbackStreamed(true);
-        if (Date.now() >= deadline - 2000) return await pauseForResume(step);
+        if (Date.now() >= deadline - 2000) return await pauseForResume();
         return { error: '上游响应超时，请重试或换个问法' };
       }
       if (nm === 'UpstreamSSEError') return { error: '上游返回错误：' + emsg };
@@ -2280,15 +1666,13 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       } catch (e) {}
     }
 
-    // 同一步的多个工具调用并行执行（顺序写回，保证消息顺序）。
-    // 单工具上限压进剩余预算内，避免工具把整轮拖过 Telegram 的 60 秒红线
-    const toolBudgetMs = Math.max(2000, deadline - Date.now());
+    // 同一步的多个工具调用并行执行（顺序写回，保证消息顺序）
     const toolResults = await Promise.all(toolCalls.map(async (tc) => {
       const fn = (tc && tc.function) || {};
       let args = {};
       try { args = JSON.parse(fn.arguments || '{}'); } catch (e) {}
       if (!fn.name) return { tc, result: '工具调用缺少名称，已跳过' };
-      const result = await execAgentTool(fn.name, args, env, chatId, toolBudgetMs);
+      const result = await execAgentTool(fn.name, args, env, chatId);
       return { tc, result: truncateToolResult(result, 4000) };
     }));
     for (const tr of toolResults) {
@@ -2309,10 +1693,8 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
   if (resumeKey) {
     const saved = await agentSaveResumeState(env, chatId, {
       v: 1, savedAt: Date.now(), chatId, targetModelId, allowTools,
-      userText: originUserText || undefined,
       messages: trimAgentMessages(messages, loopStartIdx, ctxBudget),
-      loopStartIdx: loopStartIdx,
-      totalSteps: baseStepCount + maxSteps
+      loopStartIdx: loopStartIdx
     });
     if (saved) {
       return { text: '⏸️ 推理步数已用尽，进度已保存，发送「继续」让我接着做。' + (t ? '\n\n已产出：\n' + t : ''), usedTools: true, paused: true };
@@ -2667,38 +2049,6 @@ export default {
       return new Response(html, { headers: HTML_HEADERS });
     }
 
-    // ================= 内部端点：自动续做 =================
-    // 只由 worker 自己（暂停后）调用，不是给 Telegram 用的，因此不在 setWebhook 里登记。
-    // 收到即立刻 ACK，真正的续做在 ctx.waitUntil 里跑 —— 这样调用方（上一段）能马上
-    // 拿到响应并结束自己的生命周期，本段则作为一次**独立的 invocation** 继续运行。
-    if (request.method === 'POST' && url.pathname === '/tg-auto-continue') {
-      const t0 = Date.now(); // 本段 waitUntil 约 30 秒额度的起点：段内一切预算从这里锚定，
-      // 而不是从"Agent 开始跑"算 —— 否则前置的 R2/编辑一慢，整段就会被平台掐断
-      const tok = tgAutoContinueToken(env);
-      const got = request.headers.get('X-Auto-Continue-Token') || '';
-      if (!tok || !safeEqual(got, tok)) return new Response('Forbidden', { status: 403 });
-      if (!env.TG_BOT_TOKEN || !env.R2) return new Response('OK', { status: 200 });
-      let body = {};
-      try { body = await request.json(); } catch (e) {}
-      const chatId = body ? body.chatId : undefined;
-      let seg = body ? parseInt(body.seg, 10) : 1;
-      if (!(seg >= 1)) seg = 1;
-      // totalSeg：跨「继续」的累计段号（用于显示）；老版本 kick 没带时回退为 seg
-      let totalSeg = body ? parseInt(body.totalSeg, 10) : seg;
-      if (!(totalSeg >= 1)) totalSeg = seg;
-      if (chatId === undefined || chatId === null) return new Response('OK', { status: 200 });
-      // p12 at-least-once 去重：同一个 kickId 重复打过来（超时重试），直接回 OK，
-      // 不会重复起段。注意去重检查放在鉴权之后、启动 waitUntil 之前。
-      const kickId = body ? body.kickId : null;
-      if (kickId && await tgKickDedupCheck(env, kickId)) {
-        return new Response('OK', { status: 200 });
-      }
-      // 自调用基础地址在 runTgAutoContinue 内部按 TG_SELF_BASE_URL / origin 自动选择；
-      // t0 传进去做整段预算的锚点
-      ctx.waitUntil(runTgAutoContinue(env, ctx, chatId, seg, totalSeg, url, t0));
-      return new Response('OK', { status: 200 });
-    }
-
     if (request.method === 'POST' && url.pathname === '/tg-webhook') {
       // Webhook 来源校验：配置 TG_WEBHOOK_SECRET 后，只接受携带正确
       // X-Telegram-Bot-Api-Secret-Token 请求头的调用（setWebhook 时传入 secret_token）。
@@ -2719,14 +2069,22 @@ export default {
         const update = await request.json();
         if (!env.TG_BOT_TOKEN) return new Response('OK', { status: 200 });
 
-        // Telegram Bot API 调用工厂（超时默认 15 秒，可用 TG_API_TIMEOUT_MS 调整）
-        const tgApi = makeTgApi(env);
+        // Telegram Bot API 单次调用超时（默认 15 秒，可用 TG_API_TIMEOUT_MS 调整）：
+        // 之前是裸 fetch 无超时，api.telegram.org 偶发 hung 住会让进度消息永远停在"思考中"
+        let tgApiTimeoutMs = parseInt(env.TG_API_TIMEOUT_MS || '15000', 10);
+        if (!(tgApiTimeoutMs > 0)) tgApiTimeoutMs = 15000;
+        const tgApi = (method, body) => fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/${method}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(tgApiTimeoutMs)
+        });
 
         // v6.4.3 根因修复：之前收到 webhook 立刻返回 OK、把全部工作丢进 ctx.waitUntil ——
         // 但 HTTP 响应结束后 waitUntil 最多再延续约 30 秒，超过 30 秒的 Agent 任务会被
         // 静默掐断（pending 消息永远卡在"📄 正在读取网页…"，且无任何错误）。
         // 现在改为在请求上下文内等待处理完成再返回 OK。
-        async function processTelegramUpdate(env, update, tgApi, ctx) {
+        async function processTelegramUpdate(env, update, tgApi) {
           try {
             const { models: modelObjList } = getChannelConfig(env);
             if (modelObjList.length === 0) return;
@@ -2791,7 +2149,6 @@ export default {
               if (userText === '/clear' || userText === '/new') {
                 await tgClearHistory(env, chatId);
                 await agentClearResumeState(env, chatId);
-                await tgAutoStateClear(env, chatId);
                 await tgApi('sendMessage', { chat_id: chatId, text: "🧹 上下文已清空，可以开始新的话题了。" });
                 return;
               }
@@ -2806,7 +2163,7 @@ export default {
                     + "/memory —— 查看长期记忆\n"
                     + "/forget 关键词 —— 删除包含关键词的记忆\n"
                     + "/kb —— 知识库总览（文档列表 + 记忆统计）\n"
-                    + "长任务会自动分段续做，全程无需干预；万一段数用尽，发送「继续」仍可接着做\n\n"
+                    + "任务太长被暂停时，发送「继续」可接着做\n\n"
                     + "Agent 模式下我会自主规划、调用工具（🔍 搜索、📄 网页、🧮 计算、🌤 天气、🕐 时间），长期记住你告诉我的事，还能用 💾 保存、📚 查阅知识库文档（比如：把这篇文章存成知识库文档；问知识库里的问题我会优先查文档）。"
                     + "\n\n📌 当前版本 v" + APP_VERSION + "（R2 持久化 · 长期记忆无上限）"
                 });
@@ -2877,23 +2234,6 @@ export default {
               history.push({ role: "user", content: userText });
               history = tgTrimHistory(history, env);
 
-              // webhook 单轮预算：Telegram 约 60 秒无响应会断开连接，而**客户端断开后
-              // worker 会被一起 cancel** —— 收尾消息发不出去，用户就永远停在那句
-              // "Agent 思考中…"上。这是最常见的"没反应"，所以预算不能贴着 60 秒，
-              // 必须留足余量：默认 45 秒，另扣 TG_WEBHOOK_RESERVE_MS（默认 6 秒）做收尾。
-              // 可用 TG_WEBHOOK_BUDGET_MS 调整（10 秒 ~ 240 秒）。
-              // 超预算的任务会暂停并保存进度，用户发「继续」即接着做。
-              let webhookBudgetMs = parseInt(env.TG_WEBHOOK_BUDGET_MS || '45000', 10);
-              if (!(webhookBudgetMs >= 10000)) webhookBudgetMs = 45000;
-              if (webhookBudgetMs > 240000) webhookBudgetMs = 240000;
-
-              // 先兜底收掉上一轮遗留的「思考中」占位消息：worker 被平台掐断时
-              // 收尾消息发不出去，占位会永远停在那里。这里在下一轮开工前收掉并说明，
-              // 不依赖 worker 自己能活到收尾。判据按本轮预算推导（预算 + 15 秒），
-              // 所以上一轮只要还在预算内正常跑，就绝不会被误收。
-              await tgCleanupStalePending(env, tgApi, chatId, webhookBudgetMs + 15000);
-
-              const turnT0 = Date.now();
               const sendActionPromise = tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
               const pendingMsgPromise = tgApi('sendMessage', {
                 chat_id: chatId,
@@ -2908,189 +2248,58 @@ export default {
               }).catch(() => null);
 
               const [, pendingMsgId] = await Promise.all([sendActionPromise, pendingMsgPromise]);
-              // 登记占位消息 id，供下一轮兜底清理；正常走到收尾时会摘掉自己的那一条。
-              // 追加而不是覆盖：用户可能在上一轮没结束时又发一条，两条占位都要有主。
-              if (pendingMsgId) {
-                try {
-                  const list = await tgPendingLoad(env, chatId);
-                  list.push({ id: pendingMsgId, at: turnT0 });
-                  await tgPendingSave(env, chatId, list.length > 5 ? list.slice(-5) : list);
-                } catch (e) {}
-              }
 
               // ===== Agent 主流程：自主规划 → 工具调用 → 汇总作答 =====
               const useAgent = await agentGetMode(env, chatId);
               let replyText = null;
               let agentErr = null;
-              // 本轮是否转入「自动续做」：转入时不发正文、不删占位消息，改由内部端点接着跑
-              let autoContinue = false;
-              // 新链第一段的累计段号（手动「继续」后从 9 开始，而不是回到 1）
-              let autoStartTotalSeg = 1;
-              // 「继续」精确匹配（只有以「继续」开头才算恢复指令）
-              const wantResume = /^继续/.test(userText.trim());
-              // 新问题 = 打断可能在跑的自动续做链（无论当前是否 Agent 模式）：撤掉它的
-              // 复用消息登记与 pending，并把那条消息改成「已停止」，否则它会一直挂着
-              // "正在自动继续…"，链的下一段也会继续跑、和新问题抢上下文。
-              if (!wantResume) {
-                try {
-                  const prev = await tgAutoStateGet(env, chatId);
-                  if (prev && prev.msgId) {
-                    await tgPendingRemove(env, chatId, prev.msgId);
-                    await tgApi('editMessageText', {
-                      chat_id: chatId, message_id: prev.msgId,
-                      text: '⏹️ 上一轮长任务已停止（你发了新消息）。'
-                    }, TG_QUICK_API_TIMEOUT_MS).catch(() => {});
-                  }
-                  // 统一清理：状态、代际、累计段数一次清掉。
-                  // 正在跑的旧段在下一个 chainAlive 关键点看到 epoch 对不上会自己停下，
-                  // 不会复活旧任务、也不会覆盖这条「已停止」提示
-                  await tgAutoStateClear(env, chatId);
-                } catch (e) {}
-              }
 
-              // 整轮共享同一个硬墙钟：「首步带工具失败 → 降级重试」是两次 tgAgentChat，
-              // 各自算预算会让总时长直接翻倍
-              const agentDeadline = Date.now() + Math.max(3000, webhookBudgetMs - tgReplyReserveMs(env, webhookBudgetMs));
-              // ===== Telegram 流式：把 Agent 的正文增量节流写进 pending 消息 =====
-              // Telegram 对同一条消息的 editMessageText 有严格限流（超了返回 429），
-              // 所以不做逐字编辑，而是固定间隔把「当前完整文本」刷一次 —— 用户看到的是
-              // 文字一段段长出来，而不是像以前那样只看到"思考中"、答案突然整段蹦出来。
-              // 想回到旧行为：设 TG_STREAM_EDIT_MS=0。
-              let tgStreamEditMs = parseInt(env.TG_STREAM_EDIT_MS || '2000', 10);
-              if (!(tgStreamEditMs >= 0)) tgStreamEditMs = 2000;
-              if (tgStreamEditMs > 10000) tgStreamEditMs = 10000;
-              const tgStreamEnabled = tgStreamEditMs > 0 && !!pendingMsgId;
-              const tgStream = {
-                buf: '',        // 当前这一步已流出的正文
-                progress: '',   // 最近一次进度文案（每步开始 / 工具调用时用）
-                lastSent: '',   // 已经写进 Telegram 的内容，用于去重
-                used: false,    // 本轮是否真的推过流式正文（决定最后要不要原地编辑）
-                timer: null,
-                inFlight: false
-              };
-              // pending 消息当前该显示什么：有流式正文就显示正文，否则显示进度文案
-              const tgPendingText = () => tgStream.buf
-                ? tgStream.buf.slice(0, 3900)
-                : (tgStream.progress || '⏳ 正在思考并生成内容，请稍候...');
-              const tgFlushPending = async () => {
-                if (!tgStreamEnabled || tgStream.inFlight) return;
-                const text = tgPendingText();
-                if (text === tgStream.lastSent) return;
-                tgStream.inFlight = true;
-                try {
-                  // 纯文本，不加 parse_mode：流式过程中的 Markdown 常常是半截的
-                  // （比如只推了开头的 ** 还没推结尾），带 parse_mode 会直接 400
-                  // 短超时：进度/流式编辑卡住不该吃掉整轮预算
-                  await tgApi('editMessageText', { chat_id: chatId, message_id: pendingMsgId, text }, TG_QUICK_API_TIMEOUT_MS);
-                } catch (e) {
-                } finally {
-                  // 无论成功失败都记账，避免定时器拿着同一条无效内容反复重试
-                  tgStream.lastSent = text;
-                  tgStream.inFlight = false;
-                }
-              };
-              const tgStartStream = () => {
-                if (!tgStreamEnabled || tgStream.timer) return;
-                tgStream.timer = setInterval(() => { tgFlushPending(); }, tgStreamEditMs);
-              };
-              const tgStopStream = () => {
-                if (tgStream.timer) { clearInterval(tgStream.timer); tgStream.timer = null; }
-              };
-
-              const agentOpts = {
-                maxRuntimeMs: webhookBudgetMs,
-                deadline: agentDeadline,
-                resumeKey: tgAgentResumeKey(chatId),
-                // 增量回调只更新内存缓冲，网络调用交给定时器 —— 上游读取循环里
-                // emit() 是 await onDelta 的，这里一旦做 I/O 就会把整个流拖慢。
-                // 关闭流式编辑（TG_STREAM_EDIT_MS=0）时不传回调，tgAgentRunLoop
-                // 据此也不会向上游请求 stream:true，行为与打补丁前完全一致。
-                onDelta: tgStreamEnabled ? (text, kind) => {
-                  if (kind !== 'content') return;
-                  tgStream.buf += text;
-                  tgStream.used = true;
-                  tgStartStream();
-                } : null,
-                // 撤回：这一步被判定为工具调用 / 正文被清洗过，已流出的开场白不能留在屏幕上
-                onReset: tgStreamEnabled ? () => { tgStream.buf = ''; } : null
-              };
+              // webhook 单轮预算：Telegram 约 60 秒无响应会重发 update，
+              // 55 秒内必须返回（可用 TG_WEBHOOK_BUDGET_MS 调整，10 秒 ~ 240 秒）。
+              // 超预算的任务会暂停并保存进度，用户发「继续」即接着做。
+              let webhookBudgetMs = parseInt(env.TG_WEBHOOK_BUDGET_MS || '55000', 10);
+              if (!(webhookBudgetMs >= 10000)) webhookBudgetMs = 55000;
+              if (webhookBudgetMs > 240000) webhookBudgetMs = 240000;
+              const agentOpts = { maxRuntimeMs: webhookBudgetMs, resumeKey: tgAgentResumeKey(chatId) };
 
               if (useAgent) {
-                // Agent 模式：ReAct 多步推理 + 工具调用（进度与流式正文共用 pending 消息）
+                // Agent 模式：ReAct 多步推理 + 工具调用（进度实时编辑到 pending 消息上）
                 let lastProgressEdit = 0;
                 const onProgress = async (text, force) => {
                   if (!pendingMsgId) return;
-                  // 每步开始 / 工具调用时，上一步的正文缓冲作废，改回显示进度文案
-                  tgStream.buf = '';
-                  tgStream.progress = String(text).slice(0, 4000);
                   const now = Date.now();
                   if (!force && now - lastProgressEdit < 1500) return; // Telegram 编辑限流，节流；工具进度用 force 突破
                   lastProgressEdit = now;
-                  await tgFlushPending();
+                  try {
+                    // 纯文本，不加 parse_mode，避免搜索词里的 Markdown 特殊字符导致编辑失败
+                    await tgApi('editMessageText', { chat_id: chatId, message_id: pendingMsgId, text: String(text).slice(0, 4000) });
+                  } catch (e) {}
                 };
                 // 「继续」：恢复上次暂停的任务；新问题则清掉旧暂停状态
-                // P1-1：存档过期时给明确提示，而不是当成新问题答非所问
+                const wantResume = /^继续/.test(userText.trim());
                 let resumeState = null;
-                let resumeExpired = false;
-                if (wantResume) {
-                  resumeState = await agentLoadResumeState(env, chatId);
-                  if (resumeState && resumeState.expired) {
-                    resumeExpired = true;
-                    resumeState = null;
-                  }
-                }
+                if (wantResume) resumeState = await agentLoadResumeState(env, chatId);
                 if (!resumeState) await agentClearResumeState(env, chatId);
-                if (resumeExpired) {
-                  await tgApi('sendMessage', {
-                    chat_id: chatId,
-                    text: '⏳ 上次的任务进度已过期（超过 30 分钟），无法接着做。请重新描述一下任务，我重新开始。'
-                  }).catch(() => {});
-                  if (pendingMsgId) {
-                    try { await tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {}); } catch (e) {}
-                  }
-                  return;
-                }
                 const runAgentTurn = (allowTools) => {
                   if (resumeState) {
-                    return tgAgentResume(env, tgApi, chatId, Object.assign({}, resumeState, { allowTools: allowTools }), onProgress, agentOpts);
+                    return tgAgentResume(env, tgApi, chatId, {
+                      targetModelId: resumeState.targetModelId || targetModelId,
+                      allowTools: allowTools,
+                      messages: resumeState.messages
+                    }, onProgress, agentOpts);
                   }
                   return tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTools, onProgress, agentOpts);
                 };
                 let r;
                 try {
-                  tgStartStream();
                   r = await runAgentTurn(true);
                   if (r.fallback) r = await runAgentTurn(false);
                 } catch (e) {
                   // 兜底：Agent 内部任何未预期异常都转为可见错误，绝不让用户面对卡死的"思考中"
                   r = { error: '⚠️ Agent 执行出错：' + (e && e.message ? e.message : String(e)) };
-                } finally {
-                  tgStopStream();
                 }
                 if (r.error) {
                   agentErr = r.error;
-                } else if (r.paused && tgAutoContinueEnabled(env) && env.R2 && pendingMsgId) {
-                  // ===== 自动续做：不向用户要「继续」，机器人自己接着跑 =====
-                  // 把当前占位消息登记为「续做专用消息」，交给 /tg-auto-continue 的第一段
-                  // 复用（编辑它而不是再发一条），然后立刻发起内部请求开跑下一段。
-                  autoContinue = true;
-                  replyText = null;
-                  try {
-                    // 新开一条自动续做链：生成代际标识写入统一状态，旧链各段在
-                    // chainAlive 看到 epoch 对不上就会自己停下，不会复活、不会抢消息。
-                    // 累计段号接着上次的往后排（手动「继续」后是第 9 段起），而不是回到第 1 段。
-                    const epoch = newAutoEpoch();
-                    const prevSt = await tgAutoStateGet(env, chatId);
-                    autoStartTotalSeg = (prevSt && prevSt.totalSeg > 0 ? prevSt.totalSeg : 0) + 1;
-                    await tgAutoStateSave(env, chatId, {
-                      v: 1, epoch, seg: 1, totalSeg: autoStartTotalSeg,
-                      msgId: pendingMsgId, at: Date.now(), segAt: Date.now()
-                    });
-                    await tgApi('editMessageText', {
-                      chat_id: chatId, message_id: pendingMsgId,
-                      text: '🔄 任务较长，正在自动继续（第 ' + autoStartTotalSeg + ' 段）…'
-                    }, TG_QUICK_API_TIMEOUT_MS).catch(() => {});
-                  } catch (e) {}
                 } else {
                   replyText = r.text;
                   // 文本问答记入历史；图片生成不记（省空间）
@@ -3099,20 +2308,9 @@ export default {
                     history = tgTrimHistory(history, env);
                     await tgSaveHistory(env, chatId, history);
                   }
-                  // 正常完成（非暂停）后清理断点与自动续做状态；暂停时新状态已在内部保存
-                  if (!r.paused) {
-                    await agentClearResumeState(env, chatId);
-                    await tgAutoStateClear(env, chatId);
-                  }
+                  // 正常完成（非暂停）后清理断点；暂停时新状态已在内部保存
+                  if (!r.paused) await agentClearResumeState(env, chatId);
                 }
-                // 一行式回合摘要：排查"卡住"时 wrangler tail 直接能看到每轮的耗时与结局。
-                // 关键看 elapsed 是否逼近 budget —— 逼近就说明又被平台掐断了。
-                console.log('[cloudflare-chat] tg回合 chat=' + chatId
-                  + ' elapsed=' + (Date.now() - turnT0) + 'ms'
-                  + ' budget=' + webhookBudgetMs + 'ms'
-                  + ' 结局=' + (r.error ? 'error' : (autoContinue ? 'auto-continue' : (r.paused ? 'paused' : 'ok')))
-                  + ' 正文=' + (r.text ? r.text.length : 0) + '字'
-                  + (r.error ? ' 错误=' + String(r.error).slice(0, 200) : ''));
               } else {
                 // 普通模式：单次问答（与旧版行为一致，不调用工具）
                 const aiConfig = buildAIRequest(env, targetModelId, history, false);
@@ -3165,46 +2363,12 @@ export default {
                 }
               }
 
-              // 走到收尾阶段，把本轮自己的占位登记摘掉（无论下面走哪条分支）。
-              // 只摘自己那条：别的聊天/上一轮的登记不归本轮管。
-              // 例外：转入自动续做时这条占位消息要留给下一段复用，且需要它继续留在
-              // pending 登记里（链断了才能被下一轮兜底收掉），所以这里不摘。
-              if (pendingMsgId && !autoContinue) {
-                try {
-                  const list = await tgPendingLoad(env, chatId);
-                  await tgPendingSave(env, chatId, list.filter(x => x.id !== pendingMsgId));
-                } catch (e) {}
+              if (pendingMsgId) {
+                await tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {});
               }
 
               if (agentErr) {
-                if (pendingMsgId) {
-                  await tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {});
-                }
                 await tgApi('sendMessage', { chat_id: chatId, text: agentErr });
-                return;
-              }
-
-              // 转入自动续做：占位消息已在上面改成「正在自动继续（第 N 段）」，这里
-              // 只需向自己的内部端点发一次请求，把剩余任务交给它一段一段跑完。
-              // 用 ctx.waitUntil 兜住这次 fetch：webhook 响应马上返回，请求照样发得出去。
-              if (autoContinue) {
-                // 等待内部端点的即时 ACK（它收到请求就回 200，真正的续做在它自己的
-                // waitUntil 里跑，所以这里只等一个 RTT，不会吃掉 webhook 预算）。
-                // 失败则立刻给用户明确报错 —— 自调用失败是之前「第 1 段」永远不动
-                // 最常见的原因，不能再静默过去。
-                // webhook 内（60 秒预算）给 8 秒确认；失败则立刻给用户明确报错
-                const kick = await tgKickAutoContinue(env, url, { chatId: chatId, seg: 1, totalSeg: autoStartTotalSeg }, 8000);
-                if (!kick.ok) {
-                  try {
-                    const m0 = await tgAutoStateGet(env, chatId);
-                    await tgAutoSendOrEdit(env, tgApi, chatId, m0 && m0.msgId ? { id: m0.msgId } : { id: pendingMsgId },
-                      '⚠️ 自动续做启动失败（' + kick.err + '）：worker 无法调用自己的 /tg-auto-continue 端点。'
-                      + autoKickHint(kick.err) + '或发「继续」手动接着做（进度已保存）。');
-                    await tgAutoStateClear(env, chatId);
-                    if (pendingMsgId) await tgPendingRemove(env, chatId, pendingMsgId);
-                  } catch (e) {}
-                  return;
-                }
                 return;
               }
 
@@ -3224,24 +2388,7 @@ export default {
                   }
                   return { ok: false };
                 };
-                // 原地编辑：把流式用的占位消息改成正式回复。Markdown 解析失败退回纯文本
-                const editPendingTo = async (text, useMarkdown) => {
-                  if (!tgStreamEnabled) return false;
-                  try {
-                    const r = await tgApi('editMessageText', useMarkdown
-                      ? { chat_id: chatId, message_id: pendingMsgId, text, parse_mode: "Markdown" }
-                      : { chat_id: chatId, message_id: pendingMsgId, text });
-                    if (r && r.ok) return true;
-                    // 「内容未改变」不算失败：说明这条消息上已经是我们要显示的文本。
-                    // 流式推的是纯文本、这里带 parse_mode，两者渲染结果一致时 Telegram 就会这么回
-                    const body = await r.text().catch(() => '');
-                    return /message is not modified/i.test(body);
-                  } catch (e) {
-                    return false;
-                  }
-                };
                 const maxLength = 4000;
-                const chunks = [];
                 let startIndex = 0;
                 while (startIndex < replyText.length) {
                   let sliceLength = maxLength;
@@ -3251,32 +2398,16 @@ export default {
                        sliceLength = lastNewline - startIndex;
                     }
                   }
-                  chunks.push(replyText.slice(startIndex, startIndex + sliceLength));
+
+                  const chunk = replyText.slice(startIndex, startIndex + sliceLength);
                   startIndex += sliceLength;
-                }
 
-                // 流式已经把这轮正文写在这条占位消息上了 → 直接原地改成正式回复。
-                // 不要"先删掉再重发"，那样用户会看到答案闪一下又跳出来。
-                let firstChunkDone = false;
-                if (tgStream.used) {
-                  firstChunkDone = (await editPendingTo(chunks[0], true)) || (await editPendingTo(chunks[0], false));
-                  if (!firstChunkDone && pendingMsgId) {
-                    await tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {});
-                  }
-                } else if (pendingMsgId) {
-                  await tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {});
-                }
-
-                for (let ci = firstChunkDone ? 1 : 0; ci < chunks.length; ci++) {
-                  const chunk = chunks[ci];
                   const tgRes = await sendReplyChunk(chunk, true);
+
                   if (!tgRes.ok) {
                     await sendReplyChunk(chunk, false);
                   }
                 }
-              } else if (pendingMsgId) {
-                // 没有正文（例如任务被暂停，提示已由内部单独发出）：清掉占位消息
-                await tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {});
               }
             }
           } catch (err) {
@@ -3301,7 +2432,7 @@ export default {
         } catch (e) {}
 
         try {
-          await processTelegramUpdate(env, update, tgApi, ctx);
+          await processTelegramUpdate(env, update, tgApi);
         } catch (err) {
           console.log("处理 Telegram 更新异常:", err);
         }
@@ -3433,7 +2564,6 @@ self.addEventListener('fetch', function (event) {
   // 实时接口：直连网络，不缓存
   if (url.pathname.indexOf('/api/') === 0) return;
   if (url.pathname === '/tg-webhook') return;
-  if (url.pathname === '/tg-auto-continue') return;
 
   // 页面导航：network-first，断网时回退到缓存的页面外壳
   if (req.mode === 'navigate') {
