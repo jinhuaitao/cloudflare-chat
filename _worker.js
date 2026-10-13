@@ -40,7 +40,7 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 // 应用版本号（/help 显示；发版时同步 package.json）
 // 后缀 -p1 表示这是本地补丁版（Web Agent 真流式 + 卡死修复），上游仓库无此版本。
 // 发 /help 看到带 -p1 即说明部署的是打过补丁的构建。
-const APP_VERSION = '6.8.8';
+const APP_VERSION = '6.8.3-p2';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -1468,8 +1468,9 @@ async function readUpstreamMessage(resp, onDelta) {
 async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume, baseLoopStartIdx, onDelta, onReset) {
   const maxSteps = agentLimits(env).maxSteps;
   // 真流式开关：默认开启，向上游请求 stream: true 并边读边转发正文增量。
-  // 若某条通道不支持「流式 + tools」的组合，设 AGENT_STREAM_UPSTREAM=0 退回整段等待。
-  const useUpstreamStream = env.AGENT_STREAM_UPSTREAM !== '0';
+  // 只在调用方真的提供了 onDelta 时才请求流式 —— 否则增量没人消费，白白多一个
+  // 「通道不支持 stream + tools 组合」的风险面（Telegram 关闭流式编辑时就走这条）。
+  const useUpstreamStream = env.AGENT_STREAM_UPSTREAM !== '0' && typeof onDelta === 'function';
   // 撤回已推给客户端的正文（仅当本轮确实推过内容时才发事件）
   const rollbackStreamed = async (forwarded) => {
     if (!forwarded || typeof onReset !== 'function') return;
@@ -2260,20 +2261,80 @@ export default {
               let webhookBudgetMs = parseInt(env.TG_WEBHOOK_BUDGET_MS || '55000', 10);
               if (!(webhookBudgetMs >= 10000)) webhookBudgetMs = 55000;
               if (webhookBudgetMs > 240000) webhookBudgetMs = 240000;
-              const agentOpts = { maxRuntimeMs: webhookBudgetMs, resumeKey: tgAgentResumeKey(chatId) };
+              // ===== Telegram 流式：把 Agent 的正文增量节流写进 pending 消息 =====
+              // Telegram 对同一条消息的 editMessageText 有严格限流（超了返回 429），
+              // 所以不做逐字编辑，而是固定间隔把「当前完整文本」刷一次 —— 用户看到的是
+              // 文字一段段长出来，而不是像以前那样只看到"思考中"、答案突然整段蹦出来。
+              // 想回到旧行为：设 TG_STREAM_EDIT_MS=0。
+              let tgStreamEditMs = parseInt(env.TG_STREAM_EDIT_MS || '2000', 10);
+              if (!(tgStreamEditMs >= 0)) tgStreamEditMs = 2000;
+              if (tgStreamEditMs > 10000) tgStreamEditMs = 10000;
+              const tgStreamEnabled = tgStreamEditMs > 0 && !!pendingMsgId;
+              const tgStream = {
+                buf: '',        // 当前这一步已流出的正文
+                progress: '',   // 最近一次进度文案（每步开始 / 工具调用时用）
+                lastSent: '',   // 已经写进 Telegram 的内容，用于去重
+                used: false,    // 本轮是否真的推过流式正文（决定最后要不要原地编辑）
+                timer: null,
+                inFlight: false
+              };
+              // pending 消息当前该显示什么：有流式正文就显示正文，否则显示进度文案
+              const tgPendingText = () => tgStream.buf
+                ? tgStream.buf.slice(0, 3900)
+                : (tgStream.progress || '⏳ 正在思考并生成内容，请稍候...');
+              const tgFlushPending = async () => {
+                if (!tgStreamEnabled || tgStream.inFlight) return;
+                const text = tgPendingText();
+                if (text === tgStream.lastSent) return;
+                tgStream.inFlight = true;
+                try {
+                  // 纯文本，不加 parse_mode：流式过程中的 Markdown 常常是半截的
+                  // （比如只推了开头的 ** 还没推结尾），带 parse_mode 会直接 400
+                  await tgApi('editMessageText', { chat_id: chatId, message_id: pendingMsgId, text });
+                } catch (e) {
+                } finally {
+                  // 无论成功失败都记账，避免定时器拿着同一条无效内容反复重试
+                  tgStream.lastSent = text;
+                  tgStream.inFlight = false;
+                }
+              };
+              const tgStartStream = () => {
+                if (!tgStreamEnabled || tgStream.timer) return;
+                tgStream.timer = setInterval(() => { tgFlushPending(); }, tgStreamEditMs);
+              };
+              const tgStopStream = () => {
+                if (tgStream.timer) { clearInterval(tgStream.timer); tgStream.timer = null; }
+              };
+
+              const agentOpts = {
+                maxRuntimeMs: webhookBudgetMs,
+                resumeKey: tgAgentResumeKey(chatId),
+                // 增量回调只更新内存缓冲，网络调用交给定时器 —— 上游读取循环里
+                // emit() 是 await onDelta 的，这里一旦做 I/O 就会把整个流拖慢。
+                // 关闭流式编辑（TG_STREAM_EDIT_MS=0）时不传回调，tgAgentRunLoop
+                // 据此也不会向上游请求 stream:true，行为与打补丁前完全一致。
+                onDelta: tgStreamEnabled ? (text, kind) => {
+                  if (kind !== 'content') return;
+                  tgStream.buf += text;
+                  tgStream.used = true;
+                  tgStartStream();
+                } : null,
+                // 撤回：这一步被判定为工具调用 / 正文被清洗过，已流出的开场白不能留在屏幕上
+                onReset: tgStreamEnabled ? () => { tgStream.buf = ''; } : null
+              };
 
               if (useAgent) {
-                // Agent 模式：ReAct 多步推理 + 工具调用（进度实时编辑到 pending 消息上）
+                // Agent 模式：ReAct 多步推理 + 工具调用（进度与流式正文共用 pending 消息）
                 let lastProgressEdit = 0;
                 const onProgress = async (text, force) => {
                   if (!pendingMsgId) return;
+                  // 每步开始 / 工具调用时，上一步的正文缓冲作废，改回显示进度文案
+                  tgStream.buf = '';
+                  tgStream.progress = String(text).slice(0, 4000);
                   const now = Date.now();
                   if (!force && now - lastProgressEdit < 1500) return; // Telegram 编辑限流，节流；工具进度用 force 突破
                   lastProgressEdit = now;
-                  try {
-                    // 纯文本，不加 parse_mode，避免搜索词里的 Markdown 特殊字符导致编辑失败
-                    await tgApi('editMessageText', { chat_id: chatId, message_id: pendingMsgId, text: String(text).slice(0, 4000) });
-                  } catch (e) {}
+                  await tgFlushPending();
                 };
                 // 「继续」：恢复上次暂停的任务；新问题则清掉旧暂停状态
                 const wantResume = /^继续/.test(userText.trim());
@@ -2292,11 +2353,14 @@ export default {
                 };
                 let r;
                 try {
+                  tgStartStream();
                   r = await runAgentTurn(true);
                   if (r.fallback) r = await runAgentTurn(false);
                 } catch (e) {
                   // 兜底：Agent 内部任何未预期异常都转为可见错误，绝不让用户面对卡死的"思考中"
                   r = { error: '⚠️ Agent 执行出错：' + (e && e.message ? e.message : String(e)) };
+                } finally {
+                  tgStopStream();
                 }
                 if (r.error) {
                   agentErr = r.error;
@@ -2363,11 +2427,10 @@ export default {
                 }
               }
 
-              if (pendingMsgId) {
-                await tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {});
-              }
-
               if (agentErr) {
+                if (pendingMsgId) {
+                  await tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {});
+                }
                 await tgApi('sendMessage', { chat_id: chatId, text: agentErr });
                 return;
               }
@@ -2388,7 +2451,24 @@ export default {
                   }
                   return { ok: false };
                 };
+                // 原地编辑：把流式用的占位消息改成正式回复。Markdown 解析失败退回纯文本
+                const editPendingTo = async (text, useMarkdown) => {
+                  if (!tgStreamEnabled) return false;
+                  try {
+                    const r = await tgApi('editMessageText', useMarkdown
+                      ? { chat_id: chatId, message_id: pendingMsgId, text, parse_mode: "Markdown" }
+                      : { chat_id: chatId, message_id: pendingMsgId, text });
+                    if (r && r.ok) return true;
+                    // 「内容未改变」不算失败：说明这条消息上已经是我们要显示的文本。
+                    // 流式推的是纯文本、这里带 parse_mode，两者渲染结果一致时 Telegram 就会这么回
+                    const body = await r.text().catch(() => '');
+                    return /message is not modified/i.test(body);
+                  } catch (e) {
+                    return false;
+                  }
+                };
                 const maxLength = 4000;
+                const chunks = [];
                 let startIndex = 0;
                 while (startIndex < replyText.length) {
                   let sliceLength = maxLength;
@@ -2398,16 +2478,32 @@ export default {
                        sliceLength = lastNewline - startIndex;
                     }
                   }
-
-                  const chunk = replyText.slice(startIndex, startIndex + sliceLength);
+                  chunks.push(replyText.slice(startIndex, startIndex + sliceLength));
                   startIndex += sliceLength;
+                }
 
+                // 流式已经把这轮正文写在这条占位消息上了 → 直接原地改成正式回复。
+                // 不要"先删掉再重发"，那样用户会看到答案闪一下又跳出来。
+                let firstChunkDone = false;
+                if (tgStream.used) {
+                  firstChunkDone = (await editPendingTo(chunks[0], true)) || (await editPendingTo(chunks[0], false));
+                  if (!firstChunkDone && pendingMsgId) {
+                    await tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {});
+                  }
+                } else if (pendingMsgId) {
+                  await tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {});
+                }
+
+                for (let ci = firstChunkDone ? 1 : 0; ci < chunks.length; ci++) {
+                  const chunk = chunks[ci];
                   const tgRes = await sendReplyChunk(chunk, true);
-
                   if (!tgRes.ok) {
                     await sendReplyChunk(chunk, false);
                   }
                 }
+              } else if (pendingMsgId) {
+                // 没有正文（例如任务被暂停，提示已由内部单独发出）：清掉占位消息
+                await tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {});
               }
             }
           } catch (err) {

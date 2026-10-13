@@ -17,13 +17,6 @@
 - 至少一个兼容 OpenAI 接口格式的 API 通道（OpenAI、通义千问、DeepSeek 等均可）
 
 ---
-# 部署
-
-## 方式一
-
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/jinhuaitao/cloudflare-chat)
-
-## 方式二
 
 # 第一步：在 Cloudflare 中导入 Git 存储库部署
 
@@ -411,7 +404,8 @@ const rx = p => p.split('@').join(BS);   // 用 @ 占位，运行时展开成反
 | `AGENT_TOOL_TIMEOUT_MS` | 单个工具最长执行时间（毫秒） | `30000`（30 秒） |
 | `AGENT_CONTEXT_BUDGET` | Agent 单轮任务上下文字符预算，超预算裁剪本轮旧 tool 轮次（v6.8.1 起断点续做「继续」时也会裁剪，不再无限增长） | `24000` |
 | `WEB_AGENT_TIMEOUT_MS` | 网页端 Agent 单轮任务总超时（毫秒），10 秒 ~ 240 秒。Web 是浏览器长连接，不需要 Telegram 的 55 秒妥协，单独给一个更短的预算 | `90000`（90 秒） |
-| `AGENT_STREAM_UPSTREAM` | 设为 `0` 可关闭 Agent 真流式，退回「等整段生成完再显示」。仅在通道不支持「流式 + tools」组合时需要 | 未配置=开启流式 |
+| `AGENT_STREAM_UPSTREAM` | 设为 `0` 可关闭 Agent 真流式，退回「等整段生成完再显示」。仅在通道不支持「流式 + tools」组合时需要。关闭时不会向上游请求 `stream: true` | 未配置=开启流式 |
+| `TG_STREAM_EDIT_MS` | Telegram 流式输出的刷新间隔（毫秒），1000 ~ 10000。设为 `0` 完全关闭 Telegram 流式编辑，回到「思考中 → 直接出整段答案」的旧行为 | `2000`（2 秒） |
 | `TG_API_TIMEOUT_MS` | Telegram Bot API 单次调用超时（毫秒） | `15000`（15 秒） |
 | `TG_WEBHOOK_BUDGET_MS` | webhook 内 Agent 单轮预算（毫秒），10 秒 ~ 240 秒 | `55000`（55 秒） |
 
@@ -427,8 +421,8 @@ const rx = p => p.split('@').join(BS);   // 用 @ 占位，运行时展开成反
 
 # 附：本地补丁记录（非上游版本）
 
-本仓库的 `_worker.js` 在上游 v6.8.3 基础上打过一轮补丁，`APP_VERSION` 标记为 **`6.8.3-p1`**
-（给机器人发 `/help` 看到带 `-p1` 即说明部署的是打过补丁的构建）。以下改动**不在**上游 v6.8.4 ~ v6.8.8 里，
+本仓库的 `_worker.js` 在上游 v6.8.3 基础上打过三轮补丁（p1-1 / p1-2 / p1-3），`APP_VERSION` 标记为 **`6.8.3-p2`**
+（给机器人发 `/help` 看到带 `-p2` 即说明部署的是打过补丁的构建）。以下改动**不在**上游 v6.8.4 ~ v6.8.8 里，
 升级上游代码时请留意会被覆盖。
 
 ## p1-1 修复「网页版 Agent 一直卡在思考中」
@@ -460,6 +454,27 @@ const rx = p => p.split('@').join(BS);   // 用 @ 占位，运行时展开成反
 
 > 已知取舍：若模型在调用工具前先输出了一段较长的「开场白」，用户会看到它出现后又被撤回（通常只有几百毫秒）。
 > 模型一旦发出 `tool_calls`，该步的后续正文就不再外发，尽量缩小这个窗口。
+
+## p1-3 Telegram 端也接上真流式
+
+p1-2 只接了网页端：`onDelta` 回调仅在 `/api/chat` 传入，Telegram 路径没有传 —— 于是它的上游请求虽然因为全局开关
+变成了 `stream: true`，增量却被读进来后直接丢弃，**没有任何收益，只多了一个「通道不支持 stream + tools」的风险面**。
+
+补丁把 Telegram 也接上：
+
+- `agentOpts` 传入 `onDelta` / `onReset`。增量回调**只更新内存缓冲**，不做网络 I/O ——
+  上游读取循环里 `emit()` 是 `await onDelta` 的，回调里一旦发请求就会把整个流拖慢。
+- Telegram 对同一条消息的 `editMessageText` 限流很严（超了返回 429），所以不做逐字编辑：
+  用定时器按 `TG_STREAM_EDIT_MS`（默认 2 秒）把「当前完整文本」刷一次，用户看到文字一段段长出来。
+- 进度文案与流式正文**共用同一条占位消息**：每步开始 / 工具调用时正文缓冲作废、改回显示进度，
+  所以「先开场白再调工具」时开场白会被工具进度直接顶掉，不会像网页端那样出现「显示后再撤回」的闪烁。
+- 收尾不再「删掉占位消息 + 发新消息」，而是**把占位消息原地编辑成正式回复**（Markdown 解析失败退回纯文本），
+  否则用户会看到答案闪一下又跳出来。`message is not modified` 视为成功；编辑彻底失败才退回删+发。
+- `useUpstreamStream` 收紧为 `AGENT_STREAM_UPSTREAM !== '0' && typeof onDelta === 'function'` ——
+  没人消费增量时就不请求流式。因此 `TG_STREAM_EDIT_MS=0` 时 Telegram 的行为与打补丁前**完全一致**（含上游请求形态）。
+
+> 副作用：正式回复是「编辑」出来的，Telegram 会在消息上标一个「edited」。这是流式机器人的常态，
+> 想彻底避免就设 `TG_STREAM_EDIT_MS=0`。
 
 ---
 
