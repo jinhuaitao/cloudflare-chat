@@ -41,7 +41,7 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 // 后缀 -pN 表示这是本地补丁版（p1 卡死修复 + 真流式 / p2 Telegram 流式 /
 // p3 Telegram 预算与硬墙钟），上游仓库无此版本。
 // 发 /help 看到带 -p3 即说明部署的是打过补丁的构建。
-const APP_VERSION = '6.8.3-p10';
+const APP_VERSION = '6.8.3-p11';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -1258,6 +1258,19 @@ function trimAgentMessages(messages, loopStartIdx, budget) {
   return out;
 }
 
+// 数已完成的 Agent 步数：从 loopStartIdx 起，每条 role=assistant 的消息算一步
+// （与 trimAgentMessages 的"轮次"口径一致）。用于进度显示的累计步号，
+// 避免跨段/跨「继续」时步号重置（第 3 步后突然又显示第 1 步）。
+function countAgentSteps(messages, loopStartIdx) {
+  const arr = Array.isArray(messages) ? messages : [];
+  let start = Math.max(0, Math.min(loopStartIdx | 0, arr.length));
+  let n = 0;
+  for (let i = start; i < arr.length; i++) {
+    if (arr[i] && arr[i].role === 'assistant') n++;
+  }
+  return n;
+}
+
 // ==================== Telegram Agent：主循环 ====================
 // ReAct 风格：LLM 决策 → 执行工具 → 结果回填 → 最多 MAX_STEPS 步。
 // 通道/模型不支持 tools 参数时返回 { fallback: true }，由调用方降级为普通对话。
@@ -1424,9 +1437,11 @@ async function tgAgentResume(env, tgApi, chatId, saved, onProgress, opts) {
   // v6.8.1：把首次运行时的 loopStartIdx 带回来，裁剪才能触及之前各段的老轮次，
   // 否则多段「继续」会让上下文无限增长；老版本存档无此字段则回退为旧行为
   const baseLoopStartIdx = (typeof saved.loopStartIdx === 'number' && saved.loopStartIdx >= 0) ? saved.loopStartIdx : undefined;
+  // 累计步数也带回来（防裁剪导致从消息里数不准）；老存档无此字段则回退为从消息里数
+  const savedStepCount = (typeof saved.totalSteps === 'number' && saved.totalSteps >= 0) ? saved.totalSteps : undefined;
   return await tgAgentRunLoop(env, tgApi, chatId, saved.targetModelId, saved.messages, tools, allowTools, onProgress, deadline,
     (opts && opts.resumeKey) || null, true, baseLoopStartIdx,
-    (opts && opts.onDelta) || null, (opts && opts.onReset) || null, saved.userText || null);
+    (opts && opts.onDelta) || null, (opts && opts.onReset) || null, saved.userText || null, savedStepCount);
 }
 
 // Telegram Bot API 调用工厂（webhook 与自动续做共用）。
@@ -1967,7 +1982,7 @@ async function readUpstreamMessage(resp, onDelta) {
   return { content, reasoning, toolCalls, forwarded };
 }
 
-async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume, baseLoopStartIdx, onDelta, onReset, originUserText) {
+async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume, baseLoopStartIdx, onDelta, onReset, originUserText, savedStepCount) {
   const maxSteps = agentLimits(env).maxSteps;
   // 真流式开关：默认开启，向上游请求 stream: true 并边读边转发正文增量。
   // 只在调用方真的提供了 onDelta 时才请求流式 —— 否则增量没人消费，白白多一个
@@ -1991,13 +2006,18 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
   const loopStartIdx = (typeof baseLoopStartIdx === 'number' && baseLoopStartIdx >= 0)
     ? Math.min(baseLoopStartIdx, messages.length)
     : messages.length;
+  // 累计步数基数：恢复时传入存档里的 totalSteps（防裁剪导致计数丢失）；
+  // 新任务则从消息里数（此时为 0）。显示用 baseStepCount + step + 1，保证跨段单调递增。
+  const baseStepCount = (typeof savedStepCount === 'number' && savedStepCount >= 0)
+    ? savedStepCount
+    : countAgentSteps(messages, loopStartIdx);
   // 上下文预算（字符数，env AGENT_CONTEXT_BUDGET 可配，默认 24000）
   let ctxBudget = parseInt(env.AGENT_CONTEXT_BUDGET || '24000', 10);
   if (!(ctxBudget > 0)) ctxBudget = 24000;
   // 超时暂停：保存循环状态，用户发「继续」即恢复。无 R2 时退化为直接终结。
   // v6.8.1：保存前先按上下文预算裁剪本轮老轮次（trim 只删 loopStartIdx 之后的消息，
   // 该下标本身不受影响，可原样存档），否则多段「继续」会让存档与发送量无限增长。
-  const pauseForResume = async () => {
+  const pauseForResume = async (stepIdx) => {
     const t = stripDSMLBlocks(lastAssistantText());
     let saved = false;
     if (resumeKey) {
@@ -2005,7 +2025,8 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
         v: 1, savedAt: Date.now(), chatId, targetModelId, allowTools,
         userText: originUserText || undefined,
         messages: trimAgentMessages(messages, loopStartIdx, ctxBudget),
-        loopStartIdx: loopStartIdx
+        loopStartIdx: loopStartIdx,
+        totalSteps: baseStepCount + (stepIdx || 0)
       });
     }
     if (saved) {
@@ -2023,8 +2044,8 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
   // 重复调用熔断：记录每步工具调用签名，连续 3 步完全相同即判定模型原地打转
   const callSigHistory = [];
   for (let step = 0; step < maxSteps; step++) {
-    if (Date.now() > deadline) return await pauseForResume();
-    const stepLabel = '🤖 Agent 思考中' + (isResume ? '（继续）' : '') + '（第 ' + (step + 1) + ' 步）…';
+    if (Date.now() > deadline) return await pauseForResume(step);
+    const stepLabel = '🤖 Agent 思考中' + (isResume ? '（继续）' : '') + '（第 ' + (baseStepCount + step + 1) + ' 步）…';
     // 每步开始先报进度：LLM 长思考时用户也能看到活着
     if (typeof onProgress === 'function') {
       try { await onProgress(stepLabel); } catch (e) {}
@@ -2044,7 +2065,7 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       // （Math.max(15000, ...)），导致临近 deadline 的一步还能再多跑 15 秒，
       // 把整轮推过 Telegram 的 60 秒红线 → worker 被 cancel → 用户永远卡在"思考中"。
       const remainMs = deadline - Date.now();
-      if (remainMs < 2000) return await pauseForResume();
+      if (remainMs < 2000) return await pauseForResume(step);
       resp = await fetch(cfg.apiUrl, {
         method: 'POST',
         headers: { 'Authorization': 'Bearer ' + cfg.currentApiKey, 'Content-Type': 'application/json' },
@@ -2058,7 +2079,7 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       const nm = e && e.name ? String(e.name) : '';
       const msg = String((e && e.message) || '');
       const aborted = nm === 'AbortError' || nm === 'TimeoutError' || /abort/i.test(msg);
-      if (aborted && Date.now() >= deadline - 2000) return await pauseForResume();
+      if (aborted && Date.now() >= deadline - 2000) return await pauseForResume(step);
       if (aborted) return { error: '上游响应超时，请重试或换个问法' };
       return { error: '网络错误：' + (msg || String(e)) };
     }
@@ -2089,7 +2110,7 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       if (aborted) {
         // 流式过程中可能已经推了半截正文出去，先撤回再收尾
         await rollbackStreamed(true);
-        if (Date.now() >= deadline - 2000) return await pauseForResume();
+        if (Date.now() >= deadline - 2000) return await pauseForResume(step);
         return { error: '上游响应超时，请重试或换个问法' };
       }
       if (nm === 'UpstreamSSEError') return { error: '上游返回错误：' + emsg };
@@ -2203,7 +2224,8 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       v: 1, savedAt: Date.now(), chatId, targetModelId, allowTools,
       userText: originUserText || undefined,
       messages: trimAgentMessages(messages, loopStartIdx, ctxBudget),
-      loopStartIdx: loopStartIdx
+      loopStartIdx: loopStartIdx,
+      totalSteps: baseStepCount + maxSteps
     });
     if (saved) {
       return { text: '⏸️ 推理步数已用尽，进度已保存，发送「继续」让我接着做。' + (t ? '\n\n已产出：\n' + t : ''), usedTools: true, paused: true };
