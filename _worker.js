@@ -41,7 +41,7 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 // 后缀 -pN 表示这是本地补丁版（p1 卡死修复 + 真流式 / p2 Telegram 流式 /
 // p3 Telegram 预算与硬墙钟），上游仓库无此版本。
 // 发 /help 看到带 -p3 即说明部署的是打过补丁的构建。
-const APP_VERSION = '6.8.3-p12';
+const APP_VERSION = '6.8.3-p13';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -1375,10 +1375,11 @@ async function agentLoadResumeState(env, chatId) {
   try {
     const s = JSON.parse(raw);
     if (!s || !Array.isArray(s.messages) || !s.messages.length) return null;
-    // 30 分钟过期：太旧的任务上下文已无意义
+    // 30 分钟过期：太旧的任务上下文已无意义。返回 expired 标记而非 null，
+    // 让调用方能区分"从没暂停过"和"暂停过但过期了"，给出明确提示（P1-1）。
     if (Date.now() - (s.savedAt || 0) > 30 * 60 * 1000) {
       await agentClearResumeState(env, chatId);
-      return null;
+      return { expired: true };
     }
     return s;
   } catch (e) { return null; }
@@ -1544,6 +1545,8 @@ function autoKickHint(errText) {
   }
   return '请检查 WAF / Cloudflare Access / 防火墙规则是否拦截了站内请求。';
 }
+// ===== 以下为 p12 已废弃的老状态函数，仅供 tgAutoStateGet 迁移兜底使用 =====
+// 新代码一律走 tgAutoStateGet/Save/Clear。待线上所有链都跑过一次新版本后可删除。
 // 自动续做复用的那条消息的 id（存 R2，保证多段之间编辑的是同一条消息，不刷屏）
 function tgAutoMsgKey(chatId) { return 'tg_auto_msg_' + chatId; }
 
@@ -1724,11 +1727,16 @@ async function runTgAutoContinue(env, ctx, chatId, seg, totalSeg, url, t0) {
   // 本段链的代际校验：统一状态里的 epoch 必须和本段持有的 rec.epoch 一致，
   // 否则说明这条链已被新的暂停 / 新消息取代 —— 静默收工，绝不复活僵尸链。
   // ms：R2 限时，超时按"没读到"处理（段尾用短超时保活，段首用长超时保准）。
+  // P2-2：R2 超时导致的"没读到"会打日志，不再和"链被取代"混为一谈完全静默。
   const chainAlive = async (rec, ms) => {
     try {
       if (!rec || !rec.epoch) return false;
       const cur = await withTimeout(tgAutoStateGet(env, chatId), ms || 3000);
-      return !!cur && cur.epoch === rec.epoch;
+      if (!cur) {
+        console.log('[cloudflare-chat] chainAlive chat=' + chatId + ' R2 读取超时(' + ms + 'ms)，按链已死处理');
+        return false;
+      }
+      return cur.epoch === rec.epoch;
     } catch (e) { return false; }
   };
   const st0 = await withTimeout(tgAutoStateGet(env, chatId), 6000);
@@ -1745,11 +1753,14 @@ async function runTgAutoContinue(env, ctx, chatId, seg, totalSeg, url, t0) {
 
   // 取回暂停存档；取不到说明任务已完成 / 已过期 / 已被新问题清掉 —— 直接收工
   const saved = await withTimeout(agentLoadResumeState(env, chatId), 6000);
-  if (!saved) {
+  if (!saved || saved.expired) {
     if (st0 && st0.msgId && seg <= 1) {
-      // 第 1 段：消息登记还在但存档丢了 = 真正的异常（R2 读取失败），必须让用户看见；
+      // 第 1 段：消息登记还在但存档丢了/过期了 = 需要用户看见的异常；
       // 登记也没了 = 链已被新消息取代，走静默收工（新消息分支已给出「已停止」说明）。
-      await tgAutoSendOrEdit(env, tgApi, chatId, { id: st0.msgId }, '⚠️ 自动续做异常：进度存档丢失（R2 读取失败或已被清理），请重试或发「继续」手动接着做。');
+      const why = (saved && saved.expired)
+        ? '⚠️ 自动续做异常：进度存档已过期（超过 30 分钟），请重新描述任务或发「继续」重试。'
+        : '⚠️ 自动续做异常：进度存档丢失（R2 读取失败或已被清理），请重试或发「继续」手动接着做。';
+      await tgAutoSendOrEdit(env, tgApi, chatId, { id: st0.msgId }, why);
       await tgAutoStateClear(env, chatId);
       await tgPendingRemove(env, chatId, st0.msgId);
     } else if (st0 && st0.msgId) {
@@ -3018,9 +3029,27 @@ export default {
                   await tgFlushPending();
                 };
                 // 「继续」：恢复上次暂停的任务；新问题则清掉旧暂停状态
+                // P1-1：存档过期时给明确提示，而不是当成新问题答非所问
                 let resumeState = null;
-                if (wantResume) resumeState = await agentLoadResumeState(env, chatId);
+                let resumeExpired = false;
+                if (wantResume) {
+                  resumeState = await agentLoadResumeState(env, chatId);
+                  if (resumeState && resumeState.expired) {
+                    resumeExpired = true;
+                    resumeState = null;
+                  }
+                }
                 if (!resumeState) await agentClearResumeState(env, chatId);
+                if (resumeExpired) {
+                  await tgApi('sendMessage', {
+                    chat_id: chatId,
+                    text: '⏳ 上次的任务进度已过期（超过 30 分钟），无法接着做。请重新描述一下任务，我重新开始。'
+                  }).catch(() => {});
+                  if (pendingMsgId) {
+                    try { await tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {}); } catch (e) {}
+                  }
+                  return;
+                }
                 const runAgentTurn = (allowTools) => {
                   if (resumeState) {
                     return tgAgentResume(env, tgApi, chatId, Object.assign({}, resumeState, { allowTools: allowTools }), onProgress, agentOpts);
