@@ -38,9 +38,10 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-// 后缀 -p1 表示这是本地补丁版（Web Agent 真流式 + 卡死修复），上游仓库无此版本。
-// 发 /help 看到带 -p1 即说明部署的是打过补丁的构建。
-const APP_VERSION = '6.8.3-p2';
+// 后缀 -pN 表示这是本地补丁版（p1 卡死修复 + 真流式 / p2 Telegram 流式 /
+// p3 Telegram 预算与硬墙钟），上游仓库无此版本。
+// 发 /help 看到带 -p3 即说明部署的是打过补丁的构建。
+const APP_VERSION = '6.8.3-p3';
 
 // ================= PWA =================
 // 图标以 base64 内嵌，运行时解码；不引入任何静态资源文件，
@@ -450,11 +451,16 @@ function getAgentTools() {
   ];
 }
 
-async function execAgentTool(name, args, env, chatId) {
+async function execAgentTool(name, args, env, chatId, budgetMs) {
   // 兜底超时：单个工具最长执行时间，防止 abort 信号无法中断 hung 住的请求体
   // （如永不结束的流式响应）。可通过 AGENT_TOOL_TIMEOUT_MS 调整，默认 30 秒。
   let toolTimeoutMs = parseInt(env.AGENT_TOOL_TIMEOUT_MS || '30000', 10);
   if (!(toolTimeoutMs > 0)) toolTimeoutMs = 30000;
+  // 调用方（Agent 循环）把单工具上限压进本轮剩余预算：否则一个卡住的工具
+  // （默认 30 秒）能把整个 webhook 请求拖过 Telegram 的 60 秒红线。
+  // 注意：预算不足时仍然是"跑 + 超时返回提示"，不能直接跳过 —— assistant 的
+  // tool_calls 必须配齐 tool 结果，否则暂停存档的消息序列非法，续做会失败。
+  if (budgetMs > 0 && budgetMs < toolTimeoutMs) toolTimeoutMs = budgetMs;
   let timer;
   try {
     const run = (async () => {
@@ -1308,12 +1314,32 @@ async function agentClearResumeState(env, chatId) {
   try { await storeDelete(env, tgAgentResumeKey(chatId)); } catch (e) {}
 }
 
+// 进度 / 流式编辑的超时：这类调用只是"锦上添花"，卡住了也不该拖垮整轮。
+const TG_QUICK_API_TIMEOUT_MS = 5000;
+
+// 收尾预留（毫秒）：pauseForResume（R2 存档）/ 最终 sendMessage / 历史落库都要时间。
+// 必须从「Agent 可用时间」里扣掉 —— 否则收尾动作本身就跑到 Telegram 的 60 秒红线之外。
+function tgReplyReserveMs(env, budgetMs) {
+  let r = parseInt(env.TG_WEBHOOK_RESERVE_MS || '6000', 10);
+  if (!(r >= 0)) r = 6000;
+  if (r > 30000) r = 30000;
+  // 小预算场景（自测时可能设成 10 秒）不能被收尾预留吃掉大半，最多占预算的 1/4
+  if (budgetMs > 0) r = Math.min(r, Math.round(budgetMs * 0.25));
+  return r;
+}
+
 function tgAgentDeadline(env, opts) {
+  // 整轮共享的硬墙钟：由调用方（Telegram webhook）算一次后通过 opts.deadline 传进来。
+  // 必须共享 —— 「首步带工具失败 → 降级重试」是两次 tgAgentChat 调用，
+  // 各自算预算会让总时长直接翻倍（55s + 55s），必然撞穿 Telegram 的 60 秒红线
+  // 而被 cancel，用户就永远停在那句"Agent 思考中…"上。
+  if (opts && opts.deadline > 0) return opts.deadline;
   let timeoutMs = agentLimits(env).timeoutMs;
   // webhook 场景传入 maxRuntimeMs：HTTP 响应必须在 Telegram 因超时重发 update
   // 之前返回（约 60 秒），取两者较小值，避免整体预算形同虚设
   if (opts && opts.maxRuntimeMs > 0 && opts.maxRuntimeMs < timeoutMs) timeoutMs = opts.maxRuntimeMs;
-  return Date.now() + timeoutMs;
+  // 扣掉收尾预留后才是真正能跑 Agent 的时间
+  return Date.now() + Math.max(3000, timeoutMs - tgReplyReserveMs(env, timeoutMs));
 }
 
 async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTools, onProgress, opts) {
@@ -1537,14 +1563,16 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
 
     let resp;
     try {
-      // 单步超时取 3 分钟与整体剩余预算的较小值：避免整体 deadline 已过，
-      // 还被一次上游调用拖住几分钟（webhook 必须在 Telegram 重发前返回）
-      const remainMs = Math.max(0, deadline - Date.now());
+      // 单步超时 = 剩余预算，绝不越过 deadline。以前这里有 15 秒下限
+      // （Math.max(15000, ...)），导致临近 deadline 的一步还能再多跑 15 秒，
+      // 把整轮推过 Telegram 的 60 秒红线 → worker 被 cancel → 用户永远卡在"思考中"。
+      const remainMs = deadline - Date.now();
+      if (remainMs < 2000) return await pauseForResume();
       resp = await fetch(cfg.apiUrl, {
         method: 'POST',
         headers: { 'Authorization': 'Bearer ' + cfg.currentApiKey, 'Content-Type': 'application/json' },
         body: JSON.stringify(cfg.payload),
-        signal: AbortSignal.timeout(Math.max(15000, Math.min(180000, remainMs)))
+        signal: AbortSignal.timeout(Math.min(180000, remainMs))
       });
     } catch (e) {
       // 中断分类：AbortSignal.timeout() 抛的是 TimeoutError（不是 AbortError），
@@ -1667,13 +1695,15 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       } catch (e) {}
     }
 
-    // 同一步的多个工具调用并行执行（顺序写回，保证消息顺序）
+    // 同一步的多个工具调用并行执行（顺序写回，保证消息顺序）。
+    // 单工具上限压进剩余预算内，避免工具把整轮拖过 Telegram 的 60 秒红线
+    const toolBudgetMs = Math.max(2000, deadline - Date.now());
     const toolResults = await Promise.all(toolCalls.map(async (tc) => {
       const fn = (tc && tc.function) || {};
       let args = {};
       try { args = JSON.parse(fn.arguments || '{}'); } catch (e) {}
       if (!fn.name) return { tc, result: '工具调用缺少名称，已跳过' };
-      const result = await execAgentTool(fn.name, args, env, chatId);
+      const result = await execAgentTool(fn.name, args, env, chatId, toolBudgetMs);
       return { tc, result: truncateToolResult(result, 4000) };
     }));
     for (const tr of toolResults) {
@@ -2074,11 +2104,14 @@ export default {
         // 之前是裸 fetch 无超时，api.telegram.org 偶发 hung 住会让进度消息永远停在"思考中"
         let tgApiTimeoutMs = parseInt(env.TG_API_TIMEOUT_MS || '15000', 10);
         if (!(tgApiTimeoutMs > 0)) tgApiTimeoutMs = 15000;
-        const tgApi = (method, body) => fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/${method}`, {
+        // timeoutMs 可选：进度 / 流式编辑这类"锦上添花"的调用用更短的超时。
+        // 默认 15 秒对最终回复合适，但对进度编辑太长了 —— Telegram 偶发卡两次
+        // 就是 30 秒，足以把整轮推过 60 秒红线。
+        const tgApi = (method, body, timeoutMs) => fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/${method}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
-          signal: AbortSignal.timeout(tgApiTimeoutMs)
+          signal: AbortSignal.timeout(timeoutMs > 0 ? timeoutMs : tgApiTimeoutMs)
         });
 
         // v6.4.3 根因修复：之前收到 webhook 立刻返回 OK、把全部工作丢进 ctx.waitUntil ——
@@ -2255,12 +2288,18 @@ export default {
               let replyText = null;
               let agentErr = null;
 
-              // webhook 单轮预算：Telegram 约 60 秒无响应会重发 update，
-              // 55 秒内必须返回（可用 TG_WEBHOOK_BUDGET_MS 调整，10 秒 ~ 240 秒）。
+              // webhook 单轮预算：Telegram 约 60 秒无响应会断开连接，而**客户端断开后
+              // worker 会被一起 cancel** —— 收尾消息发不出去，用户就永远停在那句
+              // "Agent 思考中…"上。这是最常见的"没反应"，所以预算不能贴着 60 秒，
+              // 必须留足余量：默认 45 秒，另扣 TG_WEBHOOK_RESERVE_MS（默认 6 秒）做收尾。
+              // 可用 TG_WEBHOOK_BUDGET_MS 调整（10 秒 ~ 240 秒）。
               // 超预算的任务会暂停并保存进度，用户发「继续」即接着做。
-              let webhookBudgetMs = parseInt(env.TG_WEBHOOK_BUDGET_MS || '55000', 10);
-              if (!(webhookBudgetMs >= 10000)) webhookBudgetMs = 55000;
+              let webhookBudgetMs = parseInt(env.TG_WEBHOOK_BUDGET_MS || '45000', 10);
+              if (!(webhookBudgetMs >= 10000)) webhookBudgetMs = 45000;
               if (webhookBudgetMs > 240000) webhookBudgetMs = 240000;
+              // 整轮共享同一个硬墙钟：「首步带工具失败 → 降级重试」是两次 tgAgentChat，
+              // 各自算预算会让总时长直接翻倍
+              const agentDeadline = Date.now() + Math.max(3000, webhookBudgetMs - tgReplyReserveMs(env, webhookBudgetMs));
               // ===== Telegram 流式：把 Agent 的正文增量节流写进 pending 消息 =====
               // Telegram 对同一条消息的 editMessageText 有严格限流（超了返回 429），
               // 所以不做逐字编辑，而是固定间隔把「当前完整文本」刷一次 —— 用户看到的是
@@ -2290,7 +2329,8 @@ export default {
                 try {
                   // 纯文本，不加 parse_mode：流式过程中的 Markdown 常常是半截的
                   // （比如只推了开头的 ** 还没推结尾），带 parse_mode 会直接 400
-                  await tgApi('editMessageText', { chat_id: chatId, message_id: pendingMsgId, text });
+                  // 短超时：进度/流式编辑卡住不该吃掉整轮预算
+                  await tgApi('editMessageText', { chat_id: chatId, message_id: pendingMsgId, text }, TG_QUICK_API_TIMEOUT_MS);
                 } catch (e) {
                 } finally {
                   // 无论成功失败都记账，避免定时器拿着同一条无效内容反复重试
@@ -2308,6 +2348,7 @@ export default {
 
               const agentOpts = {
                 maxRuntimeMs: webhookBudgetMs,
+                deadline: agentDeadline,
                 resumeKey: tgAgentResumeKey(chatId),
                 // 增量回调只更新内存缓冲，网络调用交给定时器 —— 上游读取循环里
                 // emit() 是 await onDelta 的，这里一旦做 I/O 就会把整个流拖慢。
