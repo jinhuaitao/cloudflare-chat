@@ -8,8 +8,10 @@ import { toolSaveDoc, toolListDocs, toolReadDoc, toolDeleteDoc } from '../kb/doc
 // ==================== Telegram Agent：工具定义 ====================
 // 全部工具零密钥、零成本：DuckDuckGo（搜索）、任意网页抓取、自研计算器、
 // Open-Meteo（天气）、Intl（时间）、R2（长期记忆）、R2（知识库文档存取）。
-function getAgentTools() {
-  return [
+// kbReadOnly（v6.9.3，Web 端）：过滤掉写入类工具（remember / save_doc / delete_doc），
+// Web 端对知识库只读——写入仅 Telegram 端开放。
+function getAgentTools(kbReadOnly) {
+  const tools = [
     {
       type: 'function',
       function: {
@@ -76,7 +78,7 @@ function getAgentTools() {
       type: 'function',
       function: {
         name: 'remember',
-        description: '把关于用户的重要长期信息存入记忆（如偏好、生日、项目名、常用城市），存入后以后所有对话都会记得。仅在用户明确要求记住（"记住…"）时调用，不要把临时对话内容存进去。',
+        description: '把关于用户的重要长期信息存入记忆（如偏好、生日、项目名、常用城市），存入后以后所有对话都会记得。仅在用户明确要求记住（"记住…"）时调用，不要把临时对话内容存进去。同一主题（如"我的手机号是…"）改口后直接记住新值即可：旧值会被自动覆盖更新，无需先删除；完全相同的内容重复保存会被跳过。',
         parameters: {
           type: 'object',
           properties: { fact: { type: 'string', description: '一句话事实' } },
@@ -133,9 +135,21 @@ function getAgentTools() {
       }
     }
   ];
+  if (kbReadOnly) {
+    const writes = ['remember', 'save_doc', 'delete_doc'];
+    return tools.filter(t => writes.indexOf(t.function.name) === -1);
+  }
+  return tools;
 }
 
-async function execAgentTool(name, args, env, chatId) {
+async function execAgentTool(name, args, env, chatId, kbReadOnly) {
+  // v6.9.3 执行层硬校验：Web 端（kbReadOnly）即使模型幻觉出写入类工具调用
+  // （DSML 文本格式不校验工具清单），也绝不执行——只读必须强制在执行层，
+  // 不能只靠工具声明与提示词。返回的说明会作为工具结果回给模型，
+  // 引导它如实向用户说明该操作仅 Telegram 端支持。
+  if (kbReadOnly && (name === 'remember' || name === 'save_doc' || name === 'delete_doc')) {
+    return '工具 ' + name + ' 在本端不可用：知识库为只读，写入（记忆 / 文档保存与删除）仅 Telegram 端支持。请如实告知用户，并引导其通过 Telegram 机器人完成该操作；不要声称已完成。';
+  }
   // 兜底超时：单个工具最长执行时间，防止 abort 信号无法中断 hung 住的请求体
   // （如永不结束的流式响应）。可通过 AGENT_TOOL_TIMEOUT_MS 调整，默认 30 秒。
   let toolTimeoutMs = parseInt(env.AGENT_TOOL_TIMEOUT_MS || '30000', 10);

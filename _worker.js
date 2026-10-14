@@ -7,11 +7,8 @@ import { denyUnauthorized } from './src/auth.js';
 import { hitRateLimit } from './src/rate-limit.js';
 import { getChannelConfig, buildAIRequest } from './src/channel.js';
 import { readErrorBody } from './src/agent/stability.js';
-import { storeDelete } from './src/store/r2.js';
-import { agentMemKey, kbDeleteMemDir } from './src/store/kb.js';
 import { handleWebAgent } from './src/web-agent.js';
 import { handleTgWebhook } from './src/telegram/handler.js';
-import { tgAgentMemCache } from './src/agent/memory.js';
 import { ICON_B64, getIconBytes } from './src/pwa/icons.js';
 import { MANIFEST_JSON } from './src/pwa/manifest.js';
 import { SW_JS } from './src/pwa/service-worker.js';
@@ -57,31 +54,6 @@ async function routeRequest(request, env, ctx) {
     //    永远「探测成功」→ 自动重连逻辑形同虚设。
     if (request.method === 'GET' && url.pathname === '/healthz') {
       return new Response(JSON.stringify({ ok: true, t: Date.now() }), { headers: HEALTH_HEADERS });
-    }
-
-    // v6.6.2: 删除 Web 会话时同步清理 R2 上的 Agent 长期记忆
-    //（索引 kb/agent_mem_web_<sessionId> + 镜像目录 kb/mem/web_<sessionId>/）。
-    // 注意内存缓存也要清，否则下次 remember 会把删掉的记忆从缓存里复活写回去。
-    if (request.method === 'DELETE' && url.pathname === '/api/web-memory') {
-      const denied = denyUnauthorized(env, request);
-      if (denied) return denied;
-
-      // v6.8.9：删除接口同样限流 —— 否则可无限高频试探 session_id 爆破删除他人记忆
-      if (hitRateLimit(request, env)) {
-        return new Response(JSON.stringify({ error: "请求过于频繁，请稍后再试", code: "RATE_LIMITED" }), {
-          status: 429, headers: CORS_HEADERS,
-        });
-      }
-
-      const sid = String(url.searchParams.get('session_id') || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
-      if (!sid) {
-        return new Response(JSON.stringify({ error: '缺少 session_id' }), { status: 400, headers: CORS_HEADERS });
-      }
-      const webChatId = 'web_' + sid;
-      tgAgentMemCache.delete(webChatId);
-      await storeDelete(env, agentMemKey(webChatId));
-      await kbDeleteMemDir(env, webChatId); // v6.6.7：同步清空该会话的 md 镜像目录
-      return new Response(JSON.stringify({ ok: true }), { headers: CORS_HEADERS });
     }
 
     if (request.method === 'POST' && url.pathname === '/api/chat') {

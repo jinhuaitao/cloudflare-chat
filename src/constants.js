@@ -19,10 +19,11 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-// 6.9.1 为本地补丁线的知识库优先版：Web 端 Agent 查询把知识库文档列表
-// 注入系统提示词并确立"知识库优先"的回答顺序；同时移除 6.9.0 的对话导出按钮。
-// 上游仓库无此版本；发 /help 看到 6.9.1 即说明部署的是打过补丁的构建。
-const APP_VERSION = '6.9.1';
+// 6.9.3 为本地补丁线的知识库权限分域版：Web 端 Agent 对知识库只读
+// （remember / save_doc / delete_doc 仅 Telegram 端可用），/api/web-memory
+// 端点与 UI 清理调用随之移除。上游仓库无此版本；发 /help 看到 6.9.3 即
+// 说明部署的是打过补丁的构建。
+const APP_VERSION = '6.9.3';
 const PNG_HEADERS = {
   'Content-Type': 'image/png',
   'Cache-Control': 'public, max-age=86400',

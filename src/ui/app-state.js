@@ -130,8 +130,7 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
   }
 
   function createNewSession() {
-    // v6.8.9：加随机后缀 —— 旧 id 只有 Date.now()，可被外人预测后调用
-    // DELETE /api/web-memory 清空你的 Agent 记忆
+    // v6.8.9：加随机后缀保证会话 id 不可预测（历史遗留：曾用纯时间戳 id）
     const newId = 'session_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
     const savedDefaultModel = localStorage.getItem('default_model');
     const fallbackModel = modelSelect.options.length > 0 ? modelSelect.options[0].value : "";
@@ -189,7 +188,7 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
     agentToggle.classList.toggle('active', agentMode);
     agentToggle.textContent = agentMode ? '🤖 Agent 开' : '🤖 Agent';
     agentToggle.title = agentMode
-      ? 'Agent 模式已开启：自主规划并调用工具（🔍 搜索 / 📄 网页 / 🧮 计算 / 🌤 天气 / 🕐 时间），回答优先查知识库文档，长期记住你告诉它的事。点击关闭。'
+      ? 'Agent 模式已开启：自主规划并调用工具（🔍 搜索 / 📄 网页 / 🧮 计算 / 🌤 天气 / 🕐 时间），回答优先查知识库文档；知识库在本端只读，保存文档/记住信息请通过 Telegram 机器人。点击关闭。'
       : 'Agent 模式已关闭：普通对话，不调用工具。点击开启。';
   }
   if (agentToggle) {

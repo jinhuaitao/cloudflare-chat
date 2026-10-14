@@ -76,16 +76,10 @@ export default `  // ===== 通用弹窗：替掉浏览器原生 confirm() / aler
   }
 
   async function deleteSession(e, id) {
-    e.stopPropagation(); 
+    e.stopPropagation();
     if (!(await askConfirm('确认删除这个对话吗？删除后无法恢复。'))) return;
-    sessions = sessions.filter(s => s.id !== id); 
+    sessions = sessions.filter(s => s.id !== id);
     saveSessions();
-    // v6.6.2: 同步删除 R2 上的 Agent 长期记忆；失败也不影响本地删除
-    try {
-      const delHeaders = {};
-      if (typeof accessToken !== 'undefined' && accessToken) delHeaders['X-Access-Token'] = accessToken;
-      fetch('/api/web-memory?session_id=' + encodeURIComponent(id), { method: 'DELETE', headers: delHeaders }).catch(() => {});
-    } catch (err) {}
     if (sessions.length === 0) createNewSession();
     else if (currentSessionId === id) switchSession(sessions[0].id);
     else renderSessionList();

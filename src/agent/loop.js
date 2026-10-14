@@ -29,18 +29,22 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
   if (opts && opts.kbFirst) {
     try { kbDocs = await kbGetRegistry(env); } catch (e) { kbDocs = null; }
   }
-  const systemPrompt = buildAgentSystemPrompt(memories, query, kbDocs);
-  const tools = allowTools ? getAgentTools() : null;
+  // v6.9.3：Web 端（opts.kbReadOnly）对知识库只读——写入类工具
+  // （remember / save_doc / delete_doc）不注入，提示词同步改为只读规则，
+  // 并穿透到执行层硬拦截幻觉出的写入调用。
+  const kbReadOnly = !!(opts && opts.kbReadOnly);
+  const systemPrompt = buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly);
+  const tools = allowTools ? getAgentTools(kbReadOnly) : null;
   const messages = [{ role: 'system', content: systemPrompt }];
   for (const m of history) messages.push({ role: m.role, content: m.content });
 
   const deadline = tgAgentDeadline(env, opts);
   return await tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline,
     (opts && opts.resumeKey) || null, false, undefined,
-    (opts && opts.onDelta) || null, (opts && opts.onReset) || null);
+    (opts && opts.onDelta) || null, (opts && opts.onReset) || null, kbReadOnly);
 }
 
-// 「继续」入口：messages 里已包含 system + 历史，直接接着跑
+// 「继续」入口：messages 里已包含 system + 历史，直接接着跑（仅 Telegram）
 async function tgAgentResume(env, tgApi, chatId, saved, onProgress, opts) {
   const allowTools = !!saved.allowTools;
   const tools = allowTools ? getAgentTools() : null;
@@ -50,9 +54,9 @@ async function tgAgentResume(env, tgApi, chatId, saved, onProgress, opts) {
   const baseLoopStartIdx = (typeof saved.loopStartIdx === 'number' && saved.loopStartIdx >= 0) ? saved.loopStartIdx : undefined;
   return await tgAgentRunLoop(env, tgApi, chatId, saved.targetModelId, saved.messages, tools, allowTools, onProgress, deadline,
     (opts && opts.resumeKey) || null, true, baseLoopStartIdx,
-    (opts && opts.onDelta) || null, (opts && opts.onReset) || null);
+    (opts && opts.onDelta) || null, (opts && opts.onReset) || null, false);
 }
-async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume, baseLoopStartIdx, onDelta, onReset) {
+async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume, baseLoopStartIdx, onDelta, onReset, kbReadOnly) {
   const maxSteps = agentLimits(env).maxSteps;
   // 真流式开关：默认开启，向上游请求 stream: true 并边读边转发正文增量。
   // 若某条通道不支持「流式 + tools」的组合，设 AGENT_STREAM_UPSTREAM=0 退回整段等待。
@@ -260,7 +264,7 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       let args = {};
       try { args = JSON.parse(fn.arguments || '{}'); } catch (e) {}
       if (!fn.name) return { tc, result: '工具调用缺少名称，已跳过' };
-      const result = await execAgentTool(fn.name, args, env, chatId);
+      const result = await execAgentTool(fn.name, args, env, chatId, kbReadOnly);
       return { tc, result: truncateToolResult(result, 4000) };
     }));
     for (const tr of toolResults) {

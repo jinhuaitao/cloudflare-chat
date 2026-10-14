@@ -7,6 +7,30 @@ import { agentMemKey, agentMemKeyLegacy, kbMemDir, kbNewMemFile, kbMemMarkdown,
 
 // ==================== Telegram Agent：长期记忆 + 开关 ====================
 const tgAgentMemCache = new Map();
+
+// ---------- 知识库自动优化（v6.9.2）：确定性本地规则，不依赖 LLM ----------
+// 归一化：转小写、去全部空白。"我养了一只猫 叫汤圆" 与 "我养了一只猫叫汤圆"
+// 归一化后相同 → 视为同一条记忆（完全重复判断与加载时清理都用它）。
+function memNorm(fact) {
+  return String(fact || '').toLowerCase().replace(/\s+/g, '');
+}
+// 主题键：归一化文本中第一个 是/为/:/：/=/＝ 之前的部分（至少 2 字符）。
+// 同一主题只保留最新事实——"我的手机号是A" 改口成 "我的手机号是B" 时自动
+// 覆盖旧条目，不再积累互相矛盾的记忆。没有分隔符或主语太短返回 null，
+// 不做主题判断（保守起步：宁可多存一条，不可误删用户事实）。
+// 注意不含"在"：否则"我现在的工作是后端"与"我现在的城市是北京"会撞成同
+// 主题（第一个"在"先于"是"被截断），把两条不同事实误判为改口。
+function memSubjectKey(fact) {
+  const s = memNorm(fact);
+  let idx = -1;
+  for (const d of ['是', '为', ':', '：', '=', '＝']) {
+    const i = s.indexOf(d);
+    if (i !== -1 && (idx === -1 || i < idx)) idx = i;
+  }
+  if (idx < 2) return null;
+  return s.slice(0, idx);
+}
+
 async function agentGetMemories(env, chatId) {
   if (tgAgentMemCache.has(chatId)) return tgAgentMemCache.get(chatId);
   let arr = [];
@@ -27,10 +51,37 @@ async function agentGetMemories(env, chatId) {
       const p = JSON.parse(raw);
       if (Array.isArray(p)) {
         // v6.8.6 索引校验：过滤脏条目（非对象 / fact 缺失或非字符串），
-        // 防止手改或历史 bug 留下的坏数据把 Agent 记忆整体搞挂
-        const clean = p.filter(m => m && typeof m.fact === 'string' && m.fact);
+        // 防止手改或历史 bug 留下的坏数据把 Agent 记忆整体搞挂；
+        // v6.9.2 自动优化：归一化后完全重复的条目合并为最新一条
+        // （老版本允许"带空格重复保存"，这里在读取时自动清理历史库），
+        // 被丢弃条目的 md 镜像一并删除，不留孤儿文件。
+        const clean = [];
+        const seen = new Map();
+        const orphanMd = [];
+        for (const m of p) {
+          if (!(m && typeof m.fact === 'string' && m.fact)) continue;
+          const n = memNorm(m.fact);
+          const prevIdx = seen.get(n);
+          if (prevIdx === undefined) {
+            seen.set(n, clean.length);
+            clean.push(m);
+          } else {
+            const prev = clean[prevIdx];
+            if ((m.ts || 0) > (prev.ts || 0)) {
+              clean[prevIdx] = m;
+              if (prev.file && prev.file !== m.file) orphanMd.push(kbMemDir(chatId) + prev.file);
+            } else if (m.file && m.file !== prev.file) {
+              orphanMd.push(kbMemDir(chatId) + m.file);
+            }
+          }
+        }
         if (clean.length !== p.length) {
-          try { await storePutChecked(env, agentMemKey(chatId), JSON.stringify(clean)); } catch (e) {}
+          // 索引写成功才删孤儿 md：写失败时保持原样，下次加载会重试
+          try {
+            if (await storePutChecked(env, agentMemKey(chatId), JSON.stringify(clean))) {
+              if (orphanMd.length) await kbDeleteKeys(env, orphanMd);
+            }
+          } catch (e) {}
         }
         arr = clean;
       }
@@ -51,20 +102,41 @@ async function agentSaveMemory(env, chatId, fact) {
   const arr = await agentGetMemories(env, chatId);
   fact = String(fact || '').trim().slice(0, 200);
   if (!fact) return '内容为空，未保存';
-  if (arr.some(m => m.fact === fact)) return '已记住过，无需重复保存';
+  const norm = memNorm(fact);
+  if (arr.some(m => memNorm(m.fact) === norm)) return '已记住过，无需重复保存';
+  // 自动优化：同一主题（"X是/为/: Y" 的同 X）只保留最新——改口即覆盖，
+  // 历史上积累的多条同主题旧条目一并清理，md 镜像同步删除
+  const key = memSubjectKey(fact);
+  const replacedFiles = [];
+  let oldFact = '';
+  let oldTs = 0;
+  if (key) {
+    for (let i = arr.length - 1; i >= 0; i--) {
+      if (memSubjectKey(arr[i].fact) === key) {
+        if ((arr[i].ts || 0) >= oldTs) { oldTs = arr[i].ts || 0; oldFact = arr[i].fact; }
+        if (arr[i].file) replacedFiles.push(kbMemDir(chatId) + arr[i].file);
+        arr.splice(i, 1);
+      }
+    }
+  }
+  const replaced = !!oldFact;
   // v6.6.7：条目带 file 字段；先写 md 镜像再写索引（索引是唯一可信源）
   const m = { fact: fact, ts: Date.now(), file: kbNewMemFile() };
   arr.push(m);
   // v6.4.1 起彻底不限条数：R2 单对象可达 5TB，且每次 prompt 只按预算注入，
   // 条数增长不影响 token 成本；remember 需用户明确要求才会触发，无失控风险。
   mapSetBounded(tgAgentMemCache, chatId, arr);
+  const replNote = replaced ? '（本条自动覆盖了旧记忆《' + oldFact + '》）' : '';
   // v6.8.3：未绑定 R2 时只留内存，必须如实告知——之前会谎称"已记住"，重启就丢
   if (!env.R2) {
-    return '已暂存于内存（R2 未绑定，Worker 重启后会丢失；按 README 第二步绑定 R2 后可永久记住）：' + fact;
+    return '已暂存于内存（R2 未绑定，Worker 重启后会丢失；按 README 第二步绑定 R2 后可永久记住）' + replNote + '：' + fact;
   }
   const okMd = await storePutChecked(env, kbMemDir(chatId) + m.file, kbMemMarkdown(chatId, fact, m.ts));
   const okIdx = await storePutChecked(env, agentMemKey(chatId), JSON.stringify(arr));
-  if (!okMd || !okIdx) return '记忆写入 R2 失败，已暂存于内存；请检查 R2 绑定与权限后重试：' + fact;
+  if (!okMd || !okIdx) return '记忆写入 R2 失败，已暂存于内存' + replNote + '；请检查 R2 绑定与权限后重试：' + fact;
+  // 索引落盘成功后才清理被覆盖条目的 md 镜像
+  if (replacedFiles.length) await kbDeleteKeys(env, replacedFiles);
+  if (replaced) return '已自动更新记忆：旧《' + oldFact + '》→ 新《' + fact + '》（共' + arr.length + '条）';
   return '已记住：' + fact + '（共' + arr.length + '条）';
 }
 
@@ -99,6 +171,8 @@ async function agentForgetMemory(env, chatId, keyword) {
 
 export {
   tgAgentMemCache,
+  memNorm,
+  memSubjectKey,
   agentGetMemories,
   agentSaveMemory,
   agentForgetMemory,

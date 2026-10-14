@@ -18,7 +18,9 @@ function memoryTokens(s) {
 // kbDocs（可选）：知识库文档注册表条目数组。Web 端传入时把文档标题列表
 // 确定性地注入提示词并确立"知识库优先"的回答顺序——不依赖模型自觉先调
 // list_docs；未传入（Telegram 路径或知识库为空）时保持原行为不变。
-function buildAgentSystemPrompt(memories, query, kbDocs) {
+// kbReadOnly（v6.9.3，Web 端）：知识库只读——提示词不再引导 remember /
+// save_doc / delete_doc（这些工具也不会注入），改为如实引导用户去 Telegram 端写入。
+function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly) {
   const now = new Date();
   let timeStr = '';
   try {
@@ -35,7 +37,9 @@ function buildAgentSystemPrompt(memories, query, kbDocs) {
     + (hasKb
       ? '1. 意图判断：纯闲聊、简单问候——直接回答；其余问题先对照下方【知识库文档列表】：与某篇文档相关 → 必须 read_doc 读原文后以其内容作答；无关且属于稳定知识 → 直接回答。工具是稀缺资源，能不用就不用。\n'
       : '1. 意图判断：闲聊、简单问答、你知识范围内的稳定知识——直接回答，绝不调用工具。工具是稀缺资源，能不用就不用。\n')
-    + '2. 工具选择：需要最新/实时信息（新闻、价格、赛事等）→ web_search，可换多个关键词搜索；想深入了解某条结果 → web_fetch 读原文；任何精确计算 → calculate（不要心算）；天气 → get_weather；时间 → get_time；用户明确告知的长期事实（偏好、生日、项目、城市等）→ remember；用户明确要求把长内容存成文档 → save_doc（同名覆盖即更新；同一网址只保存一次，勿换标题重复保存）；用户明确要求删除文档 → delete_doc；' + kbToolClause + '。\n'
+    + (kbReadOnly
+      ? '2. 工具选择：需要最新/实时信息（新闻、价格、赛事等）→ web_search，可换多个关键词搜索；想深入了解某条结果 → web_fetch 读原文；任何精确计算 → calculate（不要心算）；天气 → get_weather；时间 → get_time；' + kbToolClause + '。注意：知识库在本端只读，没有"记住 / 保存文档 / 删除文档"类工具；用户提出这类请求时，如实说明该操作仅在 Telegram 端支持、请通过 Telegram 机器人完成，绝不假装已记住或已保存。\n'
+      : '2. 工具选择：需要最新/实时信息（新闻、价格、赛事等）→ web_search，可换多个关键词搜索；想深入了解某条结果 → web_fetch 读原文；任何精确计算 → calculate（不要心算）；天气 → get_weather；时间 → get_time；用户明确告知的长期事实（偏好、生日、项目、城市等）→ remember（同一主题改口时直接记新值，旧记忆自动覆盖，无需先删）；用户明确要求把长内容存成文档 → save_doc（同名覆盖即更新；同一网址只保存一次，勿换标题重复保存）；用户明确要求删除文档 → delete_doc；' + kbToolClause + '。\n')
     + '3. 多步规划：允许先搜索再抓取、先计算再汇总，一次可并行调用多个工具；但每次只规划接下来 1-2 步，拿到结果再决定下一步，不要一次规划过长链条。\n'
     + '4. 诚实：工具没给的信息绝不编造；搜索无结果就直说。\n'
     + '5. 语言：默认用中文回答（用户用其他语言时跟随用户语言）。\n'
@@ -83,8 +87,10 @@ function buildAgentSystemPrompt(memories, query, kbDocs) {
   }
   p += '【重要规则】\n'
     + '- 需要用户私密或实时信息时必须用工具核实，不要凭空猜测。\n'
-    + '- remember 只用于用户明确要求记住的长期事实，不要把临时对话内容存进去。\n'
-    + '- save_doc 是唯一能写知识库文档的途径：只有它返回成功，才可以告诉用户"已保存/已生成文档"；没有调用成功就不许声称。长文档用 save_doc，不要用 remember 硬塞。\n'
+    + (kbReadOnly
+      ? '- 知识库只读：本端没有记忆与文档的写入工具，"记住某事 / 保存文档 / 删除文档"的请求一律如实引导用户通过 Telegram 机器人完成；没有工具成功返回，就绝不声称"已记住/已保存"。\n'
+      : '- remember 只用于用户明确要求记住的长期事实，不要把临时对话内容存进去。\n'
+        + '- save_doc 是唯一能写知识库文档的途径：只有它返回成功，才可以告诉用户"已保存/已生成文档"；没有调用成功就不许声称。长文档用 save_doc，不要用 remember 硬塞。\n')
     + (hasKb
       ? '- 知识库优先：read_doc 读到的文档内容优先于通用知识和网络搜索结果，两者冲突时以知识库为准（用户明确要求最新信息时除外）；引用时注明"据知识库文档《标题》"。\n'
       : '- 知识库优先：read_doc 读到的文档内容优先于通用知识和训练记忆引用，引用时注明"据知识库文档《标题》"。\n')
