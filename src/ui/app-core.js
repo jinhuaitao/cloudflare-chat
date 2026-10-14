@@ -1,0 +1,67 @@
+// 前端基础：HTML 转义、Markdown 渲染与安全清洗（_worker.js 原第 3483-3547 行，内嵌页面分片；只允许字符串导出）
+export default `<script>
+  let isCurrentlyStreaming = false;
+  let currentAbortController = null; 
+
+  const ESCAPE_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;' };
+  const ESCAPE_REG = /[&<>]/g;
+  const escapeHtml = str => str.replace(ESCAPE_REG, m => ESCAPE_MAP[m]);
+
+  // AI 输出统一走 safeHtml：先 Markdown 渲染，再做 XSS 清洗。
+  // DOMPurify 经 CDN 加载；若加载失败则降级为"解析后取纯文本"，保证永远安全。
+  // 注意：本段在外层模板字符串内，不写反斜杠、反引号，避免两层转义破坏代码。
+  function safeHtml(mdText) {
+    var raw = '';
+    try { raw = marked.parse(mdText || ''); } catch (e) { raw = ''; }
+    try {
+      if (window.DOMPurify && window.DOMPurify.sanitize) return window.DOMPurify.sanitize(raw);
+    } catch (e) {}
+    var tmp = document.createElement('div');
+    tmp.innerHTML = raw;
+    return tmp.textContent || '';
+  }
+
+  const renderer = new marked.Renderer();
+  renderer.code = function(code, language) {
+    const displayLang = language || 'text';
+    const escapedCode = escapeHtml(code);
+    
+    let highlightedCode = escapedCode;
+    if (!isCurrentlyStreaming && language && hljs.getLanguage(language)) {
+      try {
+        highlightedCode = hljs.highlight(code, { language }).value;
+      } catch (e) {}
+    } else if (!isCurrentlyStreaming) {
+      try {
+        highlightedCode = hljs.highlightAuto(code).value;
+      } catch (e) {}
+    }
+    
+    // 使用纯字符串拼接，消灭反引号
+    return '<div class="code-wrapper">' +
+             '<div class="code-header">' +
+               '<span>' + displayLang + '</span>' +
+               '<button class="copy-btn" data-code="' + encodeURIComponent(code) + '">' +
+                 '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>' +
+                 '<span>复制代码</span>' +
+               '</button>' +
+             '</div>' +
+             '<pre><code class="hljs ' + (language || '') + '">' + highlightedCode + '</code></pre>' +
+           '</div>';
+  };
+
+  marked.setOptions({ breaks: true, renderer: renderer });
+
+  document.addEventListener('click', function(e) {
+    const copyBtn = e.target.closest('.copy-btn');
+    if (!copyBtn) return;
+    const code = decodeURIComponent(copyBtn.getAttribute('data-code'));
+    navigator.clipboard.writeText(code).then(() => {
+      const span = copyBtn.querySelector('span');
+      const originalText = span.innerText;
+      span.innerText = '已复制';
+      setTimeout(() => { span.innerText = originalText; }, 2000);
+    });
+  });
+
+`;
