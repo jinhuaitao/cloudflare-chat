@@ -5,9 +5,24 @@ function toolCalculate(expr) {
   try {
     const s = String(expr || '').replace(/\s+/g, '').replace(/×/g, '*').replace(/÷/g, '/');
     if (!s) return '表达式为空';
+    if (s.length > 500) return '表达式过长（上限 500 字符）';
     if (/[^0-9+\-*/%^().]/.test(s)) return '表达式含非法字符';
     let i = 0;
+    // v6.9.4：递归深度上限。括号可以合法嵌套，但没有上限时超深表达式会打满调用栈，
+    // 把整个 Agent 步打成未捕获异常，而不是一条可读的计算失败。
+    let depth = 0;
+    const MAX_DEPTH = 64;
+    function enter() {
+      depth += 1;
+      if (depth > MAX_DEPTH) throw new Error('表达式嵌套过深');
+    }
+    function leave() { depth -= 1; }
     function parseExpr() {
+      enter();
+      try { return parseExprBody(); }
+      finally { leave(); }
+    }
+    function parseExprBody() {
       let v = parseTerm();
       while (i < s.length && (s[i] === '+' || s[i] === '-')) {
         const op = s[i++]; const r = parseTerm();

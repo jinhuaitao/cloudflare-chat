@@ -19,11 +19,10 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-// 6.9.3 为本地补丁线的知识库权限分域版：Web 端 Agent 对知识库只读
-// （remember / save_doc / delete_doc 仅 Telegram 端可用），/api/web-memory
-// 端点与 UI 清理调用随之移除。上游仓库无此版本；发 /help 看到 6.9.3 即
-// 说明部署的是打过补丁的构建。
-const APP_VERSION = '6.9.3';
+// 6.9.4：Agent 收尾与工具韧性。步数用尽先做一次无工具总结，不再把
+// "我先去搜索"当成最终答案；工具连续失败会注入纠偏并提前停止空转；
+// 搜索增加 lite 端回退；计算器限制嵌套深度。
+const APP_VERSION = '6.9.4';
 const PNG_HEADERS = {
   'Content-Type': 'image/png',
   'Cache-Control': 'public, max-age=86400',

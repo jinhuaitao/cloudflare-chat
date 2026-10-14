@@ -11,6 +11,43 @@ import { agentGetMemories } from './memory.js';
 import { buildAgentSystemPrompt } from './prompt.js';
 import { kbGetRegistry } from '../kb/registry.js';
 
+// 工具结果是否算失败。只认工具层自己的固定前缀，避免正文里偶然出现
+// "失败"二字（如新闻标题）被误判，导致正常结果也被当成空转。
+function isToolResultFailure(result) {
+  const s = String(result == null ? '' : result);
+  return /^(搜索失败|搜索请求失败|搜索「[^」]*」无结果|抓取失败|URL 非法|该地址禁止抓取|不支持抓取|计算失败|计算结果非法|时区无效|天气查询失败|找不到城市|工具执行失败|工具 [^ ]+ 执行超时|未知工具|R2 未绑定|知识库文档写入|记忆写入|内容为空|标题为空|城市名为空|表达式为空|表达式含非法字符)/.test(s);
+}
+
+// 步数用尽后的无工具收尾：不再提供 tools，强制模型把已有结果收成最终答案。
+// 剩余预算不足 8 秒或上游报错时返回 null，由调用方走原来的暂停 / 已产出兜底。
+async function agentWrapUp(env, targetModelId, messages, loopStartIdx, ctxBudget, deadline, onDelta) {
+  if (Date.now() > deadline - 8000) return null;
+  const sendMessages = trimAgentMessages(messages, loopStartIdx, ctxBudget).concat([{
+    role: 'user',
+    content: '【系统提示】可用的推理步数已用尽，不能再调用任何工具。请仅根据上面已经拿到的工具结果，直接给出最终答案：先给结论，再说明依据；没查到的部分明确说"未查到"，不要编造，也不要再输出调用计划或工具名。'
+  }]);
+  const cfg = buildAIRequest(env, targetModelId, sendMessages, true, null);
+  if (cfg.error) return null;
+  let resp;
+  try {
+    const remainMs = Math.max(0, deadline - Date.now());
+    resp = await fetch(cfg.apiUrl, {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + cfg.currentApiKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify(cfg.payload),
+      signal: AbortSignal.timeout(Math.max(8000, Math.min(60000, remainMs)))
+    });
+  } catch (e) { return null; }
+  if (!resp.ok) { try { await resp.body.cancel(); } catch (e) {} return null; }
+  let msg;
+  try { msg = await readUpstreamMessage(resp, onDelta); }
+  catch (e) { return null; }
+  const clean = stripDSMLBlocks(msg.content || '').trim();
+  if (!clean) return null;
+  if (msg.forwarded && clean === String(msg.content || '').trim()) return { text: clean, streamed: true };
+  return { text: clean, streamed: false };
+}
+
 function tgAgentDeadline(env, opts) {
   let timeoutMs = agentLimits(env).timeoutMs;
   // webhook 场景传入 maxRuntimeMs：HTTP 响应必须在 Telegram 因超时重发 update
@@ -109,6 +146,9 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
   try {
   // 重复调用熔断：记录每步工具调用签名，连续 3 步完全相同即判定模型原地打转
   const callSigHistory = [];
+  // v6.9.4：工具失败计数。同一工具连续失败时注入纠偏提示，避免模型用同样参数空转
+  // 把剩余步数耗光；全部失败则提前收尾，不再假装"还在思考"。
+  let toolFailStreak = 0;
   for (let step = 0; step < maxSteps; step++) {
     if (Date.now() > deadline) return await pauseForResume();
     const stepLabel = '🤖 Agent 思考中' + (isResume ? '（继续）' : '') + '（第 ' + (step + 1) + ' 步）…';
@@ -263,10 +303,11 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       const fn = (tc && tc.function) || {};
       let args = {};
       try { args = JSON.parse(fn.arguments || '{}'); } catch (e) {}
-      if (!fn.name) return { tc, result: '工具调用缺少名称，已跳过' };
+      if (!fn.name) return { tc, result: '工具调用缺少名称，已跳过', failed: true };
       const result = await execAgentTool(fn.name, args, env, chatId, kbReadOnly);
-      return { tc, result: truncateToolResult(result, 4000) };
+      return { tc, result: truncateToolResult(result, 4000), failed: isToolResultFailure(result) };
     }));
+    let stepFailed = 0;
     for (const tr of toolResults) {
       const fn = (tr.tc && tr.tc.function) || {};
       messages.push({
@@ -275,12 +316,26 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
         name: fn.name || 'unknown',
         content: tr.result
       });
+      if (tr.failed) stepFailed += 1;
+    }
+    // 本步全部失败才累计；有一条成功就清零（部分成功说明方向还对）
+    if (toolResults.length && stepFailed === toolResults.length) toolFailStreak += 1;
+    else toolFailStreak = 0;
+    if (toolFailStreak >= 2) {
+      messages.push({
+        role: 'user',
+        content: '【系统提示】最近的工具调用连续失败。请换关键词、换工具或换思路；若已无法取得更多信息，请基于已有结果直接给出最终答案，并明确说明哪些信息没查到。不要再用相同参数重复调用。'
+      });
     }
   }
   } finally {
     clearInterval(heartbeat);
   }
-  // 步数用尽：同样保存进度，允许「继续」（保存前先裁剪，见 pauseForResume 注释）
+  // 步数用尽：先做一次无工具收尾，让模型基于已有工具结果给出最终答案。
+  // 之前直接把最后一条 assistant（往往是"我先去搜索…"这类开场白）当答案，
+  // 用户看到的是半截计划而不是结论。收尾失败再退回暂停 / 已产出文本。
+  const wrapUp = await agentWrapUp(env, targetModelId, messages, loopStartIdx, ctxBudget, deadline, onDelta);
+  if (wrapUp && wrapUp.text) return { text: wrapUp.text, usedTools: true, streamed: !!wrapUp.streamed };
   const t = stripDSMLBlocks(lastAssistantText());
   if (resumeKey) {
     const saved = await agentSaveResumeState(env, chatId, {
@@ -296,6 +351,7 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
 }
 
 export {
+  isToolResultFailure,
   tgAgentDeadline,
   tgAgentChat,
   tgAgentResume,
