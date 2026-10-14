@@ -425,42 +425,6 @@ const rx = p => p.split('@').join(BS);   // 用 @ 占位，运行时展开成反
 
 ---
 
-# 附：本地补丁记录（非上游版本）
-
-本仓库的 `_worker.js` 在上游 v6.8.3 基础上打过一轮补丁，`APP_VERSION` 标记为 **`6.8.3-p1`**
-（给机器人发 `/help` 看到带 `-p1` 即说明部署的是打过补丁的构建）。以下改动**不在**上游 v6.8.4 ~ v6.8.8 里，
-升级上游代码时请留意会被覆盖。
-
-## p1-1 修复「网页版 Agent 一直卡在思考中」
-
-| 问题 | 原因 | 修复 |
-|---|---|---|
-| 气泡永久停在打字动画 | 前端 `if (agentMode) break;` 排在「补全 `streamError`」之前，连接被干净关闭且没收到 `[DONE]` 时会执行 `throw null`，紧接着 catch 里读 `error.name` 又抛 TypeError，错误文案永远写不进气泡 | 补错语句前移；catch 首行兜底 `if (!error) error = ...`；finally 再加一道保险，残留 `.typing-indicator` 一律替换成明确提示 |
-| 长静默连接被掐断 | Web 端零心跳（`noOpTgApi` 把 typing 心跳变成了空操作） | 每 15 秒发一个 `: keep-alive` SSE 注释行，前端按 `data:` 过滤，不受影响 |
-| 服务端假死时无限等待 | 前端读取循环没有任何超时 | 加 90 秒空闲看门狗，超时主动断开并提示，用 `idleTimedOut` 与「用户手动中止」区分 |
-| 服务端错误被吞 | `data.error` 的 `throw` 被外层空 `catch (e) {}` 吃掉 | 拆出解析与抛出，抛 `ServerError`；重试循环对它不重试 |
-| 通道不支持 tools 时不降级 | 降级判定只认错误文本含 `tool` | 首步 4xx 一律降级重试；5xx 仅在错误文本含 `tool/function/unsupported` 时降级 |
-| 干等 4 分钟 | Web 沿用 `AGENT_TIMEOUT_MS` 的 240 秒默认值 | 新增 `WEB_AGENT_TIMEOUT_MS`，默认 90 秒 |
-
-## p1-2 Agent 真流式（逐字输出）
-
-原实现里 Agent 循环用 `stream: false` 调上游，且正文要等整个 ReAct 循环跑完才一次性切片下发 ——
-所以只要开着 Agent（默认开启），再简单的问题也要盯着「思考中」干等整段生成。
-
-补丁把上游调用改为 `stream: true`，边读 SSE 边转发：
-
-- 新增 `readUpstreamMessage()`，把上游 SSE 还原成与非流式**完全相同**的 `{ content, reasoning, toolCalls, forwarded, imageUrl }` 形状 ——
-  循环里的 `tool_calls` 判定、DSML 兜底、重复调用熔断、工具执行逻辑**一行未改**，变的只是「怎么拿到 msg」。
-- 正文 / `reasoning_content` 增量以标准 OpenAI `delta` 事件实时转发，前端本来就在按这个格式解析，**逐字渲染零改动**生效。
-- 流式 `tool_calls` 分片按 `index` 合并（`arguments` 累加，`name` 取首个分片）。
-- 新增 `agent_reset` 事件：模型先输出「开场白」再调工具时，服务端会撤回已经推出去的这段文本，
-  避免它和最终答案首尾拼在一起；DSML 标记被推出去时同样撤回。
-- 兼容三种上游形态：标准 SSE、忽略 `stream` 参数直接返回完整 JSON、图片生成通道。
-- 可用 `AGENT_STREAM_UPSTREAM=0` 关闭，退回整段等待。
-
-> 已知取舍：若模型在调用工具前先输出了一段较长的「开场白」，用户会看到它出现后又被撤回（通常只有几百毫秒）。
-> 模型一旦发出 `tool_calls`，该步的后续正文就不再外发，尽量缩小这个窗口。
-
 ---
 
 # 附：版本更新记录
