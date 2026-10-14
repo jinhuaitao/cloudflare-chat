@@ -10,13 +10,17 @@ export default `  async function sendMessage() {
     }
     
     stopSpeaking();
-    emptyState.style.display = 'none'; 
-    userInput.value = ''; 
+    emptyState.style.display = 'none';
+    userInput.value = '';
     userInput.style.height = 'auto';
-    statusDot.classList.add('generating'); 
-    
-    appendMessageDOM('user', text);
-    currentSession.messages.push({ role: 'user', content: text });
+    statusDot.classList.add('generating');
+    // 发送新消息永远从底部开始看，并收起「回到底部」按钮
+    isNearBottom = true;
+    if (scrollBottomBtn) scrollBottomBtn.classList.remove('show');
+
+    const userT = Date.now();
+    appendMessageDOM('user', text, null, false, userT);
+    currentSession.messages.push({ role: 'user', content: text, t: userT });
     saveSessions();
     syncRegenButtons();   // 上一轮的 AI 回复不再是最后一条，收起它的「重新生成」
 
@@ -333,7 +337,8 @@ export default `  async function sendMessage() {
       tBox.innerHTML = safeHtml(aiContent);
       if (window.hljs) tBox.querySelectorAll('pre code').forEach((block) => { try { hljs.highlightElement(block); } catch (e) {} });
       bubble.__rawText = aiContent;   // 供「复制」取原始 Markdown
-      scrollArea.scrollTop = scrollArea.scrollHeight;
+      // 用户上翻历史时不要在收尾时拽回底部（与流式过程的 120px 阈值保持一致）
+      if (isNearBottom) scrollArea.scrollTop = scrollArea.scrollHeight;
 
       // 自动朗读（若已在左下角开启）
       if (autoSpeak && aiContent && aiContent.trim()) {
@@ -341,7 +346,10 @@ export default `  async function sendMessage() {
         if (sb) toggleSpeak(sb, bubble);
       }
       
-      currentSession.messages.push({ role: 'assistant', content: aiContent }); 
+      const aiT = Date.now();
+      currentSession.messages.push({ role: 'assistant', content: aiContent, t: aiT });
+      bubble.__time = aiT;
+      ensureMessageActions(bubble);
       saveSessions();
       
     } catch (error) {
@@ -360,8 +368,11 @@ export default `  async function sendMessage() {
         const interruptNote = '<br><br><span style="color: var(--text-secondary); font-size: 13px; font-weight: 500;">(🛑 生成已手动中止)</span>';
         tBox.innerHTML = safeHtml(aiContent || '已中止') + interruptNote;
         if (aiContent) {
-          currentSession.messages.push({ role: 'assistant', content: aiContent });
+          const abortT = Date.now();
+          currentSession.messages.push({ role: 'assistant', content: aiContent, t: abortT });
           bubble.__rawText = aiContent;
+          bubble.__time = abortT;
+          ensureMessageActions(bubble);
         }
       } else if (error.name === 'AuthError') {
         tBox.innerHTML = '<span style="color: var(--brand-color); font-size: 15px; font-weight: 600;">需要访问口令</span>' +
@@ -374,9 +385,12 @@ export default `  async function sendMessage() {
         if (aiContent || reasoningContent) {
           // 字符串拼接替换模板字符串，彻底规避 CF 编辑器转义 Bug
           tBox.innerHTML = safeHtml(aiContent) + '<br><br><span style="color: #ef4444; font-size: 13px; font-weight: 500;">(⚠️ 网络连接中断，已保留当前生成的内容。错误: ' + escapeHtml(error.message) + ')</span>';
-          currentSession.messages.push({ role: 'assistant', content: aiContent });
+          const partT = Date.now();
+          currentSession.messages.push({ role: 'assistant', content: aiContent, t: partT });
           bubble.__rawText = aiContent;
-          if (rBox && reasoningContent) rBox.remove(); 
+          bubble.__time = partT;
+          ensureMessageActions(bubble);
+          if (rBox && reasoningContent) rBox.remove();
         } else {
           tBox.innerText = '通信断开: ' + error.message; 
           bubble.parentElement.classList.add('error-msg');

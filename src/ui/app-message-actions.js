@@ -12,6 +12,22 @@ export default `  // 给消息挂上操作按钮：朗读（仅 AI）/ 复制（
       bubble.appendChild(actions);
     }
 
+    // v6.9.0：时间戳（有值时显示在操作行最前，随操作行一起悬浮出现）
+    let timeEl = actions.querySelector('.msg-time');
+    if (bubble.__time) {
+      if (!timeEl) {
+        timeEl = document.createElement('span');
+        timeEl.className = 'msg-time';
+        actions.insertBefore(timeEl, actions.firstChild);
+      }
+      const d = new Date(bubble.__time);
+      const p2 = (n) => String(n).padStart(2, '0');
+      timeEl.textContent = p2(d.getHours()) + ':' + p2(d.getMinutes());
+      timeEl.title = d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate()) + ' ' + p2(d.getHours()) + ':' + p2(d.getMinutes());
+    } else if (timeEl) {
+      timeEl.remove();
+    }
+
     // 朗读：只给 AI 消息（自己说的话没必要朗读）
     if (!isUser && !actions.querySelector('.speak-btn')) {
       const sp = document.createElement('button');

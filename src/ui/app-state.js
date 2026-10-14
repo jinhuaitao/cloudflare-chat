@@ -28,6 +28,8 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
   const messagesDiv = document.getElementById('messages');
   const emptyState = document.getElementById('emptyState');
   const scrollArea = document.getElementById('scrollArea');
+  const scrollBottomBtn = document.getElementById('scrollBottomBtn');
+  const exportBtn = document.getElementById('exportBtn');
   const userInput = document.getElementById('userInput');
   const sendBtn = document.getElementById('sendBtn');
   const sessionListDiv = document.getElementById('sessionList');
@@ -52,6 +54,8 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
   });
 
   function applyTheme(theme) {
+    // v6.9.0：切换主题时短暂开启全局色彩过渡，深浅色切换更顺滑
+    document.body.classList.add('theme-anim');
     if (theme === 'dark') {
       document.body.setAttribute('data-theme', 'dark');
       themeIcon.innerHTML = '<circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>';
@@ -59,6 +63,7 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
       document.body.removeAttribute('data-theme');
       themeIcon.innerHTML = '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>';
     }
+    setTimeout(function () { document.body.classList.remove('theme-anim'); }, 400);
   }
 
   userInput.addEventListener('input', function() {
@@ -89,6 +94,66 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
   menuToggle.addEventListener('click', () => { sidebar.classList.toggle('open'); sidebarOverlay.classList.toggle('active'); });
   sidebarOverlay.addEventListener('click', () => { sidebar.classList.remove('open'); sidebarOverlay.classList.remove('active'); });
 
+  // ===== v6.9.0 交互增强 =====
+  // 智能滚动：记录用户是否停在底部附近。向上翻历史时流式输出不再拽走滚动位置，
+  // 同时浮现「回到底部」按钮；发送 / 切换会话时复位为贴底。
+  let isNearBottom = true;
+  function updateScrollState() {
+    const d = scrollArea.scrollHeight - scrollArea.scrollTop - scrollArea.clientHeight;
+    const near = d < 120;
+    if (near !== isNearBottom) {
+      isNearBottom = near;
+      if (scrollBottomBtn) scrollBottomBtn.classList.toggle('show', !near);
+    }
+  }
+  scrollArea.addEventListener('scroll', updateScrollState, { passive: true });
+  if (scrollBottomBtn) {
+    scrollBottomBtn.addEventListener('click', () => {
+      scrollArea.scrollTop = scrollArea.scrollHeight;
+    });
+  }
+
+  // 空状态示例卡片：点击把提示语填进输入框（不直接发送，留出修改余地）
+  document.querySelectorAll('.suggestion-chip').forEach((chip) => {
+    chip.addEventListener('click', () => {
+      userInput.value = chip.dataset.prompt || '';
+      userInput.dispatchEvent(new Event('input'));
+      userInput.focus();
+    });
+  });
+
+  // 导出当前对话为 Markdown 文件
+  function exportCurrentSession() {
+    const s = sessions.find(x => x.id === currentSessionId);
+    if (!s || !s.messages || s.messages.length === 0) {
+      showAlert('当前对话还没有内容，先聊点什么再导出吧。');
+      return;
+    }
+    const lines = ['# ' + s.title, ''];
+    for (let i = 0; i < s.messages.length; i++) {
+      const m = s.messages[i];
+      lines.push(m.role === 'user' ? '## 你' : '## AI');
+      lines.push('');
+      lines.push(String(m.content || ''));
+      lines.push('');
+    }
+    const safeName = (s.title || '对话').replace(/[:*?"<>|/]/g, '_').slice(0, 40) || '对话';
+    try {
+      const blob = new Blob([lines.join('\\n')], { type: 'text/markdown;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = safeName + '.md';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+    } catch (e) {
+      showAlert('导出失败：' + (e && e.message ? e.message : String(e)));
+    }
+  }
+  if (exportBtn) exportBtn.addEventListener('click', exportCurrentSession);
+
   function updateHeaderDisplay() {
     if (modelSelect) {
       const selectedText = modelSelect.options[modelSelect.selectedIndex]?.text || 'AI 核心处理中枢';
@@ -116,6 +181,9 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
   function switchSession(id) {
     stopSpeaking();
     currentSessionId = id;
+    // 切换会话默认落在最新消息处，并收起「回到底部」按钮
+    isNearBottom = true;
+    if (scrollBottomBtn) scrollBottomBtn.classList.remove('show');
     const currentSession = sessions.find(s => s.id === id);
     if (currentSession && currentSession.model) {
       const exists = Array.from(modelSelect.options).some(opt => opt.value === currentSession.model);

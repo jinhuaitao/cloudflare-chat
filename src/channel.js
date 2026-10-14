@@ -126,7 +126,15 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
     n: 1
   } : {
     model: selectedModel,
-    messages: messagesArray,
+    // v6.9.0：只透传上游认识的标准字段。本地附加字段（如前端时间戳 t）
+    // 不剥离的话，严格校验参数的上游会整单 400
+    messages: messagesArray.map(m => {
+      const o = { role: m.role, content: m.content };
+      if (m.tool_calls) o.tool_calls = m.tool_calls;
+      if (m.tool_call_id) { o.tool_call_id = m.tool_call_id; if (m.name) o.name = m.name; }
+      if (m.reasoning_content) o.reasoning_content = m.reasoning_content;
+      return o;
+    }),
     stream: isStream,
     max_tokens: maxTokens,
   };

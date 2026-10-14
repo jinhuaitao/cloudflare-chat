@@ -36,30 +36,33 @@ export default `  function renderSessionList() {
       emptyState.style.display = 'none'; 
       currentSession.messages.forEach(msg => {
         const uiRole = msg.role === 'assistant' ? 'ai' : msg.role;
-        appendMessageDOM(uiRole, msg.content, null, false);
+        appendMessageDOM(uiRole, msg.content, null, false, msg.t);
       }); 
       syncRegenButtons();
     }
   }
 
-  function appendMessageDOM(role, content, msgId = null, isError = false) {
+  function appendMessageDOM(role, content, msgId = null, isError = false, time = null) {
     let row = msgId ? document.getElementById('row_' + msgId) : null;
     let bubble = msgId ? document.getElementById(msgId) : null;
-    
+
     if (!row) {
-      row = document.createElement('div'); 
+      row = document.createElement('div');
       row.className = 'message-row ' + role;
-      if (msgId) row.id = 'row_' + msgId; 
+      if (msgId) row.id = 'row_' + msgId;
       if (isError) row.classList.add('error-msg');
-      
-      bubble = document.createElement('div'); 
-      bubble.className = 'message-bubble'; 
+
+      bubble = document.createElement('div');
+      bubble.className = 'message-bubble';
       if (msgId) bubble.id = msgId;
-      
-      row.appendChild(bubble); 
+
+      row.appendChild(bubble);
       messagesDiv.appendChild(row);
     }
-    
+
+    // v6.9.0：时间戳（旧会话数据没有 t 字段则为 null，不显示）
+    bubble.__time = time || null;
+
     if (role === 'ai') {
       if (msgId) {
         bubble.innerHTML = content;
@@ -76,9 +79,14 @@ export default `  function renderSessionList() {
       bubble.__rawText = content;
     }
     ensureMessageActions(bubble);
-    
-    scrollArea.scrollTop = scrollArea.scrollHeight; 
-    
+
+    // v6.9.0：智能滚动 —— 用户自己的消息永远贴底；AI 消息只在用户
+    // 停在底部附近时跟随（向上翻历史时不被流式输出拽走）
+    if (role === 'user' || isNearBottom) {
+      isNearBottom = true;
+      scrollArea.scrollTop = scrollArea.scrollHeight;
+    }
+
     const rBox = bubble.querySelector('.reasoning-box');
     if (rBox) { rBox.scrollTop = rBox.scrollHeight; }
 

@@ -15,6 +15,8 @@ export default `  <style>
       --text-2: #4a4f5c;
       --muted: #8b90a0;
       --accent: #2563eb;
+      --accent-2: #7c3aed;
+      --accent-gradient: linear-gradient(135deg, #2563eb, #7c3aed);
       --accent-soft: #eef3ff;
       --user-bubble: #f1f2f6;
       --danger: #dc2626;
@@ -54,6 +56,8 @@ export default `  <style>
       --text-2: #b6bbc8;
       --muted: #868c9b;
       --accent: #4d8dff;
+      --accent-2: #a78bfa;
+      --accent-gradient: linear-gradient(135deg, #4d8dff, #a78bfa);
       --accent-soft: #17203a;
       --user-bubble: #1c2029;
       --danger: #f87171;
@@ -131,10 +135,15 @@ export default `  <style>
     }
     .brand-dot {
       width: 22px; height: 22px; border-radius: 7px;
-      background: var(--accent); color: #fff;
+      background: var(--accent-gradient); color: #fff;
       display: grid; place-items: center;
       font-size: 12px; font-weight: 700;
       flex-shrink: 0;
+    }
+    .brand-name {
+      background: linear-gradient(120deg, var(--text) 20%, var(--accent) 95%);
+      -webkit-background-clip: text; background-clip: text;
+      -webkit-text-fill-color: transparent;
     }
 
     .new-chat-btn {
@@ -151,6 +160,21 @@ export default `  <style>
     }
     .new-chat-btn:hover { filter: brightness(1.06); }
 
+    /* v6.9.0：新对话 + 导出同一行 */
+    .sidebar-actions { display: flex; gap: 8px; }
+    .sidebar-actions .new-chat-btn { flex: 1; }
+    .export-btn {
+      width: 42px; flex-shrink: 0;
+      border: 1px solid var(--border-strong); border-radius: 10px;
+      background: var(--panel); color: var(--text-2);
+      display: grid; place-items: center;
+      cursor: pointer;
+      transition: color .12s ease, border-color .12s ease, background .12s ease;
+    }
+    .export-btn:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+    .export-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+    .export-btn svg { width: 17px; height: 17px; }
+
     .session-list {
       flex: 1;
       overflow-y: auto;
@@ -159,6 +183,7 @@ export default `  <style>
     }
 
     .session-item {
+      position: relative;
       display: flex; align-items: center; gap: 8px;
       padding: 9px 10px;
       border-radius: 10px;
@@ -168,6 +193,16 @@ export default `  <style>
     }
     .session-item:hover { background: var(--hover); color: var(--text); }
     .session-item.active { background: var(--accent-soft); color: var(--accent); font-weight: 550; }
+    /* v6.9.0：激活会话左侧的强调条（绝对定位，不挤占标题空间） */
+    .session-item::before {
+      content: '';
+      position: absolute; left: 0; top: 22%; bottom: 22%;
+      width: 3px; border-radius: 2px;
+      background: var(--accent);
+      opacity: 0;
+      transition: opacity .14s ease;
+    }
+    .session-item.active::before { opacity: 1; }
 
     .session-title {
       flex: 1; min-width: 0;
@@ -280,6 +315,33 @@ export default `  <style>
       display: flex;
       flex-direction: column;
     }
+
+    /* v6.9.0：「回到底部」悬浮按钮 —— sticky 定位在滚动容器底部，永远悬于输入区上方 */
+    .scroll-bottom-btn {
+      position: sticky;
+      bottom: 12px;
+      z-index: 5;
+      width: 36px; height: 36px;
+      margin: -48px auto 0;
+      padding: 0;
+      border: 1px solid var(--border);
+      border-radius: 50%;
+      background: var(--panel);
+      color: var(--text-2);
+      display: grid; place-items: center;
+      cursor: pointer;
+      box-shadow: var(--shadow);
+      opacity: 0; visibility: hidden; pointer-events: none;
+      transform: translateY(6px);
+      transition: opacity .18s ease, visibility .18s ease, transform .18s ease, color .12s ease, border-color .12s ease;
+    }
+    .scroll-bottom-btn.show {
+      opacity: 1; visibility: visible; pointer-events: auto;
+      transform: translateY(0);
+    }
+    .scroll-bottom-btn:hover { color: var(--accent); border-color: var(--accent); }
+    .scroll-bottom-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .scroll-bottom-btn svg { width: 18px; height: 18px; }
 
     .message-row {
       display: flex;
@@ -431,6 +493,13 @@ export default `  <style>
     }
     .message-row:hover .msg-actions { opacity: 1; }
 
+    /* v6.9.0：消息时间戳，随操作行一起悬浮出现 */
+    .msg-time {
+      font-size: 11px; color: var(--muted);
+      margin-right: 7px; line-height: 27px;
+      user-select: none; white-space: nowrap;
+    }
+
     /* 消息操作按钮：朗读 / 复制 / 重新生成。纯图标 + title 提示，尺寸统一 27px */
     .icon-btn, .speak-btn {
       width: 27px; height: 27px; padding: 0;
@@ -500,8 +569,44 @@ export default `  <style>
     .empty-state h2 {
       margin: 0; font-size: 25px; font-weight: 650;
       letter-spacing: -.3px; color: var(--text);
+      background: linear-gradient(120deg, var(--text) 20%, var(--accent) 95%);
+      -webkit-background-clip: text; background-clip: text;
+      -webkit-text-fill-color: transparent;
     }
     .empty-state p { margin: 8px 0 0; font-size: 14.5px; color: var(--muted); }
+
+    /* v6.9.0：空状态示例提问卡片 —— 点击填入输入框 */
+    .suggestion-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      width: 100%;
+      max-width: 560px;
+      margin-top: 30px;
+    }
+    .suggestion-chip {
+      display: flex; align-items: center; gap: 10px;
+      padding: 13px 15px;
+      border: 1px solid var(--border);
+      border-radius: 13px;
+      background: var(--panel);
+      color: var(--text-2);
+      font-size: 13.5px; text-align: left;
+      cursor: pointer;
+      transition: border-color .14s ease, background .14s ease, color .14s ease, transform .14s ease, box-shadow .14s ease;
+    }
+    .suggestion-chip:hover {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+      color: var(--text);
+      transform: translateY(-2px);
+      box-shadow: var(--shadow);
+    }
+    .suggestion-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .suggestion-chip svg { width: 17px; height: 17px; color: var(--accent); flex-shrink: 0; }
+    .suggestion-chip span {
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
 
     /* ---------------- 输入区 ---------------- */
     .input-wrapper { flex-shrink: 0; padding: 8px 20px 16px; }
@@ -544,8 +649,8 @@ export default `  <style>
       transition: background .14s ease, color .14s ease, transform .1s ease, box-shadow .14s ease;
     }
     .send-btn.active {
-      background: var(--accent); color: #fff; cursor: pointer;
-      box-shadow: 0 4px 12px rgba(37, 99, 235, .28);
+      background: var(--accent-gradient); color: #fff; cursor: pointer;
+      box-shadow: 0 4px 14px rgba(37, 99, 235, .32);
     }
     .send-btn.active:hover { transform: scale(1.06); }
     .send-btn.stop-mode {
@@ -700,6 +805,19 @@ export default `  <style>
     .modal .modal-text { margin: 0; color: var(--text-2); font-size: 13.5px; line-height: 1.6; }
     .modal .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 18px; }
 
+    /* ---------------- 主题切换过渡 / 动效减弱 ---------------- */
+    /* applyTheme 切换时给 body 加 .theme-anim，400ms 内全局色彩平滑过渡 */
+    body.theme-anim, body.theme-anim *, body.theme-anim *::before, body.theme-anim *::after {
+      transition: background-color .25s ease, border-color .25s ease, color .25s ease, box-shadow .25s ease, fill .25s ease, stroke .25s ease !important;
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: .01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: .01ms !important;
+      }
+    }
+
     /* ---------------- 移动端 ---------------- */
     /* 断点取 768px：与原脚本里 window.innerWidth <= 768 的判断保持一致 */
     @media (max-width: 768px) {
@@ -719,6 +837,8 @@ export default `  <style>
 
       .empty-state { min-height: 50vh; }
       .empty-state h2 { font-size: 22px; }
+      .suggestion-grid { grid-template-columns: 1fr; max-width: 400px; }
+      .scroll-bottom-btn { bottom: 10px; }
 
       /* 触屏没有 hover，操作按钮常驻可见 */
       .msg-actions { opacity: 1; }
