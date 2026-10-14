@@ -160,21 +160,6 @@ export default `  <style>
     }
     .new-chat-btn:hover { filter: brightness(1.06); }
 
-    /* v6.9.0：新对话 + 导出同一行 */
-    .sidebar-actions { display: flex; gap: 8px; }
-    .sidebar-actions .new-chat-btn { flex: 1; }
-    .export-btn {
-      width: 42px; flex-shrink: 0;
-      border: 1px solid var(--border-strong); border-radius: 10px;
-      background: var(--panel); color: var(--text-2);
-      display: grid; place-items: center;
-      cursor: pointer;
-      transition: color .12s ease, border-color .12s ease, background .12s ease;
-    }
-    .export-btn:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
-    .export-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-    .export-btn svg { width: 17px; height: 17px; }
-
     .session-list {
       flex: 1;
       overflow-y: auto;

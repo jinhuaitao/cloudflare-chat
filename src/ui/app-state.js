@@ -29,7 +29,6 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
   const emptyState = document.getElementById('emptyState');
   const scrollArea = document.getElementById('scrollArea');
   const scrollBottomBtn = document.getElementById('scrollBottomBtn');
-  const exportBtn = document.getElementById('exportBtn');
   const userInput = document.getElementById('userInput');
   const sendBtn = document.getElementById('sendBtn');
   const sessionListDiv = document.getElementById('sessionList');
@@ -121,38 +120,6 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
       userInput.focus();
     });
   });
-
-  // 导出当前对话为 Markdown 文件
-  function exportCurrentSession() {
-    const s = sessions.find(x => x.id === currentSessionId);
-    if (!s || !s.messages || s.messages.length === 0) {
-      showAlert('当前对话还没有内容，先聊点什么再导出吧。');
-      return;
-    }
-    const lines = ['# ' + s.title, ''];
-    for (let i = 0; i < s.messages.length; i++) {
-      const m = s.messages[i];
-      lines.push(m.role === 'user' ? '## 你' : '## AI');
-      lines.push('');
-      lines.push(String(m.content || ''));
-      lines.push('');
-    }
-    const safeName = (s.title || '对话').replace(/[:*?"<>|/]/g, '_').slice(0, 40) || '对话';
-    try {
-      const blob = new Blob([lines.join('\\n')], { type: 'text/markdown;charset=utf-8' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = safeName + '.md';
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
-    } catch (e) {
-      showAlert('导出失败：' + (e && e.message ? e.message : String(e)));
-    }
-  }
-  if (exportBtn) exportBtn.addEventListener('click', exportCurrentSession);
 
   function updateHeaderDisplay() {
     if (modelSelect) {
