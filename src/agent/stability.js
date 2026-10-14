@@ -9,11 +9,35 @@
 //    只动本轮循环产生的消息（loopStartIdx 之后），system 与历史对话永不裁剪。
 
 // 工具结果截断：超长时保留前 maxChars 并标注，避免模型误判为完整数据
+// v6.8.7：不在代理对中间切断 —— emoji 等增补平面字符占两个 code unit，
+// 切开后会产出两个非法字符，可能污染下游的 JSON 序列化与前端渲染
 function truncateToolResult(result, maxChars) {
   const s = String(result == null ? '' : result);
   maxChars = maxChars > 0 ? maxChars : 4000;
   if (s.length <= maxChars) return s;
-  return s.slice(0, maxChars) + '\n…（结果过长，仅显示前 ' + maxChars + ' 字符）';
+  let cut = maxChars;
+  const prev = s.charCodeAt(cut - 1);
+  if (prev >= 0xd800 && prev <= 0xdbff) cut -= 1;
+  return s.slice(0, cut) + '\n…（结果过长，仅显示前 ' + cut + ' 字符）';
+}
+
+// v6.8.7：上游错误响应体带预算读取。错误页可能是几十 KB 的 HTML，
+// 失败路径上整段读入只为取前几百字符做诊断，既慢又浪费内存
+async function readErrorBody(resp, maxChars) {
+  maxChars = maxChars > 0 ? maxChars : 2048;
+  try {
+    if (!resp.body) return (await resp.text()).slice(0, maxChars);
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let out = '';
+    while (out.length < maxChars) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      out += dec.decode(value, { stream: true });
+    }
+    try { await reader.cancel(); } catch (e) {}
+    return out.slice(0, maxChars);
+  } catch (e) { return ''; }
 }
 
 // 工具调用签名：name + 规范化后的参数，用于检测模型是否在原地打转
@@ -60,6 +84,7 @@ function trimAgentMessages(messages, loopStartIdx, budget) {
 
 export {
   truncateToolResult,
+  readErrorBody,
   toolCallSignature,
   trimAgentMessages,
 };

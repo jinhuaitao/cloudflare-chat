@@ -331,7 +331,7 @@ export default `  async function sendMessage() {
       clearAgentProgress();
 
       tBox.innerHTML = safeHtml(aiContent);
-      tBox.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
+      if (window.hljs) tBox.querySelectorAll('pre code').forEach((block) => { try { hljs.highlightElement(block); } catch (e) {} });
       bubble.__rawText = aiContent;   // 供「复制」取原始 Markdown
       scrollArea.scrollTop = scrollArea.scrollHeight;
 
@@ -383,7 +383,7 @@ export default `  async function sendMessage() {
           currentSession.messages.pop(); 
         }
       }
-      tBox.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
+      if (window.hljs) tBox.querySelectorAll('pre code').forEach((block) => { try { hljs.highlightElement(block); } catch (e) {} });
       saveSessions();
     } finally {
       isCurrentlyStreaming = false;

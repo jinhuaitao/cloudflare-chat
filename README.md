@@ -1,6 +1,6 @@
 # Cloudflare-Chat
 
-基于 Cloudflare Workers 的多通道 AI 对话前端 + Telegram 机器人。单文件 Worker（`_worker.js`），通过 `wrangler.toml` 声明式配置，支持连接 GitHub 仓库自动构建部署。当前版本 v6.8.8。
+基于 Cloudflare Workers 的多通道 AI 对话前端 + Telegram 机器人。单文件 Worker（`_worker.js`），通过 `wrangler.toml` 声明式配置，支持连接 GitHub 仓库自动构建部署。当前版本 v6.8.9。
 
 ## 功能一览
 
@@ -301,7 +301,7 @@ https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=https://<你的Work
 **Agent 说"已保存"但 R2 里看不到知识库文档**
 
 按顺序排查：
-1. 先确认部署的版本：给机器人发 `/help`，看版本号是不是 v6.8.8+。v6.8.2 及更早版本在 R2 未绑定时会谎称"已保存"（v6.8.3 起会明确报错）；v6.8.3 及更早版本在**并发保存或注册表写入失败时仍可能"已保存但查不到"**（v6.8.4 起注册表写入失败会如实报错，不再静默吞错）。
+1. 先确认部署的版本：给机器人发 `/help`，看版本号是不是 v6.8.9+。v6.8.2 及更早版本在 R2 未绑定时会谎称"已保存"（v6.8.3 起会明确报错）；v6.8.3 及更早版本在**并发保存或注册表写入失败时仍可能"已保存但查不到"**（v6.8.4 起注册表写入失败会如实报错，不再静默吞错）。
 2. 给机器人发 `/kb`：如果回复"R2 未绑定"，说明 Worker 没有 R2 绑定——去 Cloudflare 控制台 Workers & Pages → 你的 Worker → 设置 → 绑定，确认 R2 存储桶已绑定（变量名必须是 `R2`），然后重新部署。
 3. R2 控制台确认 bucket 里有 `kb/docs/` 前缀的对象。注意文件名是标题去掉空格和特殊字符后的结果（如标题"甲骨文云 ARM"存为 `甲骨文云ARM.md`），用 `/kb` 看到的标题列表为准。**如果 R2 里有文件但 `/kb` / `list_docs` 看不到**：说明注册表丢了该条目（旧版本并发 bug），直接删除 `kb/docs/registry.json`，下一次列表操作会自动扫描重建。
 4. 如果曾在 v6.8.1 遇到过 `loopStartIdx is not defined` 报错：那次 Agent 是中途崩溃的，工具可能没执行完，重试一次即可（v6.8.2 已修复）。
@@ -390,7 +390,8 @@ const rx = p => p.split('@').join(BS);   // 用 @ 占位，运行时展开成反
 - **Telegram 聊天白名单（v6.8.1 新增）**：配置 `TG_ALLOWED_CHAT_IDS`（逗号分隔的 chat id，只填你自己的）后，机器人只响应名单内的聊天，其他一律静默忽略。个人自用强烈建议配置——否则任何陌生人私聊机器人都能烧你的 key。
 - **Agent `web_fetch` 的 SSRF 防护（v6.8.1 新增）**：拦截内网 / 本机回环 / 链路本地（169.254.x）/ 云元数据地址及 `localhost` 等危险主机名，防止 Worker 被当成代理。但 Workers 拿不到底层 DNS，DNS 重绑定类攻击仍需在前置 WAF 层封堵。
 - **AI 回复经 XSS 清洗**：前端所有 AI 生成内容先经 Markdown 渲染，再过 DOMPurify 白名单清洗后才插入页面；CDN 加载失败时降级为纯文本显示。
-- **CORS 为 `*`**：`Access-Control-Allow-Origin: *` 允许任意站点调用你的接口。如果只在自己的域名下使用，建议收紧为实际域名。
+- **CORS 默认 `*`，可用 `CORS_ORIGIN` 收紧（v6.8.9 新增）**：默认 `Access-Control-Allow-Origin: *` 允许任意站点调用你的接口（兼容旧部署）。配置环境变量 `CORS_ORIGIN`（如 `https://chat.example.com`，逗号分隔可多个）后，只回显名单内的 Origin——其他网站的页面即使拿到了泄露的口令，也无法从浏览器直接调用你的接口。只在自己域名下使用时建议配置。
+- **`/api/web-memory` 删除接口已纳入限流（v6.8.9）**：与 `/api/chat` 共用每 IP 每分钟限额，防止高频试探 session_id 批量清空他人 Agent 记忆。
 - **API Key 只存在于服务端**：密钥通过环境变量注入，不会下发到浏览器，前端只能看到模型名称。
 
 > 关于口令强度的说明：口令以明文形式保存在浏览器 localStorage 中，并通过请求头传输（HTTPS 加密）。服务端比较采用定长实现，可避免通过响应耗时逐字节猜解。它能有效挡住扫描器和随手调用接口的人，但不宜作为对抗定向攻击的唯一防线。
@@ -414,6 +415,7 @@ const rx = p => p.split('@').join(BS);   // 用 @ 占位，运行时展开成反
 | `AGENT_STREAM_UPSTREAM` | 设为 `0` 可关闭 Agent 真流式，退回「等整段生成完再显示」。仅在通道不支持「流式 + tools」组合时需要 | 未配置=开启流式 |
 | `TG_API_TIMEOUT_MS` | Telegram Bot API 单次调用超时（毫秒） | `15000`（15 秒） |
 | `TG_WEBHOOK_BUDGET_MS` | webhook 内 Agent 单轮预算（毫秒），10 秒 ~ 240 秒 | `55000`（55 秒） |
+| `CORS_ORIGIN` | 跨域白名单（逗号分隔的完整 Origin，如 `https://chat.example.com`）；配置后 CORS 只放行名单内来源 | 未配置=`*` |
 
 ---
 
@@ -422,6 +424,7 @@ const rx = p => p.split('@').join(BS);   // 用 @ 占位，运行时展开成反
 
 # 附：版本更新记录
 
+- **v6.8.9**（本地补丁版：补齐 + 加固）：先把上游 v6.8.6 / v6.8.7 的修复真正落到本分支（SSRF 三洞——重定向逐跳校验、IPv4 映射 IPv6 压缩形式、FQDN 尾点；`web_fetch` 流式限长防 OOM；DDG 搜索解析错位；计算器溢出；天气超时；DSML 截断容忍；限流淘汰；emoji 截断；错误体预算；去重异常释放；`@botname` 命令兼容；「继续」精确匹配）。在此之上新增：Telegram `update_id` 跨 isolate 去重（L1 内存 + R2 滚动窗口——webhook 同步处理逼近 60 秒重发窗口，重发落到别的 isolate 也不会重复执行 Agent / 重复发回复）；断点续做带回 `loopStartIdx`（多段「继续」上下文不再无限增长）；断点存档改 `storePutChecked`（保存失败不再谎称"发送继续可接着做"）；TG 历史超预算成对裁剪（不再出现 assistant 开头的非法序列）；图片通道空消息 / 多模态 `content` 不再 TypeError；限流满 5000 改为淘汰最旧一半（不再整体清零 fail-open）；`/api/chat` 上游错误体限长读取并把状态码带进错误文本；可选 `CORS_ORIGIN` 收紧跨域；`/api/web-memory` 纳入限流；异常时清理 Telegram"思考中"消息并释放去重标记；Web 会话 id 加随机后缀 + 会话数上限 50；前端 marked / highlight.js CDN 加载失败时整页降级为纯文本渲染，不再因一个 CDN 挂掉而瘫痪。
 - **v6.8.7**（打磨）：限流 `clear()` 改淘汰最旧条目 + 过期 key 删除（高并发下不再 fail-open）；DSML 参数解析容忍 `max_tokens` 截断（最后一个参数不再静默丢失）；工具结果截断不在 emoji 代理对中间切断；上游错误响应体带 2KB 预算读取；Telegram 更新处理异常时删除去重标记以便重发重试。
 - **v6.8.6**（全量审计修复 25 项）：SSRF 三洞（重定向逐跳校验、IPv4 映射 IPv6 压缩形式、FQDN 尾点）、`web_fetch` 流式读取防 OOM、天气查询超时、计算器溢出、DDG 解析错位、记忆删除索引校验、历史成对裁剪、「继续」精确匹配、群组 `@botname` 命令兼容、前端 CDN 降级等。
 - **v6.8.5**：修复 Telegram 进度"假卡死"——步骤标签与工具进度改用独立节流通道。

@@ -9,10 +9,18 @@ export default `<script>
 
   // AI 输出统一走 safeHtml：先 Markdown 渲染，再做 XSS 清洗。
   // DOMPurify 经 CDN 加载；若加载失败则降级为"解析后取纯文本"，保证永远安全。
-  // 注意：本段在外层模板字符串内，不写反斜杠、反引号，避免两层转义破坏代码。
+  // 注意：本段在外层模板字符串内，不写反斜杠、反引号，避免两层转义破坏代码
+  //（split 的分隔符写作双反斜杠加 n，经模板层转义后即为页面脚本里的换行符转义）。
+  // v6.8.9：marked 也是 CDN 依赖 —— 之前 marked 加载失败时 new marked.Renderer()
+  // 直接 ReferenceError，把整段内联脚本炸死，init() 不执行、页面整体瘫痪。
+  // 现在全部降级：marked 缺失时按纯文本渲染（转义 + 换行转 <br>）。
   function safeHtml(mdText) {
     var raw = '';
-    try { raw = marked.parse(mdText || ''); } catch (e) { raw = ''; }
+    if (window.marked && window.marked.parse) {
+      try { raw = marked.parse(mdText || ''); } catch (e) { raw = ''; }
+    } else {
+      return escapeHtml(mdText || '').split('\\n').join('<br>');
+    }
     try {
       if (window.DOMPurify && window.DOMPurify.sanitize) return window.DOMPurify.sanitize(raw);
     } catch (e) {}
@@ -21,36 +29,39 @@ export default `<script>
     return tmp.textContent || '';
   }
 
-  const renderer = new marked.Renderer();
-  renderer.code = function(code, language) {
-    const displayLang = language || 'text';
-    const escapedCode = escapeHtml(code);
-    
-    let highlightedCode = escapedCode;
-    if (!isCurrentlyStreaming && language && hljs.getLanguage(language)) {
-      try {
-        highlightedCode = hljs.highlight(code, { language }).value;
-      } catch (e) {}
-    } else if (!isCurrentlyStreaming) {
-      try {
-        highlightedCode = hljs.highlightAuto(code).value;
-      } catch (e) {}
-    }
-    
-    // 使用纯字符串拼接，消灭反引号
-    return '<div class="code-wrapper">' +
-             '<div class="code-header">' +
-               '<span>' + displayLang + '</span>' +
-               '<button class="copy-btn" data-code="' + encodeURIComponent(code) + '">' +
-                 '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>' +
-                 '<span>复制代码</span>' +
-               '</button>' +
-             '</div>' +
-             '<pre><code class="hljs ' + (language || '') + '">' + highlightedCode + '</code></pre>' +
-           '</div>';
-  };
+  if (window.marked && window.marked.Renderer) {
+    const renderer = new marked.Renderer();
+    renderer.code = function(code, language) {
+      const displayLang = language || 'text';
+      const escapedCode = escapeHtml(code);
 
-  marked.setOptions({ breaks: true, renderer: renderer });
+      let highlightedCode = escapedCode;
+      // hljs 同为 CDN 依赖，缺失时直接展示转义后的纯文本代码
+      if (window.hljs && !isCurrentlyStreaming && language && hljs.getLanguage(language)) {
+        try {
+          highlightedCode = hljs.highlight(code, { language }).value;
+        } catch (e) {}
+      } else if (window.hljs && !isCurrentlyStreaming) {
+        try {
+          highlightedCode = hljs.highlightAuto(code).value;
+        } catch (e) {}
+      }
+
+      // 使用纯字符串拼接，消灭反引号
+      return '<div class="code-wrapper">' +
+               '<div class="code-header">' +
+                 '<span>' + displayLang + '</span>' +
+                 '<button class="copy-btn" data-code="' + encodeURIComponent(code) + '">' +
+                   '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>' +
+                   '<span>复制代码</span>' +
+                 '</button>' +
+               '</div>' +
+               '<pre><code class="hljs ' + (language || '') + '">' + highlightedCode + '</code></pre>' +
+             '</div>';
+    };
+
+    marked.setOptions({ breaks: true, renderer: renderer });
+  }
 
   document.addEventListener('click', function(e) {
     const copyBtn = e.target.closest('.copy-btn');

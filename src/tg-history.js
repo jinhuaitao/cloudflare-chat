@@ -12,13 +12,20 @@ function tgTrimHistory(history, env) {
   if (maxRounds > 30) maxRounds = 30;
   const maxMsgs = maxRounds * 2;
   while (history.length > maxMsgs) history.shift();
-  // 字符预算：超长历史从最旧开始丢弃，保证单次请求可控
+  // 字符预算：超长历史从最旧开始成对丢弃（user+assistant 一起），
+  // 保证剩余序列仍以 user 开头、按轮次交替，上游不会因消息序列非法而报错
   const budget = 12000;
   let total = 0;
   for (let i = 0; i < history.length; i++) total += String(history[i].content || '').length;
   while (history.length > 2 && total > budget) {
-    const dropped = history.shift();
-    total -= String(dropped.content || '').length;
+    let dropCount = 1;
+    if (history[0].role === 'user' && history.length > 1 && history[1].role === 'assistant') dropCount = 2;
+    let droppedChars = 0;
+    for (let d = 0; d < dropCount && history.length > 2; d++) {
+      const dropped = history.shift();
+      droppedChars += String(dropped.content || '').length;
+    }
+    total -= droppedChars;
   }
   return history;
 }

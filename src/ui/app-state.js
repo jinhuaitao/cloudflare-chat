@@ -4,6 +4,7 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
   const LEGACY_STORAGE_KEY = 'nvidia_ai_sessions';
   const MAX_SEND_MSGS = 60;   // 每次请求最多带最近 60 条消息，避免超长会话撑爆请求体
   const MAX_STORE_MSGS = 200; // 每个会话本地最多保留 200 条，超限从最旧开始丢弃
+  const MAX_SESSIONS = 50;    // v6.8.9：会话数上限，超出裁掉最旧的，防止 localStorage 被塞爆
   function loadSessions() {
     try {
       var raw = localStorage.getItem(STORAGE_KEY) || localStorage.getItem(LEGACY_STORAGE_KEY);
@@ -97,12 +98,15 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
   }
 
   function createNewSession() {
-    const newId = 'session_' + Date.now();
+    // v6.8.9：加随机后缀 —— 旧 id 只有 Date.now()，可被外人预测后调用
+    // DELETE /api/web-memory 清空你的 Agent 记忆
+    const newId = 'session_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
     const savedDefaultModel = localStorage.getItem('default_model');
     const fallbackModel = modelSelect.options.length > 0 ? modelSelect.options[0].value : "";
     const targetModel = savedDefaultModel || fallbackModel;
 
     sessions.unshift({ id: newId, title: '新对话', messages: [], model: targetModel });
+    if (sessions.length > MAX_SESSIONS) sessions.length = MAX_SESSIONS;
     saveSessions();
     switchSession(newId);
     renderSessionList();

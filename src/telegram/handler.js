@@ -2,23 +2,77 @@
 
 import { APP_VERSION } from '../constants.js';
 import { mapSetBounded, parseCommaSeparated, safeEqual } from '../utils.js';
-import { storeGet, storePut } from '../store/r2.js';
+import { storeGet, storePut, storePutChecked } from '../store/r2.js';
 import { getChannelConfig, buildAIRequest } from '../channel.js';
 import { tgTrimHistory, tgGetHistory, tgSaveHistory, tgClearHistory } from '../tg-history.js';
 import { agentGetMemories, agentForgetMemory } from '../agent/memory.js';
 import { agentGetMode, agentSetMode } from '../agent/mode.js';
 import { agentLoadResumeState, agentClearResumeState, tgAgentResumeKey } from '../agent/resume.js';
 import { tgAgentChat, tgAgentResume } from '../agent/loop.js';
+import { readErrorBody } from '../agent/stability.js';
 import { toolListDocs } from '../kb/doc-tools.js';
 
 // 全局内存缓存（L1 缓存）
 const tgUserModels = new Map();
-// update_id 去重缓存（v6.6.3 起改用内存，不再写 R2）：
-// key 为 Telegram update_id，value 为首次见到时间戳；
-// 去重窗口 10 分钟，每次 webhook 顺手清理过期条目，Map 不会无限增长。
+// update_id 去重缓存（L1 内存）：
+// key 为 Telegram update_id，value 为首次见到时间戳；去重窗口 10 分钟。
 const seenUpdateIds = new Map();
 // v6.8.1：TG_WEBHOOK_SECRET 缺失告警，每个 isolate 只打一次
 let warnedNoWebhookSecret = false;
+
+// ================= update_id 去重（v6.8.9：L1 内存 + L2 R2 滚动窗口） =================
+// v6.6.3 起只放内存，但 Worker 天然多 isolate：webhook 同步等处理完成（最长 55 秒），
+// 逼近 Telegram 60 秒重发窗口；重发的 update 落到另一个 isolate 就会被完整重复执行
+// （Agent 任务重跑、回复重发、记忆/文档重复写入）。R2 读写强一致，用单个 key 存滚动
+// 窗口即可跨 isolate 去重，且不会像旧版 tg_update_* 那样每个 id 一个对象无限堆积。
+// R2 写失败时退化为仅内存去重 —— 不差于旧版行为。
+const TG_DEDUP_KEY = 'tg_updates_dedup';
+const TG_DEDUP_WINDOW_MS = 10 * 60 * 1000;
+const TG_DEDUP_MAX = 200;
+async function loadDedupWindow(env) {
+  try {
+    const raw = await storeGet(env, TG_DEDUP_KEY);
+    if (raw) { const p = JSON.parse(raw); if (Array.isArray(p)) return p; }
+  } catch (e) {}
+  return [];
+}
+// 返回 true 表示该 update 已在窗口内（重复投递），应直接忽略
+async function markUpdateSeen(env, uid) {
+  if (uid === undefined || uid === null) return false;
+  const now = Date.now();
+  if (seenUpdateIds.has(uid)) return true;
+  const win = await loadDedupWindow(env);
+  const fresh = win.filter(e => e && e.id !== undefined && e.id !== null && now - (e.ts || 0) < TG_DEDUP_WINDOW_MS);
+  if (fresh.some(e => e.id === uid)) {
+    seenUpdateIds.set(uid, now);
+    return true;
+  }
+  fresh.push({ id: uid, ts: now });
+  if (fresh.length > TG_DEDUP_MAX) fresh.splice(0, fresh.length - TG_DEDUP_MAX);
+  try { await storePutChecked(env, TG_DEDUP_KEY, JSON.stringify(fresh)); } catch (e) {}
+  seenUpdateIds.set(uid, now);
+  // 顺手清理内存里的过期条目，防止 Map 无限增长
+  for (const [k, t] of seenUpdateIds) { if (now - t > TG_DEDUP_WINDOW_MS) seenUpdateIds.delete(k); }
+  return false;
+}
+// v6.8.7：处理异常时释放去重标记 —— Telegram 因超时重发该 update 时还能重试
+async function releaseUpdateForRetry(env, uid) {
+  if (uid === undefined || uid === null) return;
+  seenUpdateIds.delete(uid);
+  try {
+    const win = await loadDedupWindow(env);
+    const fresh = win.filter(e => !(e && e.id === uid));
+    if (fresh.length !== win.length) await storePutChecked(env, TG_DEDUP_KEY, JSON.stringify(fresh));
+  } catch (e) {}
+}
+
+// 命令解析（v6.8.6）：兼容群组里的 /cmd@botname 写法与命令后带参数。
+// 返回 { cmd, rest }，非命令文本返回 null。
+function parseCommand(t) {
+  const m = /^(\/[a-zA-Z]+)(?:@[a-zA-Z0-9_]+)?(?:\s+([\s\S]*))?$/.exec(String(t || '').trim());
+  if (!m) return null;
+  return { cmd: m[1].toLowerCase(), rest: (m[2] || '').trim() };
+}
 
 export async function handleTgWebhook(request, env) {
   // Webhook 来源校验：配置 TG_WEBHOOK_SECRET 后，只接受携带正确
@@ -56,6 +110,10 @@ export async function handleTgWebhook(request, env) {
     // 静默掐断（pending 消息永远卡在"📄 正在读取网页…"，且无任何错误）。
     // 现在改为在请求上下文内等待处理完成再返回 OK。
     async function processTelegramUpdate(env, update, tgApi) {
+      // v6.8.9：pending「思考中」消息的善后回调 —— 创建 pending 后立即挂上，
+      // 之后任何未预期异常都能在 catch 里删掉它并把错误文本发给用户，
+      // 不再让「⏳ 正在思考」永远挂在聊天里
+      let pendingCleanup = null;
       try {
         const { models: modelObjList } = getChannelConfig(env);
         if (modelObjList.length === 0) return;
@@ -100,10 +158,10 @@ export async function handleTgWebhook(request, env) {
           if (!isChatAllowed(chatId)) return; // 不在白名单：静默忽略
           const userText = update.message.text;
 
-          // v6.8.1：精确匹配命令，避免 /startfoo 之类被误判；
-          // 兼容群组里的 /start@botname 写法
-          const isCmd = (t, cmd) => t === cmd || t.startsWith(cmd + ' ') || t.startsWith(cmd + '@');
-          if (isCmd(userText, '/start') || isCmd(userText, '/model')) {
+          // v6.8.6：用 parseCommand 统一解析 —— 精确匹配命令名（/startfoo 不再误判），
+          // 兼容群组里的 /cmd@botname 写法，命令后的参数放进 rest
+          const cmd = parseCommand(userText);
+          if (cmd && (cmd.cmd === '/start' || cmd.cmd === '/model')) {
             const inline_keyboard = modelObjList.map((model, index) => {
               return [{ text: model.name, callback_data: `M:${index}` }];
             });
@@ -117,14 +175,14 @@ export async function handleTgWebhook(request, env) {
             return;
           }
 
-          if (userText === '/clear' || userText === '/new') {
+          if (cmd && (cmd.cmd === '/clear' || cmd.cmd === '/new')) {
             await tgClearHistory(env, chatId);
             await agentClearResumeState(env, chatId);
             await tgApi('sendMessage', { chat_id: chatId, text: "🧹 上下文已清空，可以开始新的话题了。" });
             return;
           }
 
-          if (userText === '/help') {
+          if (cmd && cmd.cmd === '/help') {
             await tgApi('sendMessage', {
               chat_id: chatId,
               text: "🤖 命令列表：\n\n"
@@ -141,7 +199,7 @@ export async function handleTgWebhook(request, env) {
             return;
           }
 
-          if (userText === '/memory') {
+          if (cmd && cmd.cmd === '/memory') {
             const mems = await agentGetMemories(env, chatId);
             if (!mems.length) {
               await tgApi('sendMessage', { chat_id: chatId, text: "🧠 暂无长期记忆。\n\n对我说「记住xxx」即可保存，比如：记住，我养了一只猫叫汤圆" });
@@ -156,7 +214,7 @@ export async function handleTgWebhook(request, env) {
             return;
           }
 
-          if (userText === '/kb') {
+          if (cmd && cmd.cmd === '/kb') {
             const mems = await agentGetMemories(env, chatId);
             let text = '📚 知识库总览\n\n';
             text += '🧠 长期记忆：共' + mems.length + '条（/memory 查看，/forget 关键词 删除）\n\n';
@@ -168,8 +226,8 @@ export async function handleTgWebhook(request, env) {
             return;
           }
 
-          if (userText.startsWith('/forget')) {
-            const kw = userText.slice(7).trim();
+          if (cmd && cmd.cmd === '/forget') {
+            const kw = cmd.rest;
             if (!kw) {
               await tgApi('sendMessage', { chat_id: chatId, text: "用法：/forget 关键词\n例如：/forget 猫 —— 删除所有包含「猫」的记忆" });
             } else {
@@ -182,7 +240,7 @@ export async function handleTgWebhook(request, env) {
             return;
           }
 
-          if (userText === '/agent') {
+          if (cmd && cmd.cmd === '/agent') {
             const cur = await agentGetMode(env, chatId);
             await agentSetMode(env, chatId, !cur);
             await tgApi('sendMessage', {
@@ -219,6 +277,10 @@ export async function handleTgWebhook(request, env) {
           }).catch(() => null);
 
           const [, pendingMsgId] = await Promise.all([sendActionPromise, pendingMsgPromise]);
+          pendingCleanup = async (err) => {
+            if (pendingMsgId) tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {});
+            tgApi('sendMessage', { chat_id: chatId, text: '⚠️ 处理消息时出错：' + (err && err.message ? err.message : String(err)) }).catch(() => {});
+          };
 
           // ===== Agent 主流程：自主规划 → 工具调用 → 汇总作答 =====
           const useAgent = await agentGetMode(env, chatId);
@@ -246,8 +308,9 @@ export async function handleTgWebhook(request, env) {
                 await tgApi('editMessageText', { chat_id: chatId, message_id: pendingMsgId, text: String(text).slice(0, 4000) });
               } catch (e) {}
             };
-            // 「继续」：恢复上次暂停的任务；新问题则清掉旧暂停状态
-            const wantResume = /^继续/.test(userText.trim());
+            // 「继续」（精确匹配）：恢复上次暂停的任务；新问题则清掉旧暂停状态。
+            // 之前用 /^继续/ 前缀匹配，「继续优化这段代码」这类正常提问会被误判成恢复。
+            const wantResume = userText.trim() === '继续';
             let resumeState = null;
             if (wantResume) resumeState = await agentLoadResumeState(env, chatId);
             if (!resumeState) await agentClearResumeState(env, chatId);
@@ -256,7 +319,10 @@ export async function handleTgWebhook(request, env) {
                 return tgAgentResume(env, tgApi, chatId, {
                   targetModelId: resumeState.targetModelId || targetModelId,
                   allowTools: allowTools,
-                  messages: resumeState.messages
+                  messages: resumeState.messages,
+                  // v6.8.1：loopStartIdx 必须随存档带回，多段「继续」时
+                  // 上下文裁剪才能触及之前各段的老轮次；丢了它上下文会无限增长
+                  loopStartIdx: resumeState.loopStartIdx
                 }, onProgress, agentOpts);
               }
               return tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTools, onProgress, agentOpts);
@@ -289,7 +355,9 @@ export async function handleTgWebhook(request, env) {
               if (pendingMsgId) {
                 tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {});
               }
-              await tgApi('sendMessage', { chat_id: chatId, text: "⚠️ 此模型的 API 接口未配置或异常。" });
+              // buildAIRequest 的错误文本本身就说明了缺什么配置（API_URL / MODEL 等），
+              // 直接透传，不再吞成笼统的一句「未配置或异常」
+              await tgApi('sendMessage', { chat_id: chatId, text: '⚠️ ' + aiConfig.error });
               return;
             }
             const { apiUrl, currentApiKey, payload } = aiConfig;
@@ -329,7 +397,16 @@ export async function handleTgWebhook(request, env) {
                   await tgSaveHistory(env, chatId, history);
                 }
               } else {
-                agentErr = "⚠️ AI 接口请求失败，请稍后再试。";
+                // v6.8.9：把上游状态码与错误正文带出来 —— 只说「请求失败」
+                // 对排查 401 / 429 / 模型名写错毫无帮助；正文限长 300 字符防止刷屏
+                let diag = '';
+                if (aiResponse) {
+                  try {
+                    diag = '（HTTP ' + aiResponse.status + (aiResponse.statusText ? ' ' + aiResponse.statusText : '')
+                      + '：' + await readErrorBody(aiResponse, 300) + '）';
+                  } catch (e) {}
+                }
+                agentErr = "⚠️ AI 接口请求失败，请稍后再试。" + diag;
               }
             }
           }
@@ -383,28 +460,26 @@ export async function handleTgWebhook(request, env) {
         }
       } catch (err) {
         console.log("后台处理异常:", err);
+        if (pendingCleanup) { try { await pendingCleanup(err); } catch (e) {} }
+        // 抛给外层：释放去重标记，Telegram 因超时重发该 update 时还能重试
+        throw err;
       }
     }
 
-    // update_id 去重（v6.6.3 起改用内存，不再写 R2，避免 tg_update_* 无上限堆积）：
-    // 同一 update 10 分钟内只处理一次。处理改为在请求内等待完成，
-    // 响应变慢时 Telegram 可能重发 update，去重可避免重复执行 Agent / 重复发送回复。
-    try {
-      const uid = update && update.update_id;
-      if (uid !== undefined && uid !== null) {
-        const now = Date.now();
-        // 顺手清理过期条目（>10 分钟），防止 Map 无限增长
-        for (const [k, t] of seenUpdateIds) {
-          if (now - t > 600000) seenUpdateIds.delete(k);
-        }
-        if (seenUpdateIds.has(uid)) return new Response('OK', { status: 200 });
-        seenUpdateIds.set(uid, now);
-      }
-    } catch (e) {}
+    // update_id 去重：L1 内存 + L2 R2 滚动窗口（详见 markUpdateSeen 注释）。
+    // 同一 update 10 分钟内只处理一次。处理在请求内等待完成，响应慢时
+    // Telegram 可能重发 update，跨 isolate 去重可避免重复执行 Agent / 重复发送回复。
+    const uid = update && update.update_id;
+    if (uid !== undefined && uid !== null && await markUpdateSeen(env, uid)) {
+      return new Response('OK', { status: 200 });
+    }
 
     try {
       await processTelegramUpdate(env, update, tgApi);
     } catch (err) {
+      // v6.8.7：处理异常时释放去重标记 —— Telegram 因超时重发该 update 时还能重试，
+      // 而不是被去重挡住变成静默失败
+      await releaseUpdateForRetry(env, uid);
       console.log("处理 Telegram 更新异常:", err);
     }
 
@@ -413,3 +488,10 @@ export async function handleTgWebhook(request, env) {
     return new Response('Error', { status: 500 });
   }
 }
+
+// 供单元测试使用（纯函数与去重窗口逻辑）
+export {
+  parseCommand,
+  markUpdateSeen,
+  releaseUpdateForRetry,
+};

@@ -45,8 +45,12 @@ function toolCalculate(expr) {
     }
     const v = parseExpr();
     if (i !== s.length) throw new Error('表达式未完全解析');
-    if (!isFinite(v)) return '计算结果非法（可能除零）';
-    return '计算结果：' + String(Math.round(v * 1e10) / 1e10);
+    if (!isFinite(v)) return '计算结果非法（可能除零或结果溢出）';
+    // v6.8.6：只对常规量级做 1e10 舍入。旧版无差别舍入会把 1e-12 舍成 0、
+    // 把 1e308 级结果乘 1e10 后溢出成 Infinity 显示出来
+    const av = Math.abs(v);
+    const out = (av >= 1e-6 && av < 1e15) ? Math.round(v * 1e10) / 1e10 : v;
+    return '计算结果：' + String(out);
   } catch (e) { return '计算失败: ' + e.message; }
 }
 
@@ -61,16 +65,28 @@ function toolGetTime(timezone) {
   } catch (e) { return '时区无效: ' + tz; }
 }
 
+// v6.8.6：外部 JSON 请求统一带独立超时。之前天气两次 fetch 都是裸调用，
+// 只能靠工具层 30 秒 race 兜底，而 race 并不会真正取消挂住的连接
+async function fetchJson(url, timeoutMs) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs || 12000);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    return await res.json();
+  } finally { clearTimeout(timer); }
+}
+
 async function toolGetWeather(city) {
   city = String(city || '').trim();
   if (!city) return '城市名为空';
   try {
-    const g = await (await fetch('https://geocoding-api.open-meteo.com/v1/search?name=' + encodeURIComponent(city) + '&count=1&language=zh&format=json')).json();
+    const g = await fetchJson('https://geocoding-api.open-meteo.com/v1/search?name=' + encodeURIComponent(city) + '&count=1&language=zh&format=json');
     if (!g.results || !g.results.length) return '找不到城市：' + city;
     const loc = g.results[0];
-    const w = await (await fetch('https://api.open-meteo.com/v1/forecast?latitude=' + loc.latitude + '&longitude=' + loc.longitude +
+    const w = await fetchJson('https://api.open-meteo.com/v1/forecast?latitude=' + loc.latitude + '&longitude=' + loc.longitude +
       '&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m' +
-      '&daily=temperature_2m_max,temperature_2m_min,weather_code&timezone=auto&forecast_days=2')).json();
+      '&daily=temperature_2m_max,temperature_2m_min,weather_code&timezone=auto&forecast_days=2');
     const wm = { 0: '晴', 1: '大致晴', 2: '多云', 3: '阴', 45: '雾', 48: '雾凇', 51: '毛毛雨', 53: '毛毛雨', 55: '毛毛雨', 61: '小雨', 63: '中雨', 65: '大雨', 71: '小雪', 73: '中雪', 75: '大雪', 80: '阵雨', 81: '阵雨', 82: '暴雨', 95: '雷阵雨' };
     const c = w.current, d = w.daily;
     let t = loc.name + '（' + (loc.country || '') + '）当前：' + (wm[c.weather_code] || '未知') +

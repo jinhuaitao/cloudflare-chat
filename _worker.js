@@ -6,6 +6,7 @@ import { safeEqual } from './src/utils.js';
 import { denyUnauthorized } from './src/auth.js';
 import { hitRateLimit } from './src/rate-limit.js';
 import { getChannelConfig, buildAIRequest } from './src/channel.js';
+import { readErrorBody } from './src/agent/stability.js';
 import { storeDelete } from './src/store/r2.js';
 import { agentMemKey, kbDeleteMemDir } from './src/store/kb.js';
 import { handleWebAgent } from './src/web-agent.js';
@@ -17,8 +18,15 @@ import { SW_JS } from './src/pwa/service-worker.js';
 import { getPwaVersion } from './src/pwa/version.js';
 import { HTML_CONTENT } from './src/ui/index.js';
 
-export default {
-  async fetch(request, env, ctx) {
+// v6.8.9：CORS 收紧（可选）。配置 CORS_ORIGIN（如 https://chat.example.com，
+// 逗号分隔可多个）后，Access-Control-Allow-Origin 只回显名单内的 Origin，
+// 名单外的跨站请求拿不到 CORS 头 —— 别的网站即使拿到了泄露的访问令牌，
+// 也无法从浏览器直接调用 /api/chat。未配置时保持 *，与旧部署完全兼容。
+// 在 fetch 顶层统一改写，覆盖包括 web-agent / auth 等所有子模块的响应。
+async function routeRequest(request, env, ctx) {
+  // 顶层兜底：任何路由内未捕获的异常都以 JSON 500 返回，
+  // 而不是让 Worker 直接崩成 Cloudflare 的 1101 错误页（前端无从显示原因）
+  try {
     const url = new URL(request.url);
 
     // 域名所有权验证文件（某第三方平台验证用，路径与内容固定；若不再需要可删除本段）
@@ -57,6 +65,13 @@ export default {
     if (request.method === 'DELETE' && url.pathname === '/api/web-memory') {
       const denied = denyUnauthorized(env, request);
       if (denied) return denied;
+
+      // v6.8.9：删除接口同样限流 —— 否则可无限高频试探 session_id 爆破删除他人记忆
+      if (hitRateLimit(request, env)) {
+        return new Response(JSON.stringify({ error: "请求过于频繁，请稍后再试", code: "RATE_LIMITED" }), {
+          status: 429, headers: CORS_HEADERS,
+        });
+      }
 
       const sid = String(url.searchParams.get('session_id') || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
       if (!sid) {
@@ -111,7 +126,8 @@ export default {
         });
 
         if (!upstreamResponse.ok) {
-          const errText = await upstreamResponse.text();
+          // v6.8.7：错误正文限长读取 —— 上游偶发返回超大 HTML 错误页时不再整段读入
+          const errText = await readErrorBody(upstreamResponse, 2048);
           return new Response(JSON.stringify({ error: `API 报错 (${upstreamResponse.status}):${errText}` }), {
             status: upstreamResponse.status,
             headers: CORS_HEADERS,
@@ -176,5 +192,25 @@ export default {
     }
 
     return new Response('Not Found', { status: 404 });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: error && error.message ? error.message : String(error) }), { status: 500, headers: CORS_HEADERS });
   }
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    const res = await routeRequest(request, env, ctx);
+    if (!env || !env.CORS_ORIGIN) return res;
+    if (!res.headers.has('Access-Control-Allow-Origin')) return res;
+    const allowed = String(env.CORS_ORIGIN).split(',').map(s => s.trim()).filter(Boolean);
+    const origin = request.headers.get('Origin');
+    const h = new Headers(res.headers);
+    if (origin && allowed.includes(origin)) {
+      h.set('Access-Control-Allow-Origin', origin);
+      h.set('Vary', 'Origin');
+    } else {
+      h.delete('Access-Control-Allow-Origin');
+    }
+    return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h });
+  },
 };

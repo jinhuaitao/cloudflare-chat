@@ -106,9 +106,23 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
   if (!(maxTokens > 0)) maxTokens = 16384;
   if (maxTokens > 32000) maxTokens = 32000;
 
+  // v6.8.9：图片通道取最后一条消息的纯文本。之前直接
+  // messagesArray[len-1].content —— 空数组会 TypeError，多模态 content（分片数组）
+  // 会把整个对象塞进 prompt，上游必然报错
+  let lastPrompt = '';
+  const lastMsg = messagesArray[messagesArray.length - 1];
+  if (lastMsg) {
+    if (typeof lastMsg.content === 'string') {
+      lastPrompt = lastMsg.content;
+    } else if (Array.isArray(lastMsg.content)) {
+      const seg = lastMsg.content.find(s => s && s.type === 'text' && typeof s.text === 'string');
+      lastPrompt = seg ? seg.text : '';
+    }
+  }
+
   const payload = isImageAPI ? {
     model: selectedModel,
-    prompt: messagesArray[messagesArray.length - 1].content,
+    prompt: lastPrompt,
     n: 1
   } : {
     model: selectedModel,

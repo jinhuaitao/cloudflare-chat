@@ -66,7 +66,8 @@ export default `  function renderSessionList() {
       } else {
         isCurrentlyStreaming = false;
         bubble.innerHTML = '<div class="message-text markdown-body">' + safeHtml(content) + '</div>';
-        bubble.querySelectorAll('pre code').forEach((block) => hljs.highlightElement(block));
+        // hljs 为 CDN 依赖，缺失时跳过高亮（代码块仍显示转义后的纯文本）
+        if (window.hljs) bubble.querySelectorAll('pre code').forEach((block) => { try { hljs.highlightElement(block); } catch (e) {} });
         // 复制按钮要的是原始 Markdown，不是渲染后的 HTML
         bubble.__rawText = content;
       }

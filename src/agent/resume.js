@@ -1,6 +1,6 @@
 // Agent 断点续做：ReAct 循环状态存档（_worker.js 原第 1280-1309 行）
 
-import { storeGet, storePut, storeDelete } from '../store/r2.js';
+import { storeGet, storePutChecked, storeDelete } from '../store/r2.js';
 
 // ==================== Agent 断点续做 ====================
 // webhook 内单轮预算约 55 秒（Telegram 约 60 秒无响应会重发 update；
@@ -10,10 +10,9 @@ import { storeGet, storePut, storeDelete } from '../store/r2.js';
 function tgAgentResumeKey(chatId) { return 'tg_agent_' + chatId; }
 async function agentSaveResumeState(env, chatId, state) {
   if (!env.R2) return false;
-  try {
-    await storePut(env, tgAgentResumeKey(chatId), JSON.stringify(state));
-    return true;
-  } catch (e) { return false; }
+  // v6.8.9：改用 checked 写入。旧版经 storePut 转发，而 storePut 静默吞错，
+  // 这里永远返回 true —— 断点实际没存上时仍告诉用户「发送继续可接着做」
+  return await storePutChecked(env, tgAgentResumeKey(chatId), JSON.stringify(state));
 }
 async function agentLoadResumeState(env, chatId) {
   const raw = await storeGet(env, tgAgentResumeKey(chatId));

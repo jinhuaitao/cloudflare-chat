@@ -2,7 +2,7 @@
 
 import { buildAIRequest } from '../channel.js';
 import { parseDSMLToolCalls, stripDSMLBlocks } from './dsml.js';
-import { truncateToolResult, toolCallSignature, trimAgentMessages } from './stability.js';
+import { truncateToolResult, readErrorBody, toolCallSignature, trimAgentMessages } from './stability.js';
 import { agentLimits, describeToolCall } from './limits.js';
 import { agentSaveResumeState } from './resume.js';
 import { readUpstreamMessage } from './upstream.js';
@@ -137,7 +137,8 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
     }
 
     if (!resp.ok) {
-      const t = await resp.text().catch(() => '');
+      // v6.8.7：错误体预算读取（2KB），超大错误页不再整段读入
+      const t = await readErrorBody(resp, 2048);
       // 降级判定：通道不支持 tools 时的报错五花八门（Invalid parameter: functions、
       // unsupported parameter、400 Bad Request…），只认 "tool" 关键词会漏判，
       // 用户就会拿到一个红色 API 报错而不是自动降级。首步拿到 4xx 一律先降级成

@@ -23,7 +23,18 @@ async function agentGetMemories(env, chatId) {
     }
   }
   if (raw) {
-    try { const p = JSON.parse(raw); if (Array.isArray(p)) arr = p; } catch (e) {}
+    try {
+      const p = JSON.parse(raw);
+      if (Array.isArray(p)) {
+        // v6.8.6 索引校验：过滤脏条目（非对象 / fact 缺失或非字符串），
+        // 防止手改或历史 bug 留下的坏数据把 Agent 记忆整体搞挂
+        const clean = p.filter(m => m && typeof m.fact === 'string' && m.fact);
+        if (clean.length !== p.length) {
+          try { await storePutChecked(env, agentMemKey(chatId), JSON.stringify(clean)); } catch (e) {}
+        }
+        arr = clean;
+      }
+    } catch (e) {}
   }
   // v6.6.7：回补 md 镜像 —— 老条目自动分配文件名并建 md；控制台误删的 md 也会按索引重建
   try {
