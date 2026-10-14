@@ -189,7 +189,7 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
     agentToggle.classList.toggle('active', agentMode);
     agentToggle.textContent = agentMode ? '🤖 Agent 开' : '🤖 Agent';
     agentToggle.title = agentMode
-      ? 'Agent 模式已开启：自主规划并调用工具（🔍 搜索 / 📄 网页 / 🧮 计算 / 🌤 天气 / 🕐 时间），长期记住你告诉它的事。点击关闭。'
+      ? 'Agent 模式已开启：自主规划并调用工具（🔍 搜索 / 📄 网页 / 🧮 计算 / 🌤 天气 / 🕐 时间），回答优先查知识库文档，长期记住你告诉它的事。点击关闭。'
       : 'Agent 模式已关闭：普通对话，不调用工具。点击开启。';
   }
   if (agentToggle) {

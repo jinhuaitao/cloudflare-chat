@@ -19,10 +19,10 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-// 6.9.0 为本地补丁线的界面升级版：在 6.8.9 修复线之上叠加
-// 空状态示例卡片、消息时间戳、回到底部按钮、对话导出等体验增强。
-// 上游仓库无此版本；发 /help 看到 6.9.0 即说明部署的是打过补丁的构建。
-const APP_VERSION = '6.9.0';
+// 6.9.1 为本地补丁线的知识库优先版：Web 端 Agent 查询把知识库文档列表
+// 注入系统提示词并确立"知识库优先"的回答顺序；同时移除 6.9.0 的对话导出按钮。
+// 上游仓库无此版本；发 /help 看到 6.9.1 即说明部署的是打过补丁的构建。
+const APP_VERSION = '6.9.1';
 const PNG_HEADERS = {
   'Content-Type': 'image/png',
   'Cache-Control': 'public, max-age=86400',

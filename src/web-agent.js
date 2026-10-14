@@ -45,6 +45,8 @@ async function handleWebAgent(env, body) {
       // agent_reset 用于撤回被判定为"工具调用开场白"或 DSML 标记的中间文本。
       const webOpts = {
         maxRuntimeMs: webBudgetMs,
+        // Web 端查询优先知识库：文档列表注入系统提示词（loop.js 读取此标记）
+        kbFirst: true,
         onDelta: async (text, kind) => {
           if (kind === 'reasoning') send({ choices: [{ delta: { reasoning_content: text } }] });
           else send({ choices: [{ delta: { content: text } }] });

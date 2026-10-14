@@ -9,6 +9,7 @@ import { readUpstreamMessage } from './upstream.js';
 import { getAgentTools, execAgentTool } from './tools.js';
 import { agentGetMemories } from './memory.js';
 import { buildAgentSystemPrompt } from './prompt.js';
+import { kbGetRegistry } from '../kb/registry.js';
 
 function tgAgentDeadline(env, opts) {
   let timeoutMs = agentLimits(env).timeoutMs;
@@ -21,7 +22,14 @@ function tgAgentDeadline(env, opts) {
 async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTools, onProgress, opts) {
   const query = history.length ? String(history[history.length - 1].content || '') : '';
   const memories = await agentGetMemories(env, chatId);
-  const systemPrompt = buildAgentSystemPrompt(memories, query);
+  // Web 端（opts.kbFirst）查询优先知识库：把文档注册表注入系统提示词，
+  // 让模型开局就看到全部标题并按"知识库优先"作答，不依赖它自觉先调 list_docs。
+  // 注册表读取失败不阻断对话，按"无知识库"处理。
+  let kbDocs = null;
+  if (opts && opts.kbFirst) {
+    try { kbDocs = await kbGetRegistry(env); } catch (e) { kbDocs = null; }
+  }
+  const systemPrompt = buildAgentSystemPrompt(memories, query, kbDocs);
   const tools = allowTools ? getAgentTools() : null;
   const messages = [{ role: 'system', content: systemPrompt }];
   for (const m of history) messages.push({ role: m.role, content: m.content });

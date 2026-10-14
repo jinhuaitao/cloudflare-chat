@@ -1,12 +1,12 @@
 # Cloudflare-Chat
 
-基于 Cloudflare Workers 的多通道 AI 对话前端 + Telegram 机器人。单文件 Worker（`_worker.js`），通过 `wrangler.toml` 声明式配置，支持连接 GitHub 仓库自动构建部署。当前版本 v6.8.9。
+基于 Cloudflare Workers 的多通道 AI 对话前端 + Telegram 机器人。单文件 Worker（`_worker.js`），通过 `wrangler.toml` 声明式配置，支持连接 GitHub 仓库自动构建部署。当前版本 v6.9.1。
 
 ## 功能一览
 
 - **多通道 AI 对话前端**：网页聊天 UI，支持多模型 / 多通道（OpenAI、通义千问、DeepSeek 等兼容 OpenAI 接口的通道），PWA 可安装，支持离线打开外壳
 - **Telegram 机器人**：多轮对话（默认记 10 轮）、`/model` 内联按钮切换模型
-- **Agent 模式**（默认开启，Web 与 Telegram 共用）：ReAct 循环自主规划，10 个零密钥工具 —— 🔍 联网搜索、📄 网页抓取、🧮 精确计算、🌤 天气、🕐 时间、🧠 长期记忆、💾 知识库文档保存、📚📖🗑️ 文档检索与删除
+- **Agent 模式**（默认开启，Web 与 Telegram 共用）：ReAct 循环自主规划，10 个零密钥工具 —— 🔍 联网搜索、📄 网页抓取、🧮 精确计算、🌤 天气、🕐 时间、🧠 长期记忆、💾 知识库文档保存、📚📖🗑️ 文档检索与删除；Web 端查询优先知识库（文档列表自动注入提示词，相关必读、内容以其为准）
 - **知识库**：长期记忆（`remember`）+ 知识库文档（`save_doc`），全部持久化在 R2 的 `kb/` 独立文件夹
 - **语音朗读**：浏览器原生语音合成，零成本、零密钥
 
@@ -17,11 +17,12 @@
 - 至少一个兼容 OpenAI 接口格式的 API 通道（OpenAI、通义千问、DeepSeek 等均可）
 
 ---
+
 # 部署
 
 ## 方式一
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/jinhuaitao/cloudflare-chat)
+![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)
 
 ## 方式二
 
@@ -38,7 +39,7 @@
 9. **构建命令** (Build command) 留空；**部署命令** (Deploy command) 保持默认的 `npx wrangler deploy`。
 10. 点击 **保存并部署** (Save and deploy)。
 
-> 项目根目录已包含 `wrangler.toml` 和 `package.json`，构建设置会被自动接管，无需额外配置。
+> 项目根目录已包含 `wrangler.toml` 和 `package.json`，构建设置会被自动接管，无需额外配置。  
 > `package.json` 中锁定了 `wrangler ^4.0.0`，请勿删除 —— Workers Builds 会优先使用这里声明的 Wrangler 版本，版本过旧会导致下面的 R2 自动置备失败。
 
 ---
@@ -115,7 +116,7 @@ bucket_name = "cloudflare-chat-r2"
 2. 点击 **设置** (Settings) → **变量和机密** (Variables and Secrets)。
 3. 在 **环境变量** 区域点击 **添加**。
 
-> `wrangler.toml` 中已设置 `keep_vars = true`，控制台里手动添加的变量在后续部署时不会被清空。
+> `wrangler.toml` 中已设置 `keep_vars = true`，控制台里手动添加的变量在后续部署时不会被清空。  
 > 但注意：**添加或修改变量后必须重新部署一次**，新配置才会生效，新的模型列表也会随之出现在前端下拉框中。
 
 ### 多模型 / 多通道配置
@@ -205,26 +206,27 @@ https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=https://<你的Work
 
 **可用工具**（全部零密钥、零成本）：
 
-| 工具 | 能力 | 示例触发 |
-|---|---|---|
-| `web_search` | 联网搜索最新信息（DuckDuckGo） | "今天有什么 AI 大新闻？" |
-| `web_fetch` | 抓取网页正文并总结 | "总结一下这篇文章：<链接>" |
-| `calculate` | 精确数学计算（自研解析器，拒绝注入） | "帮我算 (3280-1299)*1.13" |
-| `get_time` | 当前时间（可指定时区） | "现在几点了" |
-| `get_weather` | 城市天气 + 今明两天预报（Open-Meteo） | "北京明天适合跑步吗" |
-| `remember` | 长期记住关于你的事实（R2 持久化，不限条数） | "记住，我养了一只猫叫汤圆" |
-| `save_doc` | 把长篇内容保存为知识库文档（真实写入 R2 `kb/docs/`，同链接自动去重） | "把这篇文章存成知识库文档" |
-| `list_docs` | 列出知识库文档标题 | （自动调用） |
-| `read_doc` | 按标题关键词读取知识库文档全文 | （自动调用） |
-| `delete_doc` | 删除一篇知识库文档 | "删除知识库文档《甲骨文ARM》" |
+| 工具            | 能力                                        | 示例触发                   |
+| ------------- | ----------------------------------------- | ---------------------- |
+| `web_search`  | 联网搜索最新信息（DuckDuckGo）                      | "今天有什么 AI 大新闻？"        |
+| `web_fetch`   | 抓取网页正文并总结                                 | "总结一下这篇文章：<链接>"        |
+| `calculate`   | 精确数学计算（自研解析器，拒绝注入）                        | "帮我算 (3280-1299)*1.13" |
+| `get_time`    | 当前时间（可指定时区）                               | "现在几点了"                |
+| `get_weather` | 城市天气 + 今明两天预报（Open-Meteo）                 | "北京明天适合跑步吗"            |
+| `remember`    | 长期记住关于你的事实（R2 持久化，不限条数）                   | "记住，我养了一只猫叫汤圆"         |
+| `save_doc`    | 把长篇内容保存为知识库文档（真实写入 R2 `kb/docs/`，同链接自动去重） | "把这篇文章存成知识库文档"         |
+| `list_docs`   | 列出知识库文档标题                                 | （自动调用）                 |
+| `read_doc`    | 按标题关键词读取知识库文档全文                           | （自动调用）                 |
+| `delete_doc`  | 删除一篇知识库文档                                 | "删除知识库文档《甲骨文ARM》"      |
 
 **工作方式**：ReAct 循环 —— 模型先判断意图，简单问题直接回答；需要时自主规划多步（比如先搜索再抓取原文、先计算再汇总），最多 6 步，工具结果回填后综合作答，绝不编造。
 
 **记忆**：短期记忆是多轮对话历史；长期记忆是你明确告知的事实（`remember`，每条不超过 200 字，不限条数），每次对话按相关性自动注入，无需重复介绍自己。
 
-**知识库文档**：`save_doc` 专门用来存长篇内容（如"抓取这篇文章并生成知识库文档"），同名保存即覆盖更新并会明确提示。只有工具真正返回成功，机器人才会告诉你"已保存"；`remember` 存不下整篇文章，不要混用。**同一网址只保存一次**：换标题重复保存会被拒绝（指引你用原标题覆盖或先删除），标题仅差空格也会归一为同一文件名。所有文档在 `kb/docs/registry.json` 注册表里统一登记，去重/列表/删除都走注册表。提问时若问题可能涉及知识库文档主题，机器人会先 `list_docs` 看标题、再 `read_doc` 细读（标题想不起来时会自动搜正文），**文档内容优先引用**并注明出处；`delete_doc` 可删除文档，`/kb` 可查看知识库总览。
+**知识库文档**：`save_doc` 专门用来存长篇内容（如"抓取这篇文章并生成知识库文档"），同名保存即覆盖更新并会明确提示。只有工具真正返回成功，机器人才会告诉你"已保存"；`remember` 存不下整篇文章，不要混用。**同一网址只保存一次**：换标题重复保存会被拒绝（指引你用原标题覆盖或先删除），标题仅差空格也会归一为同一文件名。所有文档在 `kb/docs/registry.json` 注册表里统一登记，去重/列表/删除都走注册表。提问时**文档内容优先引用**并注明出处：Web 端（v6.9.1 起）每轮对话都会把文档标题列表直接注入系统提示词，模型开局即见全部标题，相关问题必须先 `read_doc` 读原文再作答，知识库内容优先于训练知识与网络搜索；Telegram 端则由模型按需先 `list_docs` 看标题、再 `read_doc` 细读（标题想不起来时会自动搜正文）。`delete_doc` 可删除文档，`/kb` 可查看知识库总览。
 
 **命令**：
+
 - `/agent` —— 在 Agent / 普通对话模式间切换（选择保存在 R2，默认 Agent 开启）
 - `/model` —— 切换模型；`/clear` —— 清空上下文
 - `/memory` —— 查看长期记忆；`/forget 关键词` —— 删除记忆；`/kb` —— 知识库总览（文档列表 + 记忆统计）；`/help` —— 命令列表
@@ -253,26 +255,26 @@ https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=https://<你的Work
 
 前端已具备完整的 PWA 能力，可以像原生 App 一样安装到桌面 / 主屏幕，并支持离线打开。
 
-| 能力 | 实现 |
-| --- | --- |
+| 能力               | 实现                                                                        |
+| ---------------- | ------------------------------------------------------------------------- |
 | Web App Manifest | `GET /manifest.webmanifest`，`display: standalone`，含 192/512 + maskable 图标 |
-| Service Worker | `GET /sw.js`，挂在根路径，`Service-Worker-Allowed: /`、`Cache-Control: no-cache` |
-| 图标 | `GET /icon-192.png`、`/icon-512.png`、`/icon-maskable-512.png` |
-| 健康探针 | `GET /healthz`，供前端与 SW 判断服务端是否可达 |
-| 安装入口 | 侧边栏左下角的下载图标，浏览器判定可安装后自动出现 |
-| 离线提示 | 顶部橙色横幅，断网时滑入，恢复后自动消失 |
+| Service Worker   | `GET /sw.js`，挂在根路径，`Service-Worker-Allowed: /`、`Cache-Control: no-cache`  |
+| 图标               | `GET /icon-192.png`、`/icon-512.png`、`/icon-maskable-512.png`              |
+| 健康探针             | `GET /healthz`，供前端与 SW 判断服务端是否可达                                          |
+| 安装入口             | 侧边栏左下角的下载图标，浏览器判定可安装后自动出现                                                 |
+| 离线提示             | 顶部橙色横幅，断网时滑入，恢复后自动消失                                                      |
 
 **图标以 base64 内嵌在 `_worker.js` 里，运行时解码**，不引入任何静态资源文件 —— 这样「单文件 Worker、无额外构建产物、直接连 Git 部署」的方式完全不受影响。
 
 ### 缓存策略
 
-| 请求类型 | 策略 |
-| --- | --- |
-| 页面导航（`/`） | network-first，断网回退到缓存的应用外壳 |
-| 同源静态资源（图标 / manifest） | cache-first |
-| 第三方 CDN（marked、highlight.js、Google Fonts） | stale-while-revalidate |
-| `/api/*`、`/tg-webhook` | **完全放行，绝不缓存** |
-| `/healthz` | **完全放行，绝不缓存**（关键，见下） |
+| 请求类型                                      | 策略                         |
+| ----------------------------------------- | -------------------------- |
+| 页面导航（`/`）                                 | network-first，断网回退到缓存的应用外壳 |
+| 同源静态资源（图标 / manifest）                     | cache-first                |
+| 第三方 CDN（marked、highlight.js、Google Fonts） | stale-while-revalidate     |
+| `/api/*`、`/tg-webhook`                    | **完全放行，绝不缓存**              |
+| `/healthz`                                | **完全放行，绝不缓存**（关键，见下）       |
 
 > `/healthz` 必须显式绕过缓存。若 SW 缓存了它，探针会被缓存应答 → 永远「探测成功」→ 离线横幅的自动重连逻辑形同虚设。
 
@@ -301,6 +303,7 @@ https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=https://<你的Work
 **Agent 说"已保存"但 R2 里看不到知识库文档**
 
 按顺序排查：
+
 1. 先确认部署的版本：给机器人发 `/help`，看版本号是不是 v6.8.9+。v6.8.2 及更早版本在 R2 未绑定时会谎称"已保存"（v6.8.3 起会明确报错）；v6.8.3 及更早版本在**并发保存或注册表写入失败时仍可能"已保存但查不到"**（v6.8.4 起注册表写入失败会如实报错，不再静默吞错）。
 2. 给机器人发 `/kb`：如果回复"R2 未绑定"，说明 Worker 没有 R2 绑定——去 Cloudflare 控制台 Workers & Pages → 你的 Worker → 设置 → 绑定，确认 R2 存储桶已绑定（变量名必须是 `R2`），然后重新部署。
 3. R2 控制台确认 bucket 里有 `kb/docs/` 前缀的对象。注意文件名是标题去掉空格和特殊字符后的结果（如标题"甲骨文云 ARM"存为 `甲骨文云ARM.md`），用 `/kb` 看到的标题列表为准。**如果 R2 里有文件但 `/kb` / `list_docs` 看不到**：说明注册表丢了该条目（旧版本并发 bug），直接删除 `kb/docs/registry.json`，下一次列表操作会自动扫描重建。
@@ -309,6 +312,7 @@ https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=https://<你的Work
 **Agent 进度条卡在"💾 正在保存文档"（或其它工具进度）不动**
 
 v6.8.5 之前的进度显示 bug，不是真的卡死：工具本身执行很快（save_doc 实测 8 万字只要十几毫秒），但"第 N+1 步"的"思考中"标签会被上一步工具进度的节流吞掉，界面就 frozen 在上一步。Agent 实际已在下一步等待上游 LLM——推理模型处理长文时单步可达数分钟，期间只显示 typing 状态。v6.8.5 起步骤标签走独立节流通道，不会再被吞。单个工具另有 30 秒超时保护，不会无限执行；如果 5 分钟以上毫无动静，去 Cloudflare 实时日志看上游接口是否报错。
+
 
 **部署日志报 `Missing id` 或要求交互式输入**
 
@@ -400,21 +404,34 @@ const rx = p => p.split('@').join(BS);   // 用 @ 占位，运行时展开成反
 
 # 附：环境变量一览
 
-| 变量 | 说明 | 默认值 |
-|---|---|---|
-| `TG_WEBHOOK_SECRET` | Telegram webhook 校验密钥，见第四步 | 未配置=不校验 |
-| `TG_ALLOWED_CHAT_IDS` | Telegram 聊天白名单（逗号分隔），只响应名单内的聊天 | 未配置=开放 |
-| `TG_HISTORY_ROUNDS` | 机器人记住的最近对话轮数（最大 30） | `10` |
-| `MAX_TOKENS` | `/api/chat` 与机器人共用的 `max_tokens`（上限 32000） | `4096` |
-| `RATE_LIMIT_PER_MIN` | 每 IP 每分钟 `/api/chat` 限额，`0` 关闭 | `60` |
-| `AGENT_MAX_STEPS` | Agent 单轮任务最大推理步数（上限 12） | `6` |
-| `AGENT_TIMEOUT_MS` | Agent 单轮任务总超时（毫秒） | `240000`（4 分钟） |
-| `AGENT_TOOL_TIMEOUT_MS` | 单个工具最长执行时间（毫秒） | `30000`（30 秒） |
-| `AGENT_CONTEXT_BUDGET` | Agent 单轮任务上下文字符预算，超预算裁剪本轮旧 tool 轮次（v6.8.1 起断点续做「继续」时也会裁剪，不再无限增长） | `24000` |
-| `WEB_AGENT_TIMEOUT_MS` | 网页端 Agent 单轮任务总超时（毫秒），10 秒 ~ 240 秒。Web 是浏览器长连接，不需要 Telegram 的 55 秒妥协，单独给一个更短的预算 | `90000`（90 秒） |
-| `AGENT_STREAM_UPSTREAM` | 设为 `0` 可关闭 Agent 真流式，退回「等整段生成完再显示」。仅在通道不支持「流式 + tools」组合时需要 | 未配置=开启流式 |
-| `TG_API_TIMEOUT_MS` | Telegram Bot API 单次调用超时（毫秒） | `15000`（15 秒） |
-| `TG_WEBHOOK_BUDGET_MS` | webhook 内 Agent 单轮预算（毫秒），10 秒 ~ 240 秒 | `55000`（55 秒） |
-| `CORS_ORIGIN` | 跨域白名单（逗号分隔的完整 Origin，如 `https://chat.example.com`）；配置后 CORS 只放行名单内来源 | 未配置=`*` |
+| 变量                      | 说明                                                                              | 默认值            |
+| ----------------------- | ------------------------------------------------------------------------------- | -------------- |
+| `TG_WEBHOOK_SECRET`     | Telegram webhook 校验密钥，见第四步                                                      | 未配置=不校验        |
+| `TG_ALLOWED_CHAT_IDS`   | Telegram 聊天白名单（逗号分隔），只响应名单内的聊天                                                  | 未配置=开放         |
+| `TG_HISTORY_ROUNDS`     | 机器人记住的最近对话轮数（最大 30）                                                             | `10`           |
+| `MAX_TOKENS`            | `/api/chat` 与机器人共用的 `max_tokens`（上限 32000）                                      | `4096`         |
+| `RATE_LIMIT_PER_MIN`    | 每 IP 每分钟 `/api/chat` 限额，`0` 关闭                                                  | `60`           |
+| `AGENT_MAX_STEPS`       | Agent 单轮任务最大推理步数（上限 12）                                                         | `6`            |
+| `AGENT_TIMEOUT_MS`      | Agent 单轮任务总超时（毫秒）                                                               | `240000`（4 分钟） |
+| `AGENT_TOOL_TIMEOUT_MS` | 单个工具最长执行时间（毫秒）                                                                  | `30000`（30 秒）  |
+| `AGENT_CONTEXT_BUDGET`  | Agent 单轮任务上下文字符预算，超预算裁剪本轮旧 tool 轮次（v6.8.1 起断点续做「继续」时也会裁剪，不再无限增长）                | `24000`        |
+| `WEB_AGENT_TIMEOUT_MS`  | 网页端 Agent 单轮任务总超时（毫秒），10 秒 ~ 240 秒。Web 是浏览器长连接，不需要 Telegram 的 55 秒妥协，单独给一个更短的预算 | `90000`（90 秒）  |
+| `AGENT_STREAM_UPSTREAM` | 设为 `0` 可关闭 Agent 真流式，退回「等整段生成完再显示」。仅在通道不支持「流式 + tools」组合时需要                     | 未配置=开启流式       |
+| `TG_API_TIMEOUT_MS`     | Telegram Bot API 单次调用超时（毫秒）                                                     | `15000`（15 秒）  |
+| `TG_WEBHOOK_BUDGET_MS`  | webhook 内 Agent 单轮预算（毫秒），10 秒 ~ 240 秒                                           | `55000`（55 秒）  |
+| `CORS_ORIGIN`           | 跨域白名单（逗号分隔的完整 Origin，如 `https://chat.example.com`）；配置后 CORS 只放行名单内来源            | 未配置=`*`        |
 
 ---
+
+---
+
+# 附：版本更新记录
+
+- **v6.9.1**（知识库优先）：Web 端 Agent 查询优先知识库——每轮对话把 R2 知识库文档注册表（标题 + 来源，最多 60 篇 / 3000 字符）确定性地注入系统提示词，不依赖模型自觉先调 `list_docs`；提示词同时确立优先级：问题与任一文档相关 → 必须先 `read_doc` 读原文、以其内容为准作答并注明"据知识库文档《标题》"，知识库内容优先于训练知识与网络搜索（冲突时以知识库为准，用户明确要求最新信息时除外），无相关文档才走常规流程；注册表读取失败按"无知识库"处理，不阻断对话；Telegram 路径保持原行为。另：移除 v6.9.0 的侧边栏对话导出按钮。
+- **v6.9.0**（界面与体验升级）：空状态新增示例提问卡片（点击填入输入框，不直接发送，留出修改余地）；消息操作行显示时间戳（悬停可见，提示含完整日期），会话数据新增可选 `t` 字段，旧数据没有该字段也能正常渲染；新增「回到底部」悬浮按钮，向上翻历史时流式输出不再把滚动位置拽回底部（发送 / 切换会话自动复位）；视觉打磨——激活会话左侧强调条、品牌名与空状态标题渐变文字、发送按钮渐变、主题切换全局色彩过渡动画；`prefers-reduced-motion` 下自动关闭动效；构建上游请求时只透传标准字段、剥离本地附加字段（时间戳等），严格校验参数的上游不再整单 400。
+- **v6.8.9**（本地补丁版：补齐 + 加固）：先把上游 v6.8.6 / v6.8.7 的修复真正落到本分支（SSRF 三洞——重定向逐跳校验、IPv4 映射 IPv6 压缩形式、FQDN 尾点；`web_fetch` 流式限长防 OOM；DDG 搜索解析错位；计算器溢出；天气超时；DSML 截断容忍；限流淘汰；emoji 截断；错误体预算；去重异常释放；`@botname` 命令兼容；「继续」精确匹配）。在此之上新增：Telegram `update_id` 跨 isolate 去重（L1 内存 + R2 滚动窗口——webhook 同步处理逼近 60 秒重发窗口，重发落到别的 isolate 也不会重复执行 Agent / 重复发回复）；断点续做带回 `loopStartIdx`（多段「继续」上下文不再无限增长）；断点存档改 `storePutChecked`（保存失败不再谎称"发送继续可接着做"）；TG 历史超预算成对裁剪（不再出现 assistant 开头的非法序列）；图片通道空消息 / 多模态 `content` 不再 TypeError；限流满 5000 改为淘汰最旧一半（不再整体清零 fail-open）；`/api/chat` 上游错误体限长读取并把状态码带进错误文本；可选 `CORS_ORIGIN` 收紧跨域；`/api/web-memory` 纳入限流；异常时清理 Telegram"思考中"消息并释放去重标记；Web 会话 id 加随机后缀 + 会话数上限 50；前端 marked / highlight.js CDN 加载失败时整页降级为纯文本渲染，不再因一个 CDN 挂掉而瘫痪。
+- **v6.8.7**（打磨）：限流 `clear()` 改淘汰最旧条目 + 过期 key 删除（高并发下不再 fail-open）；DSML 参数解析容忍 `max_tokens` 截断（最后一个参数不再静默丢失）；工具结果截断不在 emoji 代理对中间切断；上游错误响应体带 2KB 预算读取；Telegram 更新处理异常时删除去重标记以便重发重试。
+- **v6.8.6**（全量审计修复 25 项）：SSRF 三洞（重定向逐跳校验、IPv4 映射 IPv6 压缩形式、FQDN 尾点）、`web_fetch` 流式读取防 OOM、天气查询超时、计算器溢出、DDG 解析错位、记忆删除索引校验、历史成对裁剪、「继续」精确匹配、群组 `@botname` 命令兼容、前端 CDN 降级等。
+- **v6.8.5**：修复 Telegram 进度"假卡死"——步骤标签与工具进度改用独立节流通道。
+- **v6.8.4**：修复知识库"已保存但查不到"——注册表写入失败如实上报（`kbSaveRegistry` 返回布尔，调用方据此决定是否告知用户），注册表降级为缓存、读取时自动比对重建。
+- **v6.8.8**（知识库写入可信度加固）：新增 `storePutChecked`——`R2.put` 异常即返回失败，写入结果如实上报（不再静默吞错），杜绝"写入失败却说已保存"；`save_doc` 失败消息给出 bucket 绑定排查指引；R2 未绑定时明确报错拒绝保存，不再有"假成功"。防 LLM 美化失败：只有工具真实返回成功文本，Agent 才允许转述"已保存"。（注：当前实现依赖 R2 强一致性，put 成功即真写入，无需额外读回校验。）
