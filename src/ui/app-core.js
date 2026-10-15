@@ -11,9 +11,7 @@ export default `<script>
   // DOMPurify 经 CDN 加载；若加载失败则降级为"解析后取纯文本"，保证永远安全。
   // 注意：本段在外层模板字符串内，不写反斜杠、反引号，避免两层转义破坏代码
   //（split 的分隔符写作双反斜杠加 n，经模板层转义后即为页面脚本里的换行符转义）。
-  // v6.8.9：marked 也是 CDN 依赖 —— 之前 marked 加载失败时 new marked.Renderer()
-  // 直接 ReferenceError，把整段内联脚本炸死，init() 不执行、页面整体瘫痪。
-  // 现在全部降级：marked 缺失时按纯文本渲染（转义 + 换行转 <br>）。
+  // v6.8.9：marked 也是 CDN 依赖 —— marked 缺失时按纯文本渲染（转义 + 换行转 <br>）。
   function safeHtml(mdText) {
     var raw = '';
     if (window.marked && window.marked.parse) {
@@ -63,12 +61,15 @@ export default `<script>
     marked.setOptions({ breaks: true, renderer: renderer });
   }
 
+  // v6.9.5：复用 copyText，兼容非安全上下文并提供异常保护
   document.addEventListener('click', function(e) {
     const copyBtn = e.target.closest('.copy-btn');
     if (!copyBtn) return;
-    const code = decodeURIComponent(copyBtn.getAttribute('data-code'));
-    navigator.clipboard.writeText(code).then(() => {
+    const code = decodeURIComponent(copyBtn.getAttribute('data-code') || '');
+    copyText(code).then((ok) => {
+      if (!ok) return;
       const span = copyBtn.querySelector('span');
+      if (!span) return;
       const originalText = span.innerText;
       span.innerText = '已复制';
       setTimeout(() => { span.innerText = originalText; }, 2000);

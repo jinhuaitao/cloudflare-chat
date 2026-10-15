@@ -2,7 +2,6 @@
 
 import { CORS_HEADERS, TEXT_HEADERS, HTML_HEADERS, SSE_HEADERS, PNG_HEADERS,
   MANIFEST_HEADERS, SW_HEADERS, HEALTH_HEADERS, APP_VERSION } from './src/constants.js';
-import { safeEqual } from './src/utils.js';
 import { denyUnauthorized } from './src/auth.js';
 import { hitRateLimit } from './src/rate-limit.js';
 import { getChannelConfig, buildAIRequest } from './src/channel.js';
@@ -26,9 +25,9 @@ async function routeRequest(request, env, ctx) {
   try {
     const url = new URL(request.url);
 
-    // 域名所有权验证文件（某第三方平台验证用，路径与内容固定；若不再需要可删除本段）
-    if (request.method === 'GET' && url.pathname === '/a9a015a0f6e7c9ca09f4cdce4479deb3.txt') {
-      return new Response('b7aa7e3069358c2c18f7908a7d5815788bafd020', { headers: TEXT_HEADERS });
+    // 可选域名所有权验证文件：支持通过环境变量 VERIFY_FILE_PATH / VERIFY_FILE_CONTENT 配置
+    if (request.method === 'GET' && env && env.VERIFY_FILE_PATH && url.pathname === env.VERIFY_FILE_PATH) {
+      return new Response(String(env.VERIFY_FILE_CONTENT || ''), { headers: TEXT_HEADERS });
     }
 
     if (request.method === 'OPTIONS') {
@@ -82,8 +81,7 @@ async function routeRequest(request, env, ctx) {
         const { apiUrl, currentApiKey, payload, isImageAPI } = aiConfig;
 
         // v6.6.0: Web 端 Agent 模式 —— 复用 Telegram 同一套 ReAct 循环 + 工具链，
-        // 进度通过 SSE 事件推送。记忆按 Web 会话隔离（web_<sessionId>），与 Telegram 互不干扰。
-        // Web 是浏览器长连接（无 Telegram 的 60 秒重发问题），用完整 AGENT_TIMEOUT_MS 预算。
+        // 进度通过 SSE 事件推送。Web 端对知识库只读（kbReadOnly: true），优先检索知识库文档。
         if (body.agent === true && !isImageAPI) {
           return await handleWebAgent(env, body);
         }

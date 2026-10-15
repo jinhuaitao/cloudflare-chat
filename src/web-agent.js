@@ -1,11 +1,11 @@
 // Web 端 Agent：与 Telegram 共用循环，进度与正文走 SSE（_worker.js 原第 1823-1897 行）
 
 import { SSE_HEADERS } from './constants.js';
-import { tgAgentChat, tgAgentResume } from './agent/loop.js';
+import { tgAgentChat } from './agent/loop.js';
 
-// ==================== Web 端 Agent（v6.6.0） ====================
-// 与 Telegram 共用 tgAgentChat（含 9 个零密钥工具 + 长期记忆），
-// 记忆命名空间为 web_<sessionId>，与 Telegram 完全隔离。
+// ==================== Web 端 Agent（v6.6.0，v6.9.3 只读权限分域） ====================
+// 与 Telegram 共用 tgAgentChat（提供联网搜索、网页抓取、计算、天气、时间及知识库只读检索），
+// Web 端对知识库只读（kbReadOnly: true），不暴露写入工具，也不再读取/产生 Web 会话记忆。
 // 进度通过 SSE 自定义事件推送：{"agent_progress": "..."} / {"agent_error": "..."}，
 // 正文走标准 OpenAI delta 事件，最后 data: [DONE] 结束。
 async function handleWebAgent(env, body) {
@@ -33,16 +33,10 @@ async function handleWebAgent(env, body) {
         try { controller.enqueue(encoder.encode('data: [DONE]\n\n')); } catch (e) {}
         try { controller.close(); } catch (e) {}
       };
-      // 保活心跳：Agent 单步等上游可能长达一两分钟，期间零字节的连接会被浏览器 /
-      // 中间层判为空闲并掐断；掐断后前端拿不到 [DONE]，就会落到"连接意外中断"。
-      // 每 15 秒发一个以 ':' 开头的 SSE 注释行 —— 按 SSE 规范客户端会忽略，
-      // 前端也只解析 'data:' 开头的行，因此不会污染正文。
+      // 保活心跳：每 15 秒发一个以 ':' 开头的 SSE 注释行
       const ka = setInterval(() => {
         try { controller.enqueue(encoder.encode(': keep-alive ' + Date.now() + '\n\n')); } catch (e) {}
       }, 15000);
-      // 真流式接线：上游的正文 / 推理增量直接以标准 OpenAI delta 事件转发出去，
-      // 前端本来就在按这个格式解析，所以逐字渲染零改动即可生效。
-      // agent_reset 用于撤回被判定为"工具调用开场白"或 DSML 标记的中间文本。
       const webOpts = {
         maxRuntimeMs: webBudgetMs,
         // Web 端查询优先知识库：文档列表注入系统提示词（loop.js 读取此标记）

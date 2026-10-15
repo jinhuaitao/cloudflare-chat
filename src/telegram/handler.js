@@ -1,7 +1,7 @@
 // Telegram Webhook：命令、模型选择、Agent 对话与回复发送（_worker.js 原第 2053-2443 行）
 
 import { APP_VERSION } from '../constants.js';
-import { mapSetBounded, parseCommaSeparated, safeEqual } from '../utils.js';
+import { mapSetBounded, mapGetBounded, parseCommaSeparated, safeEqual } from '../utils.js';
 import { storeGet, storePut, storePutChecked } from '../store/r2.js';
 import { getChannelConfig, buildAIRequest } from '../channel.js';
 import { tgTrimHistory, tgGetHistory, tgSaveHistory, tgClearHistory } from '../tg-history.js';
@@ -12,8 +12,9 @@ import { tgAgentChat, tgAgentResume } from '../agent/loop.js';
 import { readErrorBody } from '../agent/stability.js';
 import { toolListDocs } from '../kb/doc-tools.js';
 
-// 全局内存缓存（L1 缓存）
+// 全局内存缓存（L1 缓存，带 60s TTL）
 const tgUserModels = new Map();
+const tgUserModelsExp = new Map();
 // update_id 去重缓存（L1 内存）：
 // key 为 Telegram update_id，value 为首次见到时间戳；去重窗口 10 分钟。
 const seenUpdateIds = new Map();
@@ -21,11 +22,6 @@ const seenUpdateIds = new Map();
 let warnedNoWebhookSecret = false;
 
 // ================= update_id 去重（v6.8.9：L1 内存 + L2 R2 滚动窗口） =================
-// v6.6.3 起只放内存，但 Worker 天然多 isolate：webhook 同步等处理完成（最长 55 秒），
-// 逼近 Telegram 60 秒重发窗口；重发的 update 落到另一个 isolate 就会被完整重复执行
-// （Agent 任务重跑、回复重发、记忆/文档重复写入）。R2 读写强一致，用单个 key 存滚动
-// 窗口即可跨 isolate 去重，且不会像旧版 tg_update_* 那样每个 id 一个对象无限堆积。
-// R2 写失败时退化为仅内存去重 —— 不差于旧版行为。
 const TG_DEDUP_KEY = 'tg_updates_dedup';
 const TG_DEDUP_WINDOW_MS = 10 * 60 * 1000;
 const TG_DEDUP_MAX = 200;
@@ -74,18 +70,44 @@ function parseCommand(t) {
   return { cmd: m[1].toLowerCase(), rest: (m[2] || '').trim() };
 }
 
+// v6.9.5：长消息按 3980 字符切分，若切分点位于未闭合的 ``` 代码块内，
+// 自动在当前分片末尾补 ``` 并在下一分片开头重开代码块，避免 Telegram Markdown 报 400 降级为纯文本。
+function splitTelegramMarkdown(text, maxLength = 3980) {
+  const chunks = [];
+  let remaining = String(text || '');
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLength) {
+      chunks.push(remaining);
+      break;
+    }
+    let sliceLength = maxLength;
+    const lastNewline = remaining.lastIndexOf('\n', maxLength);
+    if (lastNewline > 3000) {
+      sliceLength = lastNewline;
+    }
+    let chunk = remaining.slice(0, sliceLength);
+    remaining = remaining.slice(sliceLength);
+    const fences = chunk.match(/```[^\n]*/g);
+    if (fences && fences.length % 2 === 1) {
+      const lastFence = fences[fences.length - 1];
+      const lang = lastFence.slice(3).trim();
+      chunk += '\n```';
+      remaining = '```' + (lang ? lang : '') + '\n' + remaining.replace(/^\n/, '');
+    }
+    chunks.push(chunk);
+  }
+  return chunks;
+}
+
 export async function handleTgWebhook(request, env) {
   // Webhook 来源校验：配置 TG_WEBHOOK_SECRET 后，只接受携带正确
   // X-Telegram-Bot-Api-Secret-Token 请求头的调用（setWebhook 时传入 secret_token）。
-  // 未配置时保持开放（兼容旧部署），但强烈建议配置。
   if (env.TG_WEBHOOK_SECRET) {
     const got = request.headers.get('X-Telegram-Bot-Api-Secret-Token') || '';
     if (!safeEqual(got, env.TG_WEBHOOK_SECRET)) {
       return new Response('Forbidden', { status: 403 });
     }
   } else if (env.TG_BOT_TOKEN && !warnedNoWebhookSecret) {
-    // v6.8.1：未配置 TG_WEBHOOK_SECRET 时 /tg-webhook 完全开放，任何人可伪造 update
-    // 烧你的 API 配额、污染知识库；这里打一次日志提醒（wrangler tail 可见）
     warnedNoWebhookSecret = true;
     console.log('⚠️ [cloudflare-chat] 未配置 TG_WEBHOOK_SECRET，/tg-webhook 处于开放状态；强烈建议配置 secret_token 并用 setWebhook 重新绑定，同时可配 TG_ALLOWED_CHAT_IDS 白名单只允许自己的聊天。');
   }
@@ -94,8 +116,6 @@ export async function handleTgWebhook(request, env) {
     const update = await request.json();
     if (!env.TG_BOT_TOKEN) return new Response('OK', { status: 200 });
 
-    // Telegram Bot API 单次调用超时（默认 15 秒，可用 TG_API_TIMEOUT_MS 调整）：
-    // 之前是裸 fetch 无超时，api.telegram.org 偶发 hung 住会让进度消息永远停在"思考中"
     let tgApiTimeoutMs = parseInt(env.TG_API_TIMEOUT_MS || '15000', 10);
     if (!(tgApiTimeoutMs > 0)) tgApiTimeoutMs = 15000;
     const tgApi = (method, body) => fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/${method}`, {
@@ -105,28 +125,17 @@ export async function handleTgWebhook(request, env) {
       signal: AbortSignal.timeout(tgApiTimeoutMs)
     });
 
-    // v6.4.3 根因修复：之前收到 webhook 立刻返回 OK、把全部工作丢进 ctx.waitUntil ——
-    // 但 HTTP 响应结束后 waitUntil 最多再延续约 30 秒，超过 30 秒的 Agent 任务会被
-    // 静默掐断（pending 消息永远卡在"📄 正在读取网页…"，且无任何错误）。
-    // 现在改为在请求上下文内等待处理完成再返回 OK。
     async function processTelegramUpdate(env, update, tgApi) {
-      // v6.8.9：pending「思考中」消息的善后回调 —— 创建 pending 后立即挂上，
-      // 之后任何未预期异常都能在 catch 里删掉它并把错误文本发给用户，
-      // 不再让「⏳ 正在思考」永远挂在聊天里
       let pendingCleanup = null;
       try {
         const { models: modelObjList } = getChannelConfig(env);
         if (modelObjList.length === 0) return;
 
-        // v6.8.1 聊天白名单（可选）：配置 TG_ALLOWED_CHAT_IDS（逗号分隔的数字 ID）后，
-        // 只响应名单内的聊天，其他一律静默忽略（仍返回 OK，避免 Telegram 反复重发）。
-        // 不配置则保持原有开放行为。个人自用强烈建议配置，只填自己的 chat id。
         const allowedChatIds = parseCommaSeparated(env.TG_ALLOWED_CHAT_IDS);
         const isChatAllowed = (cid) => !allowedChatIds.length || allowedChatIds.indexOf(String(cid)) !== -1;
 
         if (update.callback_query) {
           const cb = update.callback_query;
-          // inline 模式的回调没有 message，直接回包消掉 loading 状态后忽略
           const chatId = cb.message && cb.message.chat ? cb.message.chat.id : undefined;
           if (chatId === undefined || !isChatAllowed(chatId)) {
             try { await tgApi('answerCallbackQuery', { callback_query_id: cb.id }).catch(() => {}); } catch (e) {}
@@ -138,12 +147,14 @@ export async function handleTgWebhook(request, env) {
             const index = parseInt(data.substring(2), 10);
             if (modelObjList[index]) {
               const selected = modelObjList[index];
-              mapSetBounded(tgUserModels, chatId, selected.id);
+              mapSetBounded(tgUserModels, chatId, selected.id, undefined, tgUserModelsExp);
               await storePut(env, `tg_user_${chatId}`, selected.id);
 
+              // v6.9.5：清理模型显示名中的反引号，防止破坏 Markdown 代码段导致 400 静默失败
+              const safeModelName = String(selected.name || selected.id).replace(/`/g, "'");
               await tgApi('sendMessage', {
                 chat_id: chatId,
-                text: `✅ **已切换模型为:** \n\`${selected.name}\``,
+                text: `✅ **已切换模型为:** \n\`${safeModelName}\``,
                 parse_mode: "Markdown"
               }).catch(() => {});
             }
@@ -158,8 +169,6 @@ export async function handleTgWebhook(request, env) {
           if (!isChatAllowed(chatId)) return; // 不在白名单：静默忽略
           const userText = update.message.text;
 
-          // v6.8.6：用 parseCommand 统一解析 —— 精确匹配命令名（/startfoo 不再误判），
-          // 兼容群组里的 /cmd@botname 写法，命令后的参数放进 rest
           const cmd = parseCommand(userText);
           if (cmd && (cmd.cmd === '/start' || cmd.cmd === '/model')) {
             const inline_keyboard = modelObjList.map((model, index) => {
@@ -253,15 +262,25 @@ export async function handleTgWebhook(request, env) {
             return;
           }
 
-          let targetModelId = tgUserModels.get(chatId);
+          let targetModelId = mapGetBounded(tgUserModels, chatId, env && env.R2 ? tgUserModelsExp : null);
           if (!targetModelId) {
             targetModelId = await storeGet(env, `tg_user_${chatId}`);
+            if (targetModelId) mapSetBounded(tgUserModels, chatId, targetModelId, undefined, tgUserModelsExp);
           }
 
-          // 多轮对话：取出历史，拼上本轮用户消息（超限自动裁剪）
-          let history = await tgGetHistory(env, chatId);
-          history.push({ role: "user", content: userText });
-          history = tgTrimHistory(history, env);
+          const useAgent = await agentGetMode(env, chatId);
+          // v6.9.5：先检查是否为「继续」断点续做；若是续做，不把"继续"当作新问题塞入对话历史
+          const wantResume = useAgent && userText.trim() === '继续';
+          let resumeState = null;
+          if (wantResume) resumeState = await agentLoadResumeState(env, chatId);
+          if (useAgent && !resumeState) await agentClearResumeState(env, chatId);
+
+          const baseHistory = await tgGetHistory(env, chatId);
+          let history = baseHistory.slice();
+          if (!resumeState) {
+            history.push({ role: "user", content: userText });
+            history = tgTrimHistory(history, env);
+          }
 
           const sendActionPromise = tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
           const pendingMsgPromise = tgApi('sendMessage', {
@@ -283,46 +302,33 @@ export async function handleTgWebhook(request, env) {
           };
 
           // ===== Agent 主流程：自主规划 → 工具调用 → 汇总作答 =====
-          const useAgent = await agentGetMode(env, chatId);
           let replyText = null;
           let agentErr = null;
 
-          // webhook 单轮预算：Telegram 约 60 秒无响应会重发 update，
-          // 55 秒内必须返回（可用 TG_WEBHOOK_BUDGET_MS 调整，10 秒 ~ 240 秒）。
-          // 超预算的任务会暂停并保存进度，用户发「继续」即接着做。
           let webhookBudgetMs = parseInt(env.TG_WEBHOOK_BUDGET_MS || '55000', 10);
           if (!(webhookBudgetMs >= 10000)) webhookBudgetMs = 55000;
           if (webhookBudgetMs > 240000) webhookBudgetMs = 240000;
-          const agentOpts = { maxRuntimeMs: webhookBudgetMs, resumeKey: tgAgentResumeKey(chatId) };
+          const agentOpts = { maxRuntimeMs: webhookBudgetMs, resumeKey: tgAgentResumeKey(chatId), origUserText: userText };
 
           if (useAgent) {
-            // Agent 模式：ReAct 多步推理 + 工具调用（进度实时编辑到 pending 消息上）
             let lastProgressEdit = 0;
             const onProgress = async (text, force) => {
               if (!pendingMsgId) return;
               const now = Date.now();
-              if (!force && now - lastProgressEdit < 1500) return; // Telegram 编辑限流，节流；工具进度用 force 突破
+              if (!force && now - lastProgressEdit < 1500) return;
               lastProgressEdit = now;
               try {
-                // 纯文本，不加 parse_mode，避免搜索词里的 Markdown 特殊字符导致编辑失败
                 await tgApi('editMessageText', { chat_id: chatId, message_id: pendingMsgId, text: String(text).slice(0, 4000) });
               } catch (e) {}
             };
-            // 「继续」（精确匹配）：恢复上次暂停的任务；新问题则清掉旧暂停状态。
-            // 之前用 /^继续/ 前缀匹配，「继续优化这段代码」这类正常提问会被误判成恢复。
-            const wantResume = userText.trim() === '继续';
-            let resumeState = null;
-            if (wantResume) resumeState = await agentLoadResumeState(env, chatId);
-            if (!resumeState) await agentClearResumeState(env, chatId);
             const runAgentTurn = (allowTools) => {
               if (resumeState) {
                 return tgAgentResume(env, tgApi, chatId, {
                   targetModelId: resumeState.targetModelId || targetModelId,
                   allowTools: allowTools,
                   messages: resumeState.messages,
-                  // v6.8.1：loopStartIdx 必须随存档带回，多段「继续」时
-                  // 上下文裁剪才能触及之前各段的老轮次；丢了它上下文会无限增长
-                  loopStartIdx: resumeState.loopStartIdx
+                  loopStartIdx: resumeState.loopStartIdx,
+                  origUserText: resumeState.origUserText || ''
                 }, onProgress, agentOpts);
               }
               return tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTools, onProgress, agentOpts);
@@ -332,21 +338,29 @@ export async function handleTgWebhook(request, env) {
               r = await runAgentTurn(true);
               if (r.fallback) r = await runAgentTurn(false);
             } catch (e) {
-              // 兜底：Agent 内部任何未预期异常都转为可见错误，绝不让用户面对卡死的"思考中"
               r = { error: '⚠️ Agent 执行出错：' + (e && e.message ? e.message : String(e)) };
             }
             if (r.error) {
               agentErr = r.error;
             } else {
               replyText = r.text;
-              // 文本问答记入历史；图片生成不记（省空间）
-              if (!r.isImage && replyText) {
-                history.push({ role: "assistant", content: replyText });
-                history = tgTrimHistory(history, env);
-                await tgSaveHistory(env, chatId, history);
+              // v6.9.5：仅在任务彻底完成（!r.paused）时将问答成对记入历史，
+              // 避免多段「继续」与半截暂停提示语污染 tg_hist_<chatId> 上下文。
+              if (!r.paused) {
+                if (!r.isImage && replyText) {
+                  let finalHist = history;
+                  if (resumeState) {
+                    finalHist = baseHistory.slice();
+                    if (resumeState.origUserText) {
+                      finalHist.push({ role: "user", content: resumeState.origUserText });
+                    }
+                  }
+                  finalHist.push({ role: "assistant", content: replyText });
+                  finalHist = tgTrimHistory(finalHist, env);
+                  await tgSaveHistory(env, chatId, finalHist);
+                }
+                await agentClearResumeState(env, chatId);
               }
-              // 正常完成（非暂停）后清理断点；暂停时新状态已在内部保存
-              if (!r.paused) await agentClearResumeState(env, chatId);
             }
           } else {
             // 普通模式：单次问答（与旧版行为一致，不调用工具）
@@ -355,13 +369,10 @@ export async function handleTgWebhook(request, env) {
               if (pendingMsgId) {
                 tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {});
               }
-              // buildAIRequest 的错误文本本身就说明了缺什么配置（API_URL / MODEL 等），
-              // 直接透传，不再吞成笼统的一句「未配置或异常」
               await tgApi('sendMessage', { chat_id: chatId, text: '⚠️ ' + aiConfig.error });
               return;
             }
             const { apiUrl, currentApiKey, payload } = aiConfig;
-            // 上游偶发中断时重试一次（深度思考时间越长越容易撞上）
             let aiResponse = null;
             for (let tgAttempt = 1; tgAttempt <= 2; tgAttempt++) {
               try {
@@ -372,7 +383,7 @@ export async function handleTgWebhook(request, env) {
                     'Content-Type': 'application/json',
                   },
                   body: JSON.stringify(payload),
-                  signal: AbortSignal.timeout(60000) // 普通对话上游单次调用上限 60 秒
+                  signal: AbortSignal.timeout(60000)
                 });
                 break;
               } catch (e) {
@@ -397,8 +408,6 @@ export async function handleTgWebhook(request, env) {
                   await tgSaveHistory(env, chatId, history);
                 }
               } else {
-                // v6.8.9：把上游状态码与错误正文带出来 —— 只说「请求失败」
-                // 对排查 401 / 429 / 模型名写错毫无帮助；正文限长 300 字符防止刷屏
                 let diag = '';
                 if (aiResponse) {
                   try {
@@ -421,7 +430,6 @@ export async function handleTgWebhook(request, env) {
           }
 
           if (replyText) {
-            // 最终回复发送：带一次重试。tgApi 有 15 秒超时，一次偶发 hung 不该直接丢掉用户回复
             const sendReplyChunk = async (text, useMarkdown) => {
               for (let attempt = 1; attempt <= 2; attempt++) {
                 try {
@@ -436,22 +444,9 @@ export async function handleTgWebhook(request, env) {
               }
               return { ok: false };
             };
-            const maxLength = 4000;
-            let startIndex = 0;
-            while (startIndex < replyText.length) {
-              let sliceLength = maxLength;
-              if (startIndex + maxLength < replyText.length) {
-                const lastNewline = replyText.lastIndexOf('\n', startIndex + maxLength);
-                if (lastNewline > startIndex + 3000) {
-                   sliceLength = lastNewline - startIndex;
-                }
-              }
-
-              const chunk = replyText.slice(startIndex, startIndex + sliceLength);
-              startIndex += sliceLength;
-
+            const chunks = splitTelegramMarkdown(replyText, 3980);
+            for (const chunk of chunks) {
               const tgRes = await sendReplyChunk(chunk, true);
-
               if (!tgRes.ok) {
                 await sendReplyChunk(chunk, false);
               }
@@ -461,14 +456,10 @@ export async function handleTgWebhook(request, env) {
       } catch (err) {
         console.log("后台处理异常:", err);
         if (pendingCleanup) { try { await pendingCleanup(err); } catch (e) {} }
-        // 抛给外层：释放去重标记，Telegram 因超时重发该 update 时还能重试
         throw err;
       }
     }
 
-    // update_id 去重：L1 内存 + L2 R2 滚动窗口（详见 markUpdateSeen 注释）。
-    // 同一 update 10 分钟内只处理一次。处理在请求内等待完成，响应慢时
-    // Telegram 可能重发 update，跨 isolate 去重可避免重复执行 Agent / 重复发送回复。
     const uid = update && update.update_id;
     if (uid !== undefined && uid !== null && await markUpdateSeen(env, uid)) {
       return new Response('OK', { status: 200 });
@@ -477,8 +468,6 @@ export async function handleTgWebhook(request, env) {
     try {
       await processTelegramUpdate(env, update, tgApi);
     } catch (err) {
-      // v6.8.7：处理异常时释放去重标记 —— Telegram 因超时重发该 update 时还能重试，
-      // 而不是被去重挡住变成静默失败
       await releaseUpdateForRetry(env, uid);
       console.log("处理 Telegram 更新异常:", err);
     }
@@ -492,6 +481,7 @@ export async function handleTgWebhook(request, env) {
 // 供单元测试使用（纯函数与去重窗口逻辑）
 export {
   parseCommand,
+  splitTelegramMarkdown,
   markUpdateSeen,
   releaseUpdateForRetry,
 };

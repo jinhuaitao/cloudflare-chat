@@ -1,12 +1,13 @@
 // Agent 长期记忆（JSON 索引为唯一可信源 + md 只读镜像）（_worker.js 原第 703-704,707-784 行）
 
-import { mapSetBounded } from '../utils.js';
+import { mapSetBounded, mapGetBounded } from '../utils.js';
 import { storeGet, storePutChecked, storeDelete } from '../store/r2.js';
 import { agentMemKey, agentMemKeyLegacy, kbMemDir, kbNewMemFile, kbMemMarkdown,
   kbBackfillMd, kbDeleteKeys } from '../store/kb.js';
 
 // ==================== Telegram Agent：长期记忆 + 开关 ====================
 const tgAgentMemCache = new Map();
+const tgAgentMemExp = new Map();
 
 // ---------- 知识库自动优化（v6.9.2）：确定性本地规则，不依赖 LLM ----------
 // 归一化：转小写、去全部空白。"我养了一只猫 叫汤圆" 与 "我养了一只猫叫汤圆"
@@ -18,8 +19,6 @@ function memNorm(fact) {
 // 同一主题只保留最新事实——"我的手机号是A" 改口成 "我的手机号是B" 时自动
 // 覆盖旧条目，不再积累互相矛盾的记忆。没有分隔符或主语太短返回 null，
 // 不做主题判断（保守起步：宁可多存一条，不可误删用户事实）。
-// 注意不含"在"：否则"我现在的工作是后端"与"我现在的城市是北京"会撞成同
-// 主题（第一个"在"先于"是"被截断），把两条不同事实误判为改口。
 function memSubjectKey(fact) {
   const s = memNorm(fact);
   let idx = -1;
@@ -32,7 +31,10 @@ function memSubjectKey(fact) {
 }
 
 async function agentGetMemories(env, chatId) {
-  if (tgAgentMemCache.has(chatId)) return tgAgentMemCache.get(chatId);
+  // v6.9.5：当绑定了 R2 时使用 60 秒 TTL 校验，防多 isolate 下长期脏读；
+  // 未绑定 R2（纯内存退化模式）时不使内存缓存过期，避免纯内存模式下 60 秒后丢失记忆。
+  const cached = mapGetBounded(tgAgentMemCache, chatId, env && env.R2 ? tgAgentMemExp : null);
+  if (Array.isArray(cached)) return cached.slice();
   let arr = [];
   // v6.6.6 起知识库搬入 kb/ 文件夹：先读新 key；若为空再尝试旧 key，
   // 读到旧数据立即搬迁（写新 key + 删旧 key），老部署升级不丢记忆。
@@ -50,11 +52,8 @@ async function agentGetMemories(env, chatId) {
     try {
       const p = JSON.parse(raw);
       if (Array.isArray(p)) {
-        // v6.8.6 索引校验：过滤脏条目（非对象 / fact 缺失或非字符串），
-        // 防止手改或历史 bug 留下的坏数据把 Agent 记忆整体搞挂；
+        // v6.8.6 索引校验：过滤脏条目（非对象 / fact 缺失或非字符串）
         // v6.9.2 自动优化：归一化后完全重复的条目合并为最新一条
-        // （老版本允许"带空格重复保存"，这里在读取时自动清理历史库），
-        // 被丢弃条目的 md 镜像一并删除，不留孤儿文件。
         const clean = [];
         const seen = new Map();
         const orphanMd = [];
@@ -90,12 +89,11 @@ async function agentGetMemories(env, chatId) {
   // v6.6.7：回补 md 镜像 —— 老条目自动分配文件名并建 md；控制台误删的 md 也会按索引重建
   try {
     if (await kbBackfillMd(env, chatId, arr)) {
-      // v6.8.4：回补索引写入改用 checked；失败不影响本次内存读取，下次加载/保存会重试
       await storePutChecked(env, agentMemKey(chatId), JSON.stringify(arr));
     }
   } catch (e) {}
-  mapSetBounded(tgAgentMemCache, chatId, arr);
-  return arr;
+  mapSetBounded(tgAgentMemCache, chatId, arr.slice(), undefined, tgAgentMemExp);
+  return arr.slice();
 }
 
 async function agentSaveMemory(env, chatId, fact) {
@@ -104,8 +102,7 @@ async function agentSaveMemory(env, chatId, fact) {
   if (!fact) return '内容为空，未保存';
   const norm = memNorm(fact);
   if (arr.some(m => memNorm(m.fact) === norm)) return '已记住过，无需重复保存';
-  // 自动优化：同一主题（"X是/为/: Y" 的同 X）只保留最新——改口即覆盖，
-  // 历史上积累的多条同主题旧条目一并清理，md 镜像同步删除
+  // 自动优化：同一主题（"X是/为/: Y" 的同 X）只保留最新——改口即覆盖
   const key = memSubjectKey(fact);
   const replacedFiles = [];
   let oldFact = '';
@@ -123,11 +120,9 @@ async function agentSaveMemory(env, chatId, fact) {
   // v6.6.7：条目带 file 字段；先写 md 镜像再写索引（索引是唯一可信源）
   const m = { fact: fact, ts: Date.now(), file: kbNewMemFile() };
   arr.push(m);
-  // v6.4.1 起彻底不限条数：R2 单对象可达 5TB，且每次 prompt 只按预算注入，
-  // 条数增长不影响 token 成本；remember 需用户明确要求才会触发，无失控风险。
-  mapSetBounded(tgAgentMemCache, chatId, arr);
+  mapSetBounded(tgAgentMemCache, chatId, arr.slice(), undefined, tgAgentMemExp);
   const replNote = replaced ? '（本条自动覆盖了旧记忆《' + oldFact + '》）' : '';
-  // v6.8.3：未绑定 R2 时只留内存，必须如实告知——之前会谎称"已记住"，重启就丢
+  // v6.8.3：未绑定 R2 时只留内存，必须如实告知
   if (!env.R2) {
     return '已暂存于内存（R2 未绑定，Worker 重启后会丢失；按 README 第二步绑定 R2 后可永久记住）' + replNote + '：' + fact;
   }
@@ -153,9 +148,9 @@ async function agentForgetMemory(env, chatId, keyword) {
     for (const m of arr) {
       if (!keptSet.has(m) && m && m.file) files.push(kbMemDir(chatId) + m.file);
     }
-    // v6.8.4：索引写入失败时不更新缓存并如实报错，否则"删了但重启又复活"
+    // v6.8.4：索引写入失败时不更新缓存并如实报错
     if (!env.R2) {
-      mapSetBounded(tgAgentMemCache, chatId, kept);
+      mapSetBounded(tgAgentMemCache, chatId, kept.slice(), undefined, tgAgentMemExp);
       if (files.length) await kbDeleteKeys(env, files);
       return { removed: removed };
     }
@@ -163,7 +158,7 @@ async function agentForgetMemory(env, chatId, keyword) {
     if (!okIdx) {
       return { removed: 0, persistError: '记忆索引写入 R2 失败，未删除任何记忆；请检查 R2 绑定与权限后重试' };
     }
-    mapSetBounded(tgAgentMemCache, chatId, kept);
+    mapSetBounded(tgAgentMemCache, chatId, kept.slice(), undefined, tgAgentMemExp);
     if (files.length) await kbDeleteKeys(env, files);
   }
   return { removed: removed };

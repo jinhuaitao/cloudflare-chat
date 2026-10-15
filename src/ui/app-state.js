@@ -21,6 +21,13 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
   } catch (e) {}
   let currentSessionId = null;
 
+  // v6.9.5：切换 / 新建 / 删除当前会话前若正在流式输出，先主动中止旧流，防止跨会话串写
+  function abortActiveStream() {
+    if (isCurrentlyStreaming && currentAbortController) {
+      try { currentAbortController.abort(); } catch (e) {}
+    }
+  }
+
   // /api/chat 访问口令：存在本机浏览器，随请求以 X-Access-Token 头发出
   const ACCESS_TOKEN_KEY = 'access_token';
   let accessToken = localStorage.getItem(ACCESS_TOKEN_KEY) || '';
@@ -130,6 +137,7 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
   }
 
   function createNewSession() {
+    abortActiveStream();
     // v6.8.9：加随机后缀保证会话 id 不可预测（历史遗留：曾用纯时间戳 id）
     const newId = 'session_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
     const savedDefaultModel = localStorage.getItem('default_model');
@@ -145,6 +153,9 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
   }
 
   function switchSession(id) {
+    if (currentSessionId && currentSessionId !== id) {
+      abortActiveStream();
+    }
     stopSpeaking();
     currentSessionId = id;
     // 切换会话默认落在最新消息处，并收起「回到底部」按钮
@@ -180,7 +191,7 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
   modelSelect.addEventListener('change', onModelChange);
   modelSelect.addEventListener('input', onModelChange);
 
-  // v6.6.0: Web 端 Agent 模式开关（默认开启，与 Telegram 一致；记忆按 Web 会话隔离）
+  // v6.6.0: Web 端 Agent 模式开关（默认开启，优先检索知识库文档）
   const agentToggle = document.getElementById('agentToggle');
   let agentMode = localStorage.getItem('cfchat_agent_mode') !== '0';
   function renderAgentToggle() {

@@ -78,6 +78,9 @@ export default `  // ===== 通用弹窗：替掉浏览器原生 confirm() / aler
   async function deleteSession(e, id) {
     e.stopPropagation();
     if (!(await askConfirm('确认删除这个对话吗？删除后无法恢复。'))) return;
+    if (currentSessionId === id && typeof abortActiveStream === 'function') {
+      abortActiveStream();
+    }
     sessions = sessions.filter(s => s.id !== id);
     saveSessions();
     if (sessions.length === 0) createNewSession();

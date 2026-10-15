@@ -19,10 +19,12 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-// 6.9.4：Agent 收尾与工具韧性。步数用尽先做一次无工具总结，不再把
-// "我先去搜索"当成最终答案；工具连续失败会注入纠偏并提前停止空转；
-// 搜索增加 lite 端回退；计算器限制嵌套深度。
-const APP_VERSION = '6.9.4';
+// 6.9.5：全面性能、可靠性与安全优化。
+//  - 前端：流式期间切换/新建/删除会话自动中断保护；/healthz 改为离线按需轮询；消除收尾重复代码高亮；
+//  - 后端：修复 L1 缓存可变数组引用污染并加入 TTL；Web 只读端跳过无效 R2 记忆读取；知识库注册表增加短期缓存；
+//  - Telegram：「继续」续做不污染历史上下文；长消息分片自动闭合跨片代码块；
+//  - 安全：定长口令比对防长度泄露；限流淘汰 O(N) 优化；SSRF 补充保留网段拦截。
+const APP_VERSION = '6.9.5';
 const PNG_HEADERS = {
   'Content-Type': 'image/png',
   'Cache-Control': 'public, max-age=86400',

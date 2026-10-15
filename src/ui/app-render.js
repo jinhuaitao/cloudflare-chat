@@ -67,10 +67,9 @@ export default `  function renderSessionList() {
       if (msgId) {
         bubble.innerHTML = content;
       } else {
+        // v6.9.5：isCurrentlyStreaming 为 false 时，safeHtml 内部的 marked renderer 已完成代码高亮，无需二次调用 hljs.highlightElement
         isCurrentlyStreaming = false;
         bubble.innerHTML = '<div class="message-text markdown-body">' + safeHtml(content) + '</div>';
-        // hljs 为 CDN 依赖，缺失时跳过高亮（代码块仍显示转义后的纯文本）
-        if (window.hljs) bubble.querySelectorAll('pre code').forEach((block) => { try { hljs.highlightElement(block); } catch (e) {} });
         // 复制按钮要的是原始 Markdown，不是渲染后的 HTML
         bubble.__rawText = content;
       }

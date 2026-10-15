@@ -8,15 +8,32 @@ export default `  // ================= PWA =================
     });
   }
 
-  // 2) 离线检测 + 自动重连
-  //    不依赖 navigator.onLine —— 它只反映网卡状态，判断不了「服务端是否可达」。
-  //    改为轮询 /healthz；该路径在 Service Worker 中被显式放行且绝不缓存，
-  //    否则探针会被缓存应答，永远「探测成功」，自动重连形同虚设。
+  // 2) 离线检测 + 按需自动重连（v6.9.5 优化）
+  //    旧版每 8 秒无条件轮询 /healthz（含后台标签页），单标签页每天消耗上万次 Worker 请求。
+  //    现改为：仅在首次加载、网络切回或进入离线态（offlineState === true）时轮询 /healthz，
+  //    一旦探测恢复在线立即停止轮询；且标签页在后台（document.hidden）时暂停探测。
   const offlineBanner = document.getElementById('offlineBanner');
   const offlineText = document.getElementById('offlineText');
   let offlineState = false;
+  let healthPollTimer = null;
+
+  function startHealthPolling() {
+    if (healthPollTimer) return;
+    healthPollTimer = setInterval(() => {
+      if (!document.hidden) checkHealth();
+    }, 8000);
+  }
+
+  function stopHealthPolling() {
+    if (healthPollTimer) {
+      clearInterval(healthPollTimer);
+      healthPollTimer = null;
+    }
+  }
 
   function setOffline(on, reason) {
+    if (on) startHealthPolling();
+    else stopHealthPolling();
     if (on === offlineState) return;
     offlineState = on;
     if (offlineBanner) offlineBanner.classList.toggle('show', on);
@@ -24,6 +41,7 @@ export default `  // ================= PWA =================
   }
 
   async function checkHealth() {
+    if (document.hidden) return;
     try {
       const res = await fetch('/healthz', { cache: 'no-store' });
       if (!res.ok) throw new Error('unhealthy');
@@ -31,6 +49,8 @@ export default `  // ================= PWA =================
         setOffline(false);
         // 刚恢复：重绘当前会话，清掉离线期间残留的错误气泡
         if (!isCurrentlyStreaming) renderMessages();
+      } else {
+        stopHealthPolling();
       }
     } catch (e) {
       setOffline(true, '网络已断开，正在尝试重连…');
@@ -39,7 +59,9 @@ export default `  // ================= PWA =================
 
   window.addEventListener('online', checkHealth);
   window.addEventListener('offline', () => setOffline(true, '网络已断开，正在尝试重连…'));
-  setInterval(checkHealth, 8000);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && offlineState) checkHealth();
+  });
   checkHealth();
 
   // 3) 安装到桌面 / 主屏幕

@@ -2,14 +2,20 @@
 
 import { KB_PREFIX } from '../store/kb.js';
 
-// ==================== 知识库文档（v6.8.0 重构）：注册表方案 ====================
+// ==================== 知识库文档（v6.8.0 重构，v6.9.5 缓存加速）：注册表方案 ====================
 // kb/docs/registry.json 是文档的唯一注册表：[{file, title, source, size, updated_at}]。
 // save / list / read / delete 全部走注册表：去重与列表都是 O(1)，不再逐篇扫描 frontmatter。
 // 注册表缺失或损坏时自动扫描 kb/docs/ 重建（自愈）；registry.json 本身永不计入文档。
 // 文件名仍为 kb/docs/<标题>.md（标题清洗，中文保留）。
-// 注意：注册表更新是 read-modify-write，极端并发下可能丢失一次更新；个人单用户场景可接受。
+// v6.9.5：增加 30 秒短期内存缓存（绑定当前 env.R2 实例），写操作穿透更新缓存，
+// 避免 Web 端每轮对话及同轮多次工具调用反复读取 R2。
 const KB_DOCS_PREFIX = KB_PREFIX + 'docs/';
 const KB_REGISTRY_KEY = KB_DOCS_PREFIX + 'registry.json';
+const KB_REG_CACHE_TTL_MS = 30 * 1000;
+
+let cachedRegistry = null;
+let cachedRegistryBucket = null;
+let cachedRegistryExp = 0;
 
 // 文件名由标题清洗得到（去掉 / \ : * ? " < > | # 与控制字符，中文保留；
 // 空格直接去掉——避免"甲骨文云 ARM"与"甲骨文云ARM"生成两个文件），超长截断；
@@ -59,7 +65,7 @@ async function kbListDocObjects(env) {
   } catch (e) {}
   return objs;
 }
-// 从现有文件重建注册表（读每篇前 1200 字节的 frontmatter），并写回
+// 从现有文件重建注册表（读每篇前 4096 字节的 frontmatter），并写回
 async function kbRebuildRegistry(env) {
   const reg = [];
   if (!env.R2) return reg;
@@ -80,15 +86,24 @@ async function kbRebuildRegistry(env) {
     });
   }
   await kbSaveRegistry(env, reg);
-  return reg;
+  return reg.slice();
 }
 async function kbGetRegistry(env) {
-  if (!env.R2) return [];
+  if (!env || !env.R2) return [];
+  const now = Date.now();
+  if (cachedRegistry && cachedRegistryBucket === env.R2 && now < cachedRegistryExp) {
+    return cachedRegistry.slice();
+  }
   try {
     const obj = await env.R2.get(KB_REGISTRY_KEY);
     if (obj) {
       const p = JSON.parse(await obj.text());
-      if (Array.isArray(p)) return p;
+      if (Array.isArray(p)) {
+        cachedRegistry = p.slice();
+        cachedRegistryBucket = env.R2;
+        cachedRegistryExp = Date.now() + KB_REG_CACHE_TTL_MS;
+        return p.slice();
+      }
     }
   } catch (e) {}
   // 缺失或损坏 → 自动重建（自愈）
@@ -97,9 +112,19 @@ async function kbGetRegistry(env) {
 // v6.8.4：返回布尔值——注册表写入失败必须让调用方知道，
 // 否则会出现"文档已保存但列表/读取找不到"的幽灵成功。
 async function kbSaveRegistry(env, reg) {
-  if (!env.R2) return false;
-  try { await env.R2.put(KB_REGISTRY_KEY, JSON.stringify(reg)); return true; }
-  catch (e) { return false; }
+  if (!env || !env.R2) return false;
+  try {
+    const list = Array.isArray(reg) ? reg.slice() : [];
+    await env.R2.put(KB_REGISTRY_KEY, JSON.stringify(list));
+    cachedRegistry = list;
+    cachedRegistryBucket = env.R2;
+    cachedRegistryExp = Date.now() + KB_REG_CACHE_TTL_MS;
+    return true;
+  } catch (e) {
+    cachedRegistry = null;
+    cachedRegistryExp = 0;
+    return false;
+  }
 }
 // 注册表内模糊查找：标题精确相等 > 标题包含 > 文件名包含（大小写不敏感）
 function kbFindRegEntry(reg, query) {
