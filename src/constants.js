@@ -19,12 +19,14 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-// 6.9.5：全面性能、可靠性与安全优化。
-//  - 前端：流式期间切换/新建/删除会话自动中断保护；/healthz 改为离线按需轮询；消除收尾重复代码高亮；
-//  - 后端：修复 L1 缓存可变数组引用污染并加入 TTL；Web 只读端跳过无效 R2 记忆读取；知识库注册表增加短期缓存；
-//  - Telegram：「继续」续做不污染历史上下文；长消息分片自动闭合跨片代码块；
-//  - 安全：定长口令比对防长度泄露；限流淘汰 O(N) 优化；SSRF 补充保留网段拦截。
-const APP_VERSION = '6.9.5';
+// 7.0.0：全套零配置 Agent 增强与架构优化版。
+//  - 知识库 2.0：read_doc 支持 offset 分页读取 10 万字长文档 + 多关键词分词/2-gram 全文相关性排序检索；
+//  - 网页提取 2.0：web_fetch 保留 Markdown 结构（标题/代码块/表格/列表）+ 支持 offset 分页 + Jina 免密钥回退；
+//  - 新工具：wiki_lookup（中英维基百科词条）、exchange_rate（实时法币汇率 + 主流加密币价）、forget_memory（自然语言删记忆）；
+//  - 科学计算与日期推算：calculate 扩展 20 个科学函数与 pi/e 常量；get_time 支持日期间隔与加减天数推算；
+//  - Telegram 增强：零配置支持直接发送文本文件（.md/.txt/.csv/.json/代码）分析或入库，以及发送图片多模态识图问答；
+//  - Web UI 增强：新增可折叠「工具调用轨迹胶囊（Tool Trace）」，保留每步工具调用记录与总耗时。
+const APP_VERSION = '7.0.0';
 const PNG_HEADERS = {
   'Content-Type': 'image/png',
   'Cache-Control': 'public, max-age=86400',

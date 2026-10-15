@@ -1,4 +1,4 @@
-// 发送与流式接收：Agent 进度、重试、中断处理（_worker.js 原第 4140-4567 行，内嵌页面分片；只允许字符串导出）
+// 发送与流式接收：Agent 进度与可折叠工具轨迹胶囊、重试、中断处理（内嵌页面分片；只允许字符串导出）
 export default `  async function sendMessage() {
     const text = userInput.value.trim(); 
     if (!text && !isCurrentlyStreaming) return;
@@ -94,11 +94,49 @@ export default `  async function sendMessage() {
         });
       }
 
-      // v6.6.0 Agent 进度条（气泡内，收到正文结束 / 出错 / 中止时清除）
+      // v6.6.0 / v7.0.0 Agent 实时进度条 + 可折叠「工具调用轨迹胶囊」
       let agentProgressEl = null;
       let agentProgressBase = '';
       let agentProgressT0 = 0;
       let agentProgressTimer = null;
+      const agentToolSteps = [];
+      let agentTraceEl = null;
+
+      function recordAgentToolSteps(progressText) {
+        const lines = String(progressText || '').split('\\n').map(s => s.trim()).filter(Boolean);
+        // 首行是 "🤖 Agent 思考中（第 N 步）…"，后续行是具体调用的工具描述
+        for (let i = 1; i < lines.length; i++) {
+          const cleanStep = lines[i].replace(/正在/g, '');
+          if (cleanStep && agentToolSteps.indexOf(cleanStep) === -1) {
+            agentToolSteps.push(cleanStep);
+          }
+        }
+      }
+
+      function renderAgentTraceCapsule() {
+        if (!agentToolSteps.length) return;
+        const elapsedSec = agentProgressT0 > 0 ? Math.max(1, Math.round((Date.now() - agentProgressT0) / 1000)) : 0;
+        if (!agentTraceEl) {
+          agentTraceEl = document.createElement('details');
+          agentTraceEl.className = 'agent-trace';
+          bubble.insertBefore(agentTraceEl, tBox);
+        }
+        agentTraceEl.replaceChildren();
+        const sum = document.createElement('summary');
+        sum.className = 'agent-trace-summary';
+        sum.textContent = '🛠️ 已调用 ' + agentToolSteps.length + ' 项工具' + (elapsedSec > 0 ? '（耗时 ' + elapsedSec + 's）' : '');
+        const list = document.createElement('div');
+        list.className = 'agent-trace-list';
+        agentToolSteps.forEach((st, idx) => {
+          const item = document.createElement('div');
+          item.className = 'agent-trace-item';
+          item.textContent = (idx + 1) + '. ' + st;
+          list.appendChild(item);
+        });
+        agentTraceEl.appendChild(sum);
+        agentTraceEl.appendChild(list);
+      }
+
       function renderAgentProgress() {
         if (!agentProgressEl) return;
         const s = Math.round((Date.now() - agentProgressT0) / 1000);
@@ -109,9 +147,10 @@ export default `  async function sendMessage() {
           agentProgressEl = document.createElement('div');
           agentProgressEl.className = 'agent-progress';
           bubble.appendChild(agentProgressEl);
-          agentProgressT0 = Date.now();
+          if (!agentProgressT0) agentProgressT0 = Date.now();
           agentProgressTimer = setInterval(renderAgentProgress, 1000);
         }
+        recordAgentToolSteps(text);
         agentProgressEl.style.display = '';
         agentProgressBase = text;
         renderAgentProgress();
@@ -122,14 +161,17 @@ export default `  async function sendMessage() {
           }
         }
       }
+      // 正文开始流式输出后收起实时进度条，并将已执行的工具步骤转为顶部可折叠轨迹胶囊
       function hideAgentProgress() {
         if (agentProgressEl) agentProgressEl.style.display = 'none';
+        renderAgentTraceCapsule();
       }
       function clearAgentProgress() {
         if (agentProgressTimer) { clearInterval(agentProgressTimer); agentProgressTimer = null; }
         if (agentProgressEl && agentProgressEl.parentNode) agentProgressEl.parentNode.removeChild(agentProgressEl);
         agentProgressEl = null;
         agentProgressBase = '';
+        renderAgentTraceCapsule();
       }
       function resetStreamedText() {
         aiContent = '';
@@ -159,6 +201,9 @@ export default `  async function sendMessage() {
         aiContent = '';
         reasoningContent = '';
         gotDone = false;
+        agentToolSteps.length = 0;
+        if (agentTraceEl && agentTraceEl.parentNode) agentTraceEl.parentNode.removeChild(agentTraceEl);
+        agentTraceEl = null;
         clearAgentProgress();
         if (rBox) { rBox.style.display = 'none'; rBox.textContent = ''; }
         tBox.innerHTML = '';
@@ -313,7 +358,6 @@ export default `  async function sendMessage() {
       if (!reasoningContent && rBox) rBox.remove();
       clearAgentProgress();
 
-      // v6.9.5：isCurrentlyStreaming 置为 false 后，safeHtml 内部已通过 marked renderer 完成代码高亮，不再二次执行 hljs.highlightElement
       tBox.innerHTML = safeHtml(aiContent);
       bubble.__rawText = aiContent;   // 供「复制」取原始 Markdown
       if (isCurrentActiveSession() && isNearBottom) scrollArea.scrollTop = scrollArea.scrollHeight;
@@ -361,7 +405,6 @@ export default `  async function sendMessage() {
           userInput.dispatchEvent(new Event('input'));
         }
       } else {
-        // 网络或服务异常时主动触发一次健康探测，若已断网则进入按需重连轮询
         if (typeof checkHealth === 'function') checkHealth();
         if (aiContent || reasoningContent) {
           tBox.innerHTML = safeHtml(aiContent) + '<br><br><span style="color: #ef4444; font-size: 13px; font-weight: 500;">(⚠️ 网络连接中断，已保留当前生成的内容。错误: ' + escapeHtml(error.message) + ')</span>';

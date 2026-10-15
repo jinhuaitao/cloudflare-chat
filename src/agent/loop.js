@@ -15,7 +15,7 @@ import { kbGetRegistry } from '../kb/registry.js';
 // "失败"二字（如新闻标题）被误判，导致正常结果也被当成空转。
 function isToolResultFailure(result) {
   const s = String(result == null ? '' : result);
-  return /^(搜索失败|搜索请求失败|搜索「[^」]*」无结果|抓取失败|URL 非法|该地址禁止抓取|不支持抓取|计算失败|计算结果非法|时区无效|天气查询失败|找不到城市|工具执行失败|工具 [^ ]+ 执行超时|未知工具|R2 未绑定|知识库文档写入|记忆写入|内容为空|标题为空|城市名为空|表达式为空|表达式含非法字符)/.test(s);
+  return /^(搜索失败|搜索请求失败|搜索「[^」]*」无结果|抓取失败|URL 非法|该地址禁止抓取|不支持抓取|计算失败|计算结果非法|时区无效|天气查询失败|找不到城市|汇率查询失败|维基百科查询失败|维基百科未找到|维基百科查询关键词为空|关键词为空|工具执行失败|工具 [^ ]+ 执行超时|未知工具|R2 未绑定|知识库文档写入|记忆写入|内容为空|标题为空|城市名为空|表达式为空|表达式含非法字符)/.test(s);
 }
 
 // 步数用尽后的无工具收尾：不再提供 tools，强制模型把已有结果收成最终答案。
@@ -50,22 +50,26 @@ async function agentWrapUp(env, targetModelId, messages, loopStartIdx, ctxBudget
 
 function tgAgentDeadline(env, opts) {
   let timeoutMs = agentLimits(env).timeoutMs;
-  // webhook 场景传入 maxRuntimeMs：HTTP 响应必须在 Telegram 因超时重发 update
-  // 之前返回（约 60 秒），取两者较小值，避免整体预算形同虚设
   if (opts && opts.maxRuntimeMs > 0 && opts.maxRuntimeMs < timeoutMs) timeoutMs = opts.maxRuntimeMs;
   return Date.now() + timeoutMs;
 }
 
+// 提取消息的纯文本部分（兼容多模态数组 [{type:'text', text:'...'}, {type:'image_url',...}]）
+function extractMsgPlainText(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter(p => p && p.type === 'text' && typeof p.text === 'string')
+      .map(p => p.text)
+      .join('\n');
+  }
+  return String(content || '');
+}
+
 async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTools, onProgress, opts) {
-  const query = history.length ? String(history[history.length - 1].content || '') : '';
-  // v6.9.3：Web 端（opts.kbReadOnly）对知识库只读——写入类工具
-  // （remember / save_doc / delete_doc）不注入，提示词同步改为只读规则，
-  // 并穿透到执行层硬拦截幻觉出的写入调用。
-  // v6.9.5：只读端不产生长期记忆，直接跳过 agentGetMemories，省去每次新 Web 会话 2 次无效 R2 GET。
+  const query = history.length ? extractMsgPlainText(history[history.length - 1].content) : '';
   const kbReadOnly = !!(opts && opts.kbReadOnly);
   const memories = kbReadOnly ? [] : await agentGetMemories(env, chatId);
-  // Web 端（opts.kbFirst）查询优先知识库：把文档注册表注入系统提示词，
-  // 让模型开局就看到全部标题并按"知识库优先"作答，不依赖它自觉先调 list_docs。
   let kbDocs = null;
   if (opts && opts.kbFirst) {
     try { kbDocs = await kbGetRegistry(env); } catch (e) { kbDocs = null; }
@@ -87,8 +91,6 @@ async function tgAgentResume(env, tgApi, chatId, saved, onProgress, opts) {
   const allowTools = !!saved.allowTools;
   const tools = allowTools ? getAgentTools() : null;
   const deadline = tgAgentDeadline(env, opts);
-  // v6.8.1：把首次运行时的 loopStartIdx 带回来，裁剪才能触及之前各段的老轮次，
-  // 否则多段「继续」会让上下文无限增长；老版本存档无此字段则回退为旧行为
   const baseLoopStartIdx = (typeof saved.loopStartIdx === 'number' && saved.loopStartIdx >= 0) ? saved.loopStartIdx : undefined;
   return await tgAgentRunLoop(env, tgApi, chatId, saved.targetModelId, saved.messages, tools, allowTools, onProgress, deadline,
     (opts && opts.resumeKey) || null, true, baseLoopStartIdx,
@@ -97,10 +99,7 @@ async function tgAgentResume(env, tgApi, chatId, saved, onProgress, opts) {
 
 async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume, baseLoopStartIdx, onDelta, onReset, kbReadOnly, origUserText) {
   const maxSteps = agentLimits(env).maxSteps;
-  // 真流式开关：默认开启，向上游请求 stream: true 并边读边转发正文增量。
-  // 若某条通道不支持「流式 + tools」的组合，设 AGENT_STREAM_UPSTREAM=0 退回整段等待。
   const useUpstreamStream = env.AGENT_STREAM_UPSTREAM !== '0';
-  // 撤回已推给客户端的正文（仅当本轮确实推过内容时才发事件）
   const rollbackStreamed = async (forwarded) => {
     if (!forwarded || typeof onReset !== 'function') return;
     try { await onReset(); } catch (e) {}
@@ -109,15 +108,11 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
     const f = [...messages].reverse().find(m => m.role === 'assistant' && m.content);
     return f ? f.content : '';
   };
-  // 本轮循环在 messages 中的起始下标：上下文裁剪只动这之后的消息，
-  // system 与历史对话永不裁剪。「继续」时传入首次运行的下标，老轮次也可被裁剪。
   const loopStartIdx = (typeof baseLoopStartIdx === 'number' && baseLoopStartIdx >= 0)
     ? Math.min(baseLoopStartIdx, messages.length)
     : messages.length;
-  // 上下文预算（字符数，env AGENT_CONTEXT_BUDGET 可配，默认 24000）
   let ctxBudget = parseInt(env.AGENT_CONTEXT_BUDGET || '24000', 10);
   if (!(ctxBudget > 0)) ctxBudget = 24000;
-  // 超时暂停：保存循环状态，用户发「继续」即恢复。无 R2 时退化为直接终结。
   const pauseForResume = async () => {
     const t = stripDSMLBlocks(lastAssistantText());
     let saved = false;
@@ -135,29 +130,21 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
     return { text: '（本次任务超时，已停止）' + (t ? '\n\n' + t : ''), usedTools: true };
   };
 
-  // typing 心跳：长推理 / 长工具调用期间每 20 秒刷新一次"正在输入"，
-  // 任何 return / throw 分支都会在 finally 里清理定时器
   const heartbeat = setInterval(() => {
     try { tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {}); } catch (e) {}
   }, 20000);
   try {
-  // 重复调用熔断：记录每步工具调用签名，连续 3 步完全相同即判定模型原地打转
   const callSigHistory = [];
-  // v6.9.4：工具失败计数。同一工具连续失败时注入纠偏提示，避免模型用同样参数空转
   let toolFailStreak = 0;
   for (let step = 0; step < maxSteps; step++) {
     if (Date.now() > deadline) return await pauseForResume();
     const stepLabel = '🤖 Agent 思考中' + (isResume ? '（继续）' : '') + '（第 ' + (step + 1) + ' 步）…';
-    // 每步开始先报进度：LLM 长思考时用户也能看到活着
     if (typeof onProgress === 'function') {
       try { await onProgress(stepLabel); } catch (e) {}
     }
-    // 长推理时保持 typing 状态不消失
     try { tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {}); } catch (e) {}
 
-    // 超预算时裁剪本轮循环产生的旧 tool 轮次（成对删除，保证消息序列合法）
     const sendMessages = trimAgentMessages(messages, loopStartIdx, ctxBudget);
-    // 真流式：请求 stream: true，正文 / 推理增量边到边推给客户端（AGENT_STREAM_UPSTREAM=0 可关）
     const cfg = buildAIRequest(env, targetModelId, sendMessages, useUpstreamStream, tools);
     if (cfg.error) return { error: cfg.error };
 
@@ -204,7 +191,6 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       return { error: '网络错误：' + (emsg || String(e)) };
     }
 
-    // 图片生成通道：直接返回图片链接（不走工具循环）
     if (msg.imageUrl) {
       return { text: '[🖼️ 点击查看生成的图片](' + msg.imageUrl + ')', usedTools: false, isImage: true };
     }
@@ -212,7 +198,6 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       return { error: 'AI 没有返回有效内容' };
     }
 
-    // 原生 tool_calls 为空时，尝试从 content 解析 DSML 文本格式工具调用
     let toolCalls = msg.toolCalls || [];
     let assistantText = msg.content || '';
     if (!toolCalls.length && assistantText.indexOf('DSML') !== -1) {
@@ -228,7 +213,6 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
     if (reasoning) assistantMsg.reasoning_content = reasoning;
     messages.push(assistantMsg);
 
-    // 兜底：任何返回给用户的文本都不允许携带 DSML markup
     if (!toolCalls.length) {
       const clean = stripDSMLBlocks(assistantText).trim();
       if (!clean) {
@@ -245,7 +229,6 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       return { text: clean, usedTools: step > 0 };
     }
 
-    // 重复调用熔断：连续 3 步工具调用完全相同 → 判定原地打转，直接收尾
     const stepSig = toolCalls.map(toolCallSignature).sort().join(';;');
     callSigHistory.push(stepSig);
     if (callSigHistory.length >= 3 &&
@@ -259,7 +242,6 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
 
     await rollbackStreamed(msg.forwarded);
 
-    // 进度提示：让用户看到 Agent 在干什么（force 突破节流）
     if (typeof onProgress === 'function') {
       try {
         const descs = toolCalls.map(tc => {
@@ -272,7 +254,6 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       } catch (e) {}
     }
 
-    // 同一步的多个工具调用并行执行（顺序写回，保证消息顺序）
     const toolResults = await Promise.all(toolCalls.map(async (tc) => {
       const fn = (tc && tc.function) || {};
       let args = {};
@@ -304,7 +285,6 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
   } finally {
     clearInterval(heartbeat);
   }
-  // 步数用尽：先做一次无工具收尾，让模型基于已有工具结果给出最终答案。
   const wrapUp = await agentWrapUp(env, targetModelId, messages, loopStartIdx, ctxBudget, deadline, onDelta);
   if (wrapUp && wrapUp.text) return { text: wrapUp.text, usedTools: true, streamed: !!wrapUp.streamed };
   const t = stripDSMLBlocks(lastAssistantText());
@@ -324,6 +304,7 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
 
 export {
   isToolResultFailure,
+  extractMsgPlainText,
   tgAgentDeadline,
   tgAgentChat,
   tgAgentResume,

@@ -1,22 +1,25 @@
-// Agent 工具定义与分发（_worker.js 原第 323-485 行）
+// Agent 工具定义与分发（v7.0.0 全套无配置增强：共 13 个零密钥工具）
 
 import { toolWebSearch, toolWebFetch } from './tools-web.js';
-import { toolCalculate, toolGetTime, toolGetWeather } from './tools-local.js';
-import { agentSaveMemory } from './memory.js';
+import { toolCalculate, toolGetTime, toolGetWeather, toolExchangeRate, toolWikiLookup } from './tools-local.js';
+import { agentSaveMemory, agentForgetMemory } from './memory.js';
 import { toolSaveDoc, toolListDocs, toolReadDoc, toolDeleteDoc } from '../kb/doc-tools.js';
 
-// ==================== Telegram Agent：工具定义 ====================
-// 全部工具零密钥、零成本：DuckDuckGo（搜索）、任意网页抓取、自研计算器、
-// Open-Meteo（天气）、Intl（时间）、R2（长期记忆）、R2（知识库文档存取）。
-// kbReadOnly（v6.9.3，Web 端）：过滤掉写入类工具（remember / save_doc / delete_doc），
-// Web 端对知识库只读——写入仅 Telegram 端开放。
+// ==================== Agent 工具定义 ====================
+// 全部工具零密钥、零成本：
+//   - 通用信息与计算：web_search（DuckDuckGo）、web_fetch（结构化正文 + 分页 + Jina 回退）、
+//     wiki_lookup（中英维基百科词条）、exchange_rate（实时法币汇率 + 主流加密币价）、
+//     calculate（科学计算器）、get_time（当前时间 + 日期差/加减推算）、get_weather（Open-Meteo）
+//   - 知识库读取（两端可用）：list_docs、read_doc（支持 offset 分页与多关键词全文相关性检索）
+//   - 知识库与长期记忆写入（仅 Telegram 端可用，Web 端 kbReadOnly 自动过滤并硬拦截）：
+//     remember、forget_memory、save_doc、delete_doc
 function getAgentTools(kbReadOnly) {
   const tools = [
     {
       type: 'function',
       function: {
         name: 'web_search',
-        description: '联网搜索最新信息。仅在需要时效性内容（实时新闻、价格、股价、赛事结果等）或问题超出你知识范围时使用；稳定的常识性知识不要搜，直接回答。',
+        description: '联网搜索最新信息。仅在需要时效性内容（实时新闻、近期事件、赛事结果等）或问题超出你知识范围时使用；稳定的常识性知识不要搜，直接回答。',
         parameters: {
           type: 'object',
           properties: {
@@ -31,10 +34,13 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'web_fetch',
-        description: '抓取指定网页的正文纯文本，用于总结文章、阅读文档页面（返回清理后的文本，可能截断）。只对搜索结果中或用户明确给出的 URL 使用，不要猜测/编造 URL。',
+        description: '抓取指定网页的结构化正文（保留标题、代码块、表格与列表，单次最多返回 6000 字符；长网页可传 offset 翻页续读）。只对搜索结果中或用户明确给出的 URL 使用，不要猜测/编造 URL。',
         parameters: {
           type: 'object',
-          properties: { url: { type: 'string', description: '完整的 http(s) URL' } },
+          properties: {
+            url: { type: 'string', description: '完整的 http(s) URL' },
+            offset: { type: 'integer', description: '可选：起始字符偏移量（默认 0），用于长网页翻页续读' }
+          },
           required: ['url']
         }
       }
@@ -42,11 +48,44 @@ function getAgentTools(kbReadOnly) {
     {
       type: 'function',
       function: {
-        name: 'calculate',
-        description: '精确数学计算，支持加减乘除、乘方(^)、取余(%)、括号。任何需要数字运算的场景（哪怕看起来简单）都用它，不要心算。',
+        name: 'wiki_lookup',
+        description: '查询维基百科（Wikipedia）权威词条摘要与相关条目，自动识别中英文。查人物、历史事件、科学概念、地理或专有名词的定义与背景时优先使用，比通用网页搜索更准确且无广告噪音。',
         parameters: {
           type: 'object',
-          properties: { expression: { type: 'string', description: '如 (3+5)*2^3/4' } },
+          properties: {
+            query: { type: 'string', description: '词条名称或搜索关键词，如"量子纠缠"、"Alan Turing"' },
+            lang: { type: 'string', description: '可选：语言代码 zh 或 en，默认按关键词自动识别' }
+          },
+          required: ['query']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'exchange_rate',
+        description: '查询实时法币汇率换算（支持 USD/CNY/JPY/EUR/HKD/TWD/GBP 等全球货币）及主流加密货币实时价格与 24h 涨跌（BTC/ETH/SOL/BNB/DOGE/XRP/TON/SUI 等）。查汇率或币价时优先用它，不要用 web_search。',
+        parameters: {
+          type: 'object',
+          properties: {
+            from: { type: 'string', description: '源货币或加密币代码，如 USD、JPY、BTC、人民币' },
+            to: { type: 'string', description: '目标货币代码，默认 CNY，如 CNY、USD' },
+            amount: { type: 'number', description: '换算金额，默认 1' }
+          },
+          required: ['from']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'calculate',
+        description: '精确科学计算器，支持加减乘除、乘方(^)、取余(%)、括号、科学记数法、常量(pi, e)以及科学函数：sqrt, cbrt, abs, round(x,n), floor, ceil, sin, cos, tan, asin, acos, atan, ln, log(x,base), log10, log2, exp, pow(a,b), min, max。任何需要数字运算的场景都用它，不要心算。',
+        parameters: {
+          type: 'object',
+          properties: {
+            expression: { type: 'string', description: '数学表达式，如 (3280-1299)*1.13 或 round(sqrt(2)*pi, 4) 或 pow(1.05, 10)' }
+          },
           required: ['expression']
         }
       }
@@ -55,10 +94,15 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'get_time',
-        description: '获取当前时间，可指定 IANA 时区。用户问"现在几点/今天周几/日期"之类时使用，不要凭记忆回答时间。',
+        description: '获取当前时间（可指定 IANA 时区），并支持精确日期推算：计算两个日期之间相差多少天/周（target_date），或计算某日期加减 N 天后的具体日期与星期几（add_days）。遇到时间、日期差、倒计时推算时必须用它，不要心算日历。',
         parameters: {
           type: 'object',
-          properties: { timezone: { type: 'string', description: '如 Asia/Shanghai，默认 Asia/Shanghai' } }
+          properties: {
+            timezone: { type: 'string', description: 'IANA 时区，如 Asia/Shanghai、America/New_York，默认 Asia/Shanghai' },
+            base_date: { type: 'string', description: '可选：基准日期 YYYY-MM-DD，默认取当前时区的今天' },
+            target_date: { type: 'string', description: '可选：目标日期 YYYY-MM-DD，用于计算与基准日期相差的天数和周数' },
+            add_days: { type: 'integer', description: '可选：在基准日期上加减的天数（正数向后推，负数向前推）' }
+          }
         }
       }
     },
@@ -69,7 +113,9 @@ function getAgentTools(kbReadOnly) {
         description: '查询指定城市当前天气与今明两天预报。city 必须给明确城市名（如"北京"、"Tokyo"）；用户没说城市时先追问，不要猜。',
         parameters: {
           type: 'object',
-          properties: { city: { type: 'string', description: '城市名，如"北京"、"Tokyo"' } },
+          properties: {
+            city: { type: 'string', description: '城市名，如"北京"、"Tokyo"' }
+          },
           required: ['city']
         }
       }
@@ -78,11 +124,27 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'remember',
-        description: '把关于用户的重要长期信息存入记忆（如偏好、生日、项目名、常用城市），存入后以后所有对话都会记得。仅在用户明确要求记住（"记住…"）时调用，不要把临时对话内容存进去。同一主题（如"我的手机号是…"）改口后直接记住新值即可：旧值会被自动覆盖更新，无需先删除；完全相同的内容重复保存会被跳过。',
+        description: '把关于用户的重要长期信息存入记忆（如偏好、生日、项目名、常用城市），存入后以后所有对话都会记得。仅在用户明确要求记住（"记住…"）时调用，不要把临时对话内容存进去。同一主题（如"我的手机号是…"）改口后直接记住新值即可：旧值会被自动覆盖更新，无需先删除。',
         parameters: {
           type: 'object',
-          properties: { fact: { type: 'string', description: '一句话事实' } },
+          properties: {
+            fact: { type: 'string', description: '一句话事实' }
+          },
           required: ['fact']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'forget_memory',
+        description: '按关键词删除已保存的用户长期记忆。仅在用户明确要求忘掉/删除某条记忆（如"忘掉我之前的住址"、"删掉关于猫的记忆"）时调用。',
+        parameters: {
+          type: 'object',
+          properties: {
+            keyword: { type: 'string', description: '要删除的记忆关键词' }
+          },
+          required: ['keyword']
         }
       }
     },
@@ -114,10 +176,13 @@ function getAgentTools(kbReadOnly) {
       type: 'function',
       function: {
         name: 'read_doc',
-        description: '按标题关键词读取一篇知识库文档的全文（超 8000 字截断并标注）。query 给标题或关键词，模糊匹配；标题想不起来时会自动改搜正文并返回关键词附近片段；找不到时会返回现有标题列表。读到相关内容后优先引用，并注明"据知识库文档《xxx》"。',
+        description: '按标题或关键词读取知识库文档（单次返回 8000 字，超长文档可传 offset 分页续读）。query 给标题或关键词；标题对不上时会自动用多关键词分词检索全库正文并返回最相关的 Top 3 片段及 offset。读到相关内容后优先引用，并注明"据知识库文档《xxx》"。',
         parameters: {
           type: 'object',
-          properties: { query: { type: 'string', description: '文档标题或关键词，如"甲骨文ARM"' } },
+          properties: {
+            query: { type: 'string', description: '文档标题或多关键词（支持空格分隔），如"甲骨文 ARM 放货"' },
+            offset: { type: 'integer', description: '可选：读取起始字符偏移量（默认 0），用于长文档翻页或跳转到检索命中的 offset' }
+          },
           required: ['query']
         }
       }
@@ -129,29 +194,27 @@ function getAgentTools(kbReadOnly) {
         description: '删除一篇知识库文档（R2 kb/docs/）。仅在用户明确要求删除文档时调用；query 给标题或关键词模糊匹配，找不到会返回现有标题列表。删除不可逆，调用前确保用户意图明确。',
         parameters: {
           type: 'object',
-          properties: { query: { type: 'string', description: '文档标题或关键词' } },
+          properties: {
+            query: { type: 'string', description: '文档标题或关键词' }
+          },
           required: ['query']
         }
       }
     }
   ];
   if (kbReadOnly) {
-    const writes = ['remember', 'save_doc', 'delete_doc'];
+    const writes = ['remember', 'forget_memory', 'save_doc', 'delete_doc'];
     return tools.filter(t => writes.indexOf(t.function.name) === -1);
   }
   return tools;
 }
 
 async function execAgentTool(name, args, env, chatId, kbReadOnly) {
-  // v6.9.3 执行层硬校验：Web 端（kbReadOnly）即使模型幻觉出写入类工具调用
-  // （DSML 文本格式不校验工具清单），也绝不执行——只读必须强制在执行层，
-  // 不能只靠工具声明与提示词。返回的说明会作为工具结果回给模型，
-  // 引导它如实向用户说明该操作仅 Telegram 端支持。
-  if (kbReadOnly && (name === 'remember' || name === 'save_doc' || name === 'delete_doc')) {
-    return '工具 ' + name + ' 在本端不可用：知识库为只读，写入（记忆 / 文档保存与删除）仅 Telegram 端支持。请如实告知用户，并引导其通过 Telegram 机器人完成该操作；不要声称已完成。';
+  args = args || {};
+  // v6.9.3 / v7.0.0 执行层硬校验：Web 端（kbReadOnly）即使模型幻觉出写入类工具调用，也绝不执行
+  if (kbReadOnly && (name === 'remember' || name === 'forget_memory' || name === 'save_doc' || name === 'delete_doc')) {
+    return '工具 ' + name + ' 在本端不可用：知识库为只读，写入与删除（记忆 / 文档保存与删除）仅 Telegram 端支持。请如实告知用户，并引导其通过 Telegram 机器人完成该操作；不要声称已完成。';
   }
-  // 兜底超时：单个工具最长执行时间，防止 abort 信号无法中断 hung 住的请求体
-  // （如永不结束的流式响应）。可通过 AGENT_TOOL_TIMEOUT_MS 调整，默认 30 秒。
   let toolTimeoutMs = parseInt(env.AGENT_TOOL_TIMEOUT_MS || '30000', 10);
   if (!(toolTimeoutMs > 0)) toolTimeoutMs = 30000;
   let timer;
@@ -159,11 +222,22 @@ async function execAgentTool(name, args, env, chatId, kbReadOnly) {
     const run = (async () => {
       switch (name) {
         case 'web_search': return await toolWebSearch(args.query, args.count);
-        case 'web_fetch': return await toolWebFetch(args.url);
+        case 'web_fetch': return await toolWebFetch(args.url, args.offset);
+        case 'wiki_lookup': return await toolWikiLookup(args.query, args.lang);
+        case 'exchange_rate': return await toolExchangeRate(args);
         case 'calculate': return toolCalculate(args.expression);
-        case 'get_time': return toolGetTime(args.timezone);
+        case 'get_time': return toolGetTime(args.timezone, args);
         case 'get_weather': return await toolGetWeather(args.city);
         case 'remember': return await agentSaveMemory(env, chatId, args.fact);
+        case 'forget_memory': {
+          const kw = String(args.keyword || '').trim();
+          if (!kw) return '关键词为空，未删除任何记忆';
+          const rr = await agentForgetMemory(env, chatId, kw);
+          if (rr.persistError) return rr.persistError;
+          return rr.removed > 0
+            ? '已删除 ' + rr.removed + ' 条包含「' + kw + '」的长期记忆'
+            : '未找到包含「' + kw + '」的长期记忆';
+        }
         case 'save_doc': return await toolSaveDoc(env, chatId, args);
         case 'list_docs': return await toolListDocs(env);
         case 'read_doc': return await toolReadDoc(env, args);

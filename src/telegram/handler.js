@@ -1,4 +1,4 @@
-// Telegram Webhook：命令、模型选择、Agent 对话与回复发送（_worker.js 原第 2053-2443 行）
+// Telegram Webhook：命令、模型选择、文件/图片多模态处理、Agent 对话与回复发送
 
 import { APP_VERSION } from '../constants.js';
 import { mapSetBounded, mapGetBounded, parseCommaSeparated, safeEqual } from '../utils.js';
@@ -16,9 +16,7 @@ import { toolListDocs } from '../kb/doc-tools.js';
 const tgUserModels = new Map();
 const tgUserModelsExp = new Map();
 // update_id 去重缓存（L1 内存）：
-// key 为 Telegram update_id，value 为首次见到时间戳；去重窗口 10 分钟。
 const seenUpdateIds = new Map();
-// v6.8.1：TG_WEBHOOK_SECRET 缺失告警，每个 isolate 只打一次
 let warnedNoWebhookSecret = false;
 
 // ================= update_id 去重（v6.8.9：L1 内存 + L2 R2 滚动窗口） =================
@@ -32,7 +30,6 @@ async function loadDedupWindow(env) {
   } catch (e) {}
   return [];
 }
-// 返回 true 表示该 update 已在窗口内（重复投递），应直接忽略
 async function markUpdateSeen(env, uid) {
   if (uid === undefined || uid === null) return false;
   const now = Date.now();
@@ -47,11 +44,9 @@ async function markUpdateSeen(env, uid) {
   if (fresh.length > TG_DEDUP_MAX) fresh.splice(0, fresh.length - TG_DEDUP_MAX);
   try { await storePutChecked(env, TG_DEDUP_KEY, JSON.stringify(fresh)); } catch (e) {}
   seenUpdateIds.set(uid, now);
-  // 顺手清理内存里的过期条目，防止 Map 无限增长
   for (const [k, t] of seenUpdateIds) { if (now - t > TG_DEDUP_WINDOW_MS) seenUpdateIds.delete(k); }
   return false;
 }
-// v6.8.7：处理异常时释放去重标记 —— Telegram 因超时重发该 update 时还能重试
 async function releaseUpdateForRetry(env, uid) {
   if (uid === undefined || uid === null) return;
   seenUpdateIds.delete(uid);
@@ -63,15 +58,13 @@ async function releaseUpdateForRetry(env, uid) {
 }
 
 // 命令解析（v6.8.6）：兼容群组里的 /cmd@botname 写法与命令后带参数。
-// 返回 { cmd, rest }，非命令文本返回 null。
 function parseCommand(t) {
   const m = /^(\/[a-zA-Z]+)(?:@[a-zA-Z0-9_]+)?(?:\s+([\s\S]*))?$/.exec(String(t || '').trim());
   if (!m) return null;
   return { cmd: m[1].toLowerCase(), rest: (m[2] || '').trim() };
 }
 
-// v6.9.5：长消息按 3980 字符切分，若切分点位于未闭合的 ``` 代码块内，
-// 自动在当前分片末尾补 ``` 并在下一分片开头重开代码块，避免 Telegram Markdown 报 400 降级为纯文本。
+// v6.9.5：长消息按 3980 字符切分，自动闭合跨分片的 ``` 代码块
 function splitTelegramMarkdown(text, maxLength = 3980) {
   const chunks = [];
   let remaining = String(text || '');
@@ -99,9 +92,41 @@ function splitTelegramMarkdown(text, maxLength = 3980) {
   return chunks;
 }
 
+// ================= v7.0.0：Telegram 文件直传与图片多模态辅助 =================
+const SUPPORTED_DOC_EXT_RE = /\.(md|markdown|txt|csv|tsv|json|jsonl|log|py|js|mjs|ts|tsx|jsx|html|htm|css|xml|yaml|yml|toml|ini|conf|sh|bash|sql|go|rs|java|c|cpp|h)$/i;
+
+async function tgFetchFileBytes(env, fileId, maxBytes, timeoutMs) {
+  const metaRes = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`, {
+    signal: AbortSignal.timeout(timeoutMs || 15000)
+  });
+  if (!metaRes.ok) throw new Error('获取文件信息失败 (HTTP ' + metaRes.status + ')');
+  const meta = await metaRes.json();
+  const filePath = meta && meta.result && meta.result.file_path;
+  if (!filePath) throw new Error('Telegram 未返回有效文件路径');
+  if (meta.result.file_size && maxBytes && meta.result.file_size > maxBytes) {
+    throw new Error('文件体积超过上限（最大支持 ' + Math.round(maxBytes / 1024) + ' KB）');
+  }
+  const fileRes = await fetch(`https://api.telegram.org/file/bot${env.TG_BOT_TOKEN}/${filePath}`, {
+    signal: AbortSignal.timeout(timeoutMs || 15000)
+  });
+  if (!fileRes.ok) throw new Error('下载文件失败 (HTTP ' + fileRes.status + ')');
+  const buf = await fileRes.arrayBuffer();
+  if (maxBytes && buf.byteLength > maxBytes) {
+    throw new Error('文件体积超过上限（最大支持 ' + Math.round(maxBytes / 1024) + ' KB）');
+  }
+  return new Uint8Array(buf);
+}
+
+function uint8ToBase64(bytes) {
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
 export async function handleTgWebhook(request, env) {
-  // Webhook 来源校验：配置 TG_WEBHOOK_SECRET 后，只接受携带正确
-  // X-Telegram-Bot-Api-Secret-Token 请求头的调用（setWebhook 时传入 secret_token）。
   if (env.TG_WEBHOOK_SECRET) {
     const got = request.headers.get('X-Telegram-Bot-Api-Secret-Token') || '';
     if (!safeEqual(got, env.TG_WEBHOOK_SECRET)) {
@@ -150,7 +175,6 @@ export async function handleTgWebhook(request, env) {
               mapSetBounded(tgUserModels, chatId, selected.id, undefined, tgUserModelsExp);
               await storePut(env, `tg_user_${chatId}`, selected.id);
 
-              // v6.9.5：清理模型显示名中的反引号，防止破坏 Markdown 代码段导致 400 静默失败
               const safeModelName = String(selected.name || selected.id).replace(/`/g, "'");
               await tgApi('sendMessage', {
                 chat_id: chatId,
@@ -164,12 +188,63 @@ export async function handleTgWebhook(request, env) {
           return;
         }
 
-        if (update.message && update.message.text) {
-          const chatId = update.message.chat.id;
-          if (!isChatAllowed(chatId)) return; // 不在白名单：静默忽略
-          const userText = update.message.text;
+        const msg = update.message;
+        if (!msg || !msg.chat) return;
+        const chatId = msg.chat.id;
+        if (!isChatAllowed(chatId)) return;
 
-          const cmd = parseCommand(userText);
+        // 提取消息内容：支持纯文本、文本文档直传（.md/.txt/.csv/.json/代码）、图片（Vision 多模态）
+        let userText = typeof msg.text === 'string' ? msg.text : '';
+        let multimodalContent = null;
+        let historyUserText = userText;
+
+        if (!userText && msg.document) {
+          const doc = msg.document;
+          const fileName = String(doc.file_name || 'document.txt');
+          const mime = String(doc.mime_type || '');
+          const isTextDoc = mime.startsWith('text/') || /json|xml|javascript|csv|yaml/i.test(mime) || SUPPORTED_DOC_EXT_RE.test(fileName);
+          if (!isTextDoc) {
+            await tgApi('sendMessage', {
+              chat_id: chatId,
+              text: '⚠️ 暂仅支持文本类文档（如 .md / .txt / .csv / .json / 代码文件），当前文件类型：' + (mime || fileName)
+            });
+            return;
+          }
+          try {
+            const bytes = await tgFetchFileBytes(env, doc.file_id, 512 * 1024, tgApiTimeoutMs);
+            let docText = new TextDecoder('utf-8').decode(bytes);
+            if (docText.length > 60000) {
+              docText = docText.slice(0, 60000) + '\n\n…（文件较长，已截取前 60000 字符）';
+            }
+            const caption = String(msg.caption || '').trim() || '请阅读并总结这份文档的核心内容；如果我要求保存到知识库，请调用 save_doc 工具。';
+            userText = `【上传文件：《${fileName}》】\n用户说明：${caption}\n\n文件内容如下：\n\`\`\`\n${docText}\n\`\`\``;
+            historyUserText = `【上传文件：《${fileName}》】${caption}`;
+          } catch (e) {
+            await tgApi('sendMessage', { chat_id: chatId, text: '⚠️ 读取上传文件失败：' + (e && e.message ? e.message : String(e)) });
+            return;
+          }
+        } else if (!userText && Array.isArray(msg.photo) && msg.photo.length > 0) {
+          try {
+            // 选取不超过 1MB 的最高清图片尺寸
+            const candidates = msg.photo.filter(p => !p.file_size || p.file_size <= 1024 * 1024);
+            const picked = candidates.length ? candidates[candidates.length - 1] : msg.photo[msg.photo.length - 1];
+            const bytes = await tgFetchFileBytes(env, picked.file_id, 2 * 1024 * 1024, tgApiTimeoutMs);
+            const dataUrl = 'data:image/jpeg;base64,' + uint8ToBase64(bytes);
+            const caption = String(msg.caption || '').trim() || '请详细查看并分析这张图片的内容。';
+            userText = caption;
+            historyUserText = '[图片] ' + caption;
+            multimodalContent = [
+              { type: 'text', text: caption },
+              { type: 'image_url', image_url: { url: dataUrl } }
+            ];
+          } catch (e) {
+            await tgApi('sendMessage', { chat_id: chatId, text: '⚠️ 读取图片失败：' + (e && e.message ? e.message : String(e)) });
+            return;
+          }
+        }
+
+        if (userText) {
+          const cmd = !multimodalContent ? parseCommand(userText) : null;
           if (cmd && (cmd.cmd === '/start' || cmd.cmd === '/model')) {
             const inline_keyboard = modelObjList.map((model, index) => {
               return [{ text: model.name, callback_data: `M:${index}` }];
@@ -177,7 +252,7 @@ export async function handleTgWebhook(request, env) {
 
             await tgApi('sendMessage', {
               chat_id: chatId,
-              text: "⚙️ **请选择对话要使用的 AI 模型:**\n\n_支持多轮对话（最近 " + (parseInt(env.TG_HISTORY_ROUNDS || '10', 10) || 10) + " 轮），发送 /clear 可清空上下文。_\n\n🤖 **Agent 模式**（默认开启）：我会自主规划、调用工具（🔍 联网搜索、📄 网页读取、🧮 精确计算、🌤 天气、🕐 时间），并用 🧠 长期记住你告诉我的事、用 💾📚 存取知识库文档。发送 /agent 可切换为普通对话模式，/help 查看全部命令。",
+              text: "⚙️ **请选择对话要使用的 AI 模型:**\n\n_支持多轮对话（最近 " + (parseInt(env.TG_HISTORY_ROUNDS || '10', 10) || 10) + " 轮），支持直接发送图片识图或上传 .md/.txt/.csv 文档，发送 /clear 可清空上下文。_\n\n🤖 **Agent 模式**（默认开启）：我会自主规划、调用 13 项工具（🔍 搜索、📄 网页、🌐 维基百科、💱 实时汇率/币价、🧮 科学计算、🌤 天气、🕐 时间/日期推算），并用 🧠🗑️ 管理长期记忆、用 💾📚📖 存取知识库文档。发送 /agent 可切换为普通对话模式，/help 查看全部命令。",
               parse_mode: "Markdown",
               reply_markup: { inline_keyboard }
             });
@@ -202,8 +277,9 @@ export async function handleTgWebhook(request, env) {
                 + "/forget 关键词 —— 删除包含关键词的记忆\n"
                 + "/kb —— 知识库总览（文档列表 + 记忆统计）\n"
                 + "任务太长被暂停时，发送「继续」可接着做\n\n"
-                + "Agent 模式下我会自主规划、调用工具（🔍 搜索、📄 网页、🧮 计算、🌤 天气、🕐 时间），长期记住你告诉我的事，还能用 💾 保存、📚 查阅知识库文档（比如：把这篇文章存成知识库文档；问知识库里的问题我会优先查文档）。"
-                + "\n\n📌 当前版本 v" + APP_VERSION + "（R2 持久化 · 长期记忆无上限）"
+                + "✨ 支持直接发送图片（多模态识图）或上传文本文件（.md/.txt/.csv/.json 等，可直接总结或说“存进知识库”）。\n"
+                + "🛠️ Agent 工具箱：🔍 联网搜索、📄 结构化网页阅读、🌐 维基百科、💱 实时汇率/加密币价、🧮 科学计算器、🌤 天气预报、🕐 时间与日期差推算、🧠🗑️ 长期记忆存取、💾📚📖 知识库文档分页精读与多关键词检索。"
+                + "\n\n📌 当前版本 v" + APP_VERSION + "（R2 持久化 · 全套零配置增强）"
             });
             return;
           }
@@ -215,7 +291,7 @@ export async function handleTgWebhook(request, env) {
             } else {
               let text = '🧠 长期记忆（共' + mems.length + '条）：\n';
               mems.forEach((mm, i) => { text += (i + 1) + '. ' + mm.fact + '\n'; });
-              text += '\n用 /forget 关键词 删除记忆。';
+              text += '\n用 /forget 关键词 删除记忆，或直接对我说「忘掉关于xxx的记忆」。';
               for (let s = 0; s < text.length; s += 4000) {
                 await tgApi('sendMessage', { chat_id: chatId, text: text.slice(s, s + 4000) });
               }
@@ -228,7 +304,7 @@ export async function handleTgWebhook(request, env) {
             let text = '📚 知识库总览\n\n';
             text += '🧠 长期记忆：共' + mems.length + '条（/memory 查看，/forget 关键词 删除）\n\n';
             text += await toolListDocs(env);
-            text += '\n\n💾 保存文档：对我说"把…存成知识库文档"；🗑️ 删文档：说"删除知识库文档《标题》"';
+            text += '\n\n💾 保存文档：对我说"把…存成知识库文档"或直接上传 .md/.txt 文件；🗑️ 删文档：说"删除知识库文档《标题》"';
             for (let s = 0; s < text.length; s += 4000) {
               await tgApi('sendMessage', { chat_id: chatId, text: text.slice(s, s + 4000) });
             }
@@ -255,7 +331,7 @@ export async function handleTgWebhook(request, env) {
             await tgApi('sendMessage', {
               chat_id: chatId,
               text: !cur
-                ? "🤖 **Agent 模式已开启**\n\n我会自主规划、调用工具（🔍 联网搜索、📄 网页读取、🧮 精确计算、🌤 天气、🕐 时间），长期记住你告诉我的重要信息，还能用 💾 保存、📚 查阅知识库文档。"
+                ? "🤖 **Agent 模式已开启**\n\n我会自主规划、调用工具（🔍 联网搜索、📄 网页读取、🌐 维基百科、💱 汇率/币价、🧮 科学计算、🌤 天气、🕐 时间与日期推算），长期记住或清理你告诉我的重要信息，还能用 💾 保存、📚 查阅知识库文档。"
                 : "💬 **已切换为普通对话模式**\n\n单轮问答，不调用工具、不使用长期记忆。如需 Agent 能力再发送 /agent 切回。",
               parse_mode: "Markdown"
             });
@@ -269,8 +345,7 @@ export async function handleTgWebhook(request, env) {
           }
 
           const useAgent = await agentGetMode(env, chatId);
-          // v6.9.5：先检查是否为「继续」断点续做；若是续做，不把"继续"当作新问题塞入对话历史
-          const wantResume = useAgent && userText.trim() === '继续';
+          const wantResume = useAgent && !multimodalContent && userText.trim() === '继续';
           let resumeState = null;
           if (wantResume) resumeState = await agentLoadResumeState(env, chatId);
           if (useAgent && !resumeState) await agentClearResumeState(env, chatId);
@@ -278,7 +353,7 @@ export async function handleTgWebhook(request, env) {
           const baseHistory = await tgGetHistory(env, chatId);
           let history = baseHistory.slice();
           if (!resumeState) {
-            history.push({ role: "user", content: userText });
+            history.push({ role: "user", content: multimodalContent || userText });
             history = tgTrimHistory(history, env);
           }
 
@@ -301,16 +376,16 @@ export async function handleTgWebhook(request, env) {
             tgApi('sendMessage', { chat_id: chatId, text: '⚠️ 处理消息时出错：' + (err && err.message ? err.message : String(err)) }).catch(() => {});
           };
 
-          // ===== Agent 主流程：自主规划 → 工具调用 → 汇总作答 =====
           let replyText = null;
           let agentErr = null;
 
           let webhookBudgetMs = parseInt(env.TG_WEBHOOK_BUDGET_MS || '55000', 10);
           if (!(webhookBudgetMs >= 10000)) webhookBudgetMs = 55000;
           if (webhookBudgetMs > 240000) webhookBudgetMs = 240000;
-          const agentOpts = { maxRuntimeMs: webhookBudgetMs, resumeKey: tgAgentResumeKey(chatId), origUserText: userText };
+          const agentOpts = { maxRuntimeMs: webhookBudgetMs, resumeKey: tgAgentResumeKey(chatId), origUserText: historyUserText };
 
-          if (useAgent) {
+          // 图片消息优先走无工具单轮多模态调用（部分上游模型不支持 tools + image_url 混用），若开启 Agent 且非图片则走 ReAct 循环
+          if (useAgent && !multimodalContent) {
             let lastProgressEdit = 0;
             const onProgress = async (text, force) => {
               if (!pendingMsgId) return;
@@ -344,17 +419,11 @@ export async function handleTgWebhook(request, env) {
               agentErr = r.error;
             } else {
               replyText = r.text;
-              // v6.9.5：仅在任务彻底完成（!r.paused）时将问答成对记入历史，
-              // 避免多段「继续」与半截暂停提示语污染 tg_hist_<chatId> 上下文。
               if (!r.paused) {
                 if (!r.isImage && replyText) {
-                  let finalHist = history;
-                  if (resumeState) {
-                    finalHist = baseHistory.slice();
-                    if (resumeState.origUserText) {
-                      finalHist.push({ role: "user", content: resumeState.origUserText });
-                    }
-                  }
+                  let finalHist = baseHistory.slice();
+                  const qToSave = resumeState ? (resumeState.origUserText || '') : historyUserText;
+                  if (qToSave) finalHist.push({ role: "user", content: qToSave });
                   finalHist.push({ role: "assistant", content: replyText });
                   finalHist = tgTrimHistory(finalHist, env);
                   await tgSaveHistory(env, chatId, finalHist);
@@ -363,7 +432,7 @@ export async function handleTgWebhook(request, env) {
               }
             }
           } else {
-            // 普通模式：单次问答（与旧版行为一致，不调用工具）
+            // 普通模式或多模态图片识图问答
             const aiConfig = buildAIRequest(env, targetModelId, history, false);
             if (aiConfig.error) {
               if (pendingMsgId) {
@@ -403,9 +472,11 @@ export async function handleTgWebhook(request, env) {
                   replyText = "AI 没有返回有效内容。";
                 }
                 if (aiData.choices && aiData.choices[0]?.message && replyText) {
-                  history.push({ role: "assistant", content: replyText });
-                  history = tgTrimHistory(history, env);
-                  await tgSaveHistory(env, chatId, history);
+                  let finalHist = baseHistory.slice();
+                  finalHist.push({ role: "user", content: historyUserText });
+                  finalHist.push({ role: "assistant", content: replyText });
+                  finalHist = tgTrimHistory(finalHist, env);
+                  await tgSaveHistory(env, chatId, finalHist);
                 }
               } else {
                 let diag = '';
@@ -415,7 +486,7 @@ export async function handleTgWebhook(request, env) {
                       + '：' + await readErrorBody(aiResponse, 300) + '）';
                   } catch (e) {}
                 }
-                agentErr = "⚠️ AI 接口请求失败，请稍后再试。" + diag;
+                agentErr = (multimodalContent ? "⚠️ 当前模型可能不支持图片识别（请用 /model 切换到支持视觉的多模态模型，如 GPT-4o / Qwen-VL）。" : "⚠️ AI 接口请求失败，请稍后再试。") + diag;
               }
             }
           }
@@ -478,7 +549,6 @@ export async function handleTgWebhook(request, env) {
   }
 }
 
-// 供单元测试使用（纯函数与去重窗口逻辑）
 export {
   parseCommand,
   splitTelegramMarkdown,

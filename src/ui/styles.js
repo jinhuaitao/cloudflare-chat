@@ -178,7 +178,6 @@ export default `  <style>
     }
     .session-item:hover { background: var(--hover); color: var(--text); }
     .session-item.active { background: var(--accent-soft); color: var(--accent); font-weight: 550; }
-    /* v6.9.0：激活会话左侧的强调条（绝对定位，不挤占标题空间） */
     .session-item::before {
       content: '';
       position: absolute; left: 0; top: 22%; bottom: 22%;
@@ -224,7 +223,6 @@ export default `  <style>
     }
     .theme-toggle:hover { background: var(--hover); color: var(--text); }
     .theme-toggle.active { background: var(--accent-soft); color: var(--accent); }
-    /* hidden 属性必须显式处理：display:grid 会覆盖浏览器默认的 [hidden] 样式 */
     .theme-toggle[hidden] { display: none; }
 
     .sidebar-overlay {
@@ -301,7 +299,6 @@ export default `  <style>
       flex-direction: column;
     }
 
-    /* v6.9.0：「回到底部」悬浮按钮 —— sticky 定位在滚动容器底部，永远悬于输入区上方 */
     .scroll-bottom-btn {
       position: sticky;
       bottom: 12px;
@@ -339,7 +336,6 @@ export default `  <style>
       to   { opacity: 1; transform: none; }
     }
 
-    /* 头像用伪元素实现：脚本只创建 .message-bubble，这样无需改动任何 JS */
     .message-row::before {
       content: 'AI';
       flex: 0 0 30px;
@@ -455,7 +451,7 @@ export default `  <style>
       white-space: pre;
     }
 
-    /* ---------------- 推理过程 / 消息操作 ---------------- */
+    /* ---------------- 推理过程 / 工具轨迹胶囊 / 消息操作 ---------------- */
     .reasoning-box {
       font-size: 13.5px; color: var(--text-2);
       background: var(--bg-soft);
@@ -470,6 +466,55 @@ export default `  <style>
     .reasoning-box::-webkit-scrollbar { width: 4px; }
     .reasoning-box::-webkit-scrollbar-thumb { background: rgba(128, 128, 128, .3); border-radius: 4px; }
 
+    /* v7.0.0：可折叠「工具调用轨迹胶囊」 */
+    .agent-trace {
+      margin: 0 0 12px;
+      border: 1px solid var(--border);
+      background: var(--bg-soft);
+      border-radius: 10px;
+      font-size: 12.5px;
+      color: var(--text-2);
+      overflow: hidden;
+    }
+    .agent-trace-summary {
+      padding: 6px 12px;
+      cursor: pointer;
+      font-weight: 550;
+      user-select: none;
+      list-style: none;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      transition: background .12s ease, color .12s ease;
+    }
+    .agent-trace-summary::-webkit-details-marker { display: none; }
+    .agent-trace-summary::after {
+      content: '▾';
+      font-size: 12px;
+      color: var(--muted);
+      transition: transform .15s ease;
+    }
+    .agent-trace[open] .agent-trace-summary::after {
+      transform: rotate(180deg);
+    }
+    .agent-trace-summary:hover {
+      background: var(--hover);
+      color: var(--text);
+    }
+    .agent-trace-list {
+      padding: 6px 12px 10px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .agent-trace-item {
+      color: var(--text-2);
+      overflow-wrap: anywhere;
+    }
+
     .msg-actions {
       display: flex; gap: 2px; align-items: center;
       margin-top: 8px; flex-wrap: wrap;
@@ -478,14 +523,12 @@ export default `  <style>
     }
     .message-row:hover .msg-actions { opacity: 1; }
 
-    /* v6.9.0：消息时间戳，随操作行一起悬浮出现 */
     .msg-time {
       font-size: 11px; color: var(--muted);
       margin-right: 7px; line-height: 27px;
       user-select: none; white-space: nowrap;
     }
 
-    /* 消息操作按钮：朗读 / 复制 / 重新生成。纯图标 + title 提示，尺寸统一 27px */
     .icon-btn, .speak-btn {
       width: 27px; height: 27px; padding: 0;
       display: grid; place-items: center;
@@ -499,7 +542,6 @@ export default `  <style>
     .icon-btn:focus-visible, .speak-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
     .icon-btn svg, .speak-btn svg { width: 16px; height: 16px; display: block; pointer-events: none; }
 
-    /* 复制成功后短暂切成对勾 */
     .icon-btn.done { color: var(--accent); }
     .icon-btn.done:hover { background: var(--accent-soft); }
 
@@ -535,7 +577,6 @@ export default `  <style>
     }
 
     /* ---------------- 空状态 ---------------- */
-    /* 脚本会写入 inline 的 display:flex / none，这里只补充轴向与对齐 */
     .empty-state {
       flex-direction: column;
       align-items: center;
@@ -560,7 +601,6 @@ export default `  <style>
     }
     .empty-state p { margin: 8px 0 0; font-size: 14.5px; color: var(--muted); }
 
-    /* v6.9.0：空状态示例提问卡片 —— 点击填入输入框 */
     .suggestion-grid {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -693,8 +733,6 @@ export default `  <style>
     }
 
     /* ---------------- 设置弹窗 ---------------- */
-    /* 脚本会先写 inline display:flex，10ms 后再加 .active；
-       因此居中必须用 flex 而不是 grid（inline display 优先级更高）。 */
     .settings-modal-overlay {
       position: fixed; inset: 0; z-index: 70;
       background: rgba(10, 12, 18, .45);
@@ -756,7 +794,6 @@ export default `  <style>
     .settings-btn:hover { filter: brightness(1.06); }
 
     /* ---------------- 通用按钮 / 确认弹窗 ---------------- */
-    /* 用来替掉浏览器原生 confirm() / alert()，样式跟随主题 */
     .btn {
       border: 1px solid var(--border-strong);
       background: var(--panel);
@@ -791,7 +828,6 @@ export default `  <style>
     .modal .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 18px; }
 
     /* ---------------- 主题切换过渡 / 动效减弱 ---------------- */
-    /* applyTheme 切换时给 body 加 .theme-anim，400ms 内全局色彩平滑过渡 */
     body.theme-anim, body.theme-anim *, body.theme-anim *::before, body.theme-anim *::after {
       transition: background-color .25s ease, border-color .25s ease, color .25s ease, box-shadow .25s ease, fill .25s ease, stroke .25s ease !important;
     }
@@ -804,7 +840,6 @@ export default `  <style>
     }
 
     /* ---------------- 移动端 ---------------- */
-    /* 断点取 768px：与原脚本里 window.innerWidth <= 768 的判断保持一致 */
     @media (max-width: 768px) {
       .sidebar {
         position: fixed; top: 0; left: 0; bottom: 0;
@@ -825,7 +860,6 @@ export default `  <style>
       .suggestion-grid { grid-template-columns: 1fr; max-width: 400px; }
       .scroll-bottom-btn { bottom: 10px; }
 
-      /* 触屏没有 hover，操作按钮常驻可见 */
       .msg-actions { opacity: 1; }
       .delete-btn { opacity: 1; }
     }
