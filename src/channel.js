@@ -126,7 +126,7 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
       model: selectedModel,
       prompt: lastPrompt,
       n: 1,
-      size: "1024x1024",
+      size: "auto",
       output_format: "png",
       response_format: "url"
     };
