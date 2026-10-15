@@ -120,25 +120,35 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
     }
   }
 
-  const payload = isImageAPI ? {
-    model: selectedModel,
-    prompt: lastPrompt,
-    n: 1
-  } : {
-    model: selectedModel,
-    // v6.9.0：只透传上游认识的标准字段。本地附加字段（如前端时间戳 t）
-    // 不剥离的话，严格校验参数的上游会整单 400
-    messages: messagesArray.map(m => {
-      const o = { role: m.role, content: m.content };
-      if (m.tool_calls) o.tool_calls = m.tool_calls;
-      if (m.tool_call_id) { o.tool_call_id = m.tool_call_id; if (m.name) o.name = m.name; }
-      if (m.reasoning_content) o.reasoning_content = m.reasoning_content;
-      return o;
-    }),
-    stream: isStream,
-    max_tokens: maxTokens,
-  };
-  if (tools && tools.length && !isImageAPI) payload.tools = tools;
+  let payload;
+  if (isImageAPI) {
+    payload = {
+      model: selectedModel,
+      prompt: lastPrompt,
+      n: 1,
+      size: "1024x1024",
+      output_format: "png",
+      response_format: "url"
+    };
+    // 针对商汤生图模型显式关闭水印（公测免去水印）
+    if (selectedModel.includes('sensenova')) {
+      payload.watermark = false;
+    }
+  } else {
+    payload = {
+      model: selectedModel,
+      messages: messagesArray.map(m => {
+        const o = { role: m.role, content: m.content };
+        if (m.tool_calls) o.tool_calls = m.tool_calls;
+        if (m.tool_call_id) { o.tool_call_id = m.tool_call_id; if (m.name) o.name = m.name; }
+        if (m.reasoning_content) o.reasoning_content = m.reasoning_content;
+        return o;
+      }),
+      stream: isStream,
+      max_tokens: maxTokens,
+    };
+    if (tools && tools.length) payload.tools = tools;
+  }
 
   return { apiUrl, currentApiKey, payload, isImageAPI };
 }
