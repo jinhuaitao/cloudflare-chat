@@ -1,9 +1,34 @@
 // Agent 工具：知识库文档的保存 / 列表 / 读取（支持分页 offset） / 多关键词分词检索 / 删除
+// v7.1.0 性能优化：新增文档正文 L1 内存缓存（支持长文档 0ms 翻页与多轮全文检索加速）+ 标题/词频加权相关性算法
 
+import { mapSetBounded, mapGetBounded } from '../utils.js';
 import { storePutChecked } from '../store/r2.js';
 import { kbSafeChatId } from '../store/kb.js';
 import { KB_DOCS_PREFIX, kbDocSlug, kbNormSource, kbDocTitleOf, kbGetRegistry,
   kbSaveRegistry, kbFindRegEntry, kbFmtSize, kbFmtDate } from './registry.js';
+
+// v7.1.0：知识库文档正文 L1 内存缓存（最多缓存 80 篇，TTL 120 秒），写入或删除时自动失效/更新
+const kbDocTextCache = new Map();
+const kbDocTextExp = new Map();
+const KB_DOC_CACHE_MAX = 80;
+const KB_DOC_CACHE_TTL_MS = 120 * 1000;
+
+async function kbReadDocTextCached(env, key) {
+  if (!env || !env.R2) return null;
+  const cached = mapGetBounded(kbDocTextCache, key, kbDocTextExp);
+  if (typeof cached === 'string') return cached;
+  try {
+    const obj = await env.R2.get(key);
+    if (!obj) return null;
+    const text = await obj.text();
+    if (text.length <= 150000) {
+      mapSetBounded(kbDocTextCache, key, text, KB_DOC_CACHE_MAX, kbDocTextExp, KB_DOC_CACHE_TTL_MS);
+    }
+    return text;
+  } catch (e) {
+    return null;
+  }
+}
 
 // 分词辅助：英文/数字按词、中文按单字 + 2-gram，用于正文多关键词相关性检索
 function docSearchTokens(s) {
@@ -24,19 +49,16 @@ function docSearchTokens(s) {
 
 async function toolSaveDoc(env, chatId, args) {
   args = args || {};
-  // v6.8.4：标题/source 去掉换行（换行会破坏 frontmatter 解析，导致重建注册表时标题丢失）
   const title = String(args.title || '').replace(/[\r\n]+/g, ' ').trim().slice(0, 80);
   const cleanSource = String(args.source || '').replace(/[\r\n]+/g, ' ').trim().slice(0, 500);
   let content = String(args.content || '');
   if (!title) return '标题为空，未保存';
   if (!content.trim()) return '内容为空，未保存';
-  // v6.8.3：R2 未绑定时必须明确失败——之前会静默跳过写入却谎称"已保存"
   if (!env.R2) return 'R2 未绑定，知识库文档无法保存。请先按 README 第二步绑定 R2 存储桶后再试；本次内容未保存。';
   if (content.length > 100000) content = content.slice(0, 100000) + '\n\n> （内容过长，仅保存前 10 万字符）';
   const file = kbDocSlug(title) + '.md';
   const key = KB_DOCS_PREFIX + file;
   const reg = await kbGetRegistry(env);
-  // 同链接去重（O(1) 查注册表）：已存为另一篇文档时拒绝
   const normSrc = kbNormSource(args.source);
   if (normSrc) {
     const dup = reg.find(e => kbNormSource(e.source) === normSrc);
@@ -51,9 +73,10 @@ async function toolSaveDoc(env, chatId, args) {
     + (cleanSource ? '\nsource: ' + cleanSource : '')
     + '\n---\n\n';
   const body = head + content;
-  // v6.8.3：校验写入结果，R2 写入失败（如权限问题）不再谎称成功
   const okDoc = await storePutChecked(env, key, body);
   if (!okDoc) return '知识库文档写入 R2 失败（' + key + '），请检查 R2 绑定与权限后重试；本次内容未保存。';
+  // 穿透更新 L1 正文缓存
+  mapSetBounded(kbDocTextCache, key, body, KB_DOC_CACHE_MAX, kbDocTextExp, KB_DOC_CACHE_TTL_MS);
   const entry = {
     file: file,
     title: title,
@@ -63,11 +86,9 @@ async function toolSaveDoc(env, chatId, args) {
   };
   const idx = reg.findIndex(e => e.file === file);
   if (idx >= 0) reg[idx] = entry; else reg.push(entry);
-  // v6.8.4：注册表写入失败必须如实返回——正文已落盘但列表查不到时，引导用户重试修复
   const okReg = await kbSaveRegistry(env, reg);
   if (!okReg) return '文档正文已写入 R2（' + key + '），但注册表更新失败，文档可能暂不出现在列表中；请稍后重新保存一次以修复注册表，本次内容未丢失。';
   let verNote = existed ? '，已覆盖旧版本' : '，新建';
-  // v6.8.4：slug 碰撞提示——"A/B" 与 "AB" 会生成同一文件，覆盖时明确告知
   if (existed && prevEntry && prevEntry.title !== title) {
     verNote += '（注意：新标题清洗后与旧文档《' + prevEntry.title + '》同名，旧内容已被覆盖）';
   }
@@ -93,24 +114,21 @@ async function toolReadDoc(env, args) {
   const MAX = 8000;
   const hit = kbFindRegEntry(reg, query);
   if (hit) {
-    try {
-      const obj = await env.R2.get(KB_DOCS_PREFIX + hit.file);
-      if (!obj) return '文档读取失败：' + (hit.title || hit.file);
-      const fullText = await obj.text();
-      const totalLen = fullText.length;
-      if (offset >= totalLen) {
-        return '【知识库文档《' + (hit.title || hit.file) + '》】偏移量 offset=' + offset + ' 已超出文档总长度（' + totalLen + ' 字符）。';
-      }
-      const slice = fullText.slice(offset, offset + MAX);
-      const nextOffset = offset + slice.length;
-      let note = '';
-      if (nextOffset < totalLen) {
-        note = '\n\n> （当前显示第 ' + offset + ' ~ ' + nextOffset + ' 字符，全文共 ' + totalLen + ' 字符；如需继续阅读后续内容，请调用 read_doc 并传 offset=' + nextOffset + '）';
-      } else if (offset > 0) {
-        note = '\n\n> （当前显示第 ' + offset + ' ~ ' + totalLen + ' 字符，已读到文档末尾）';
-      }
-      return '【知识库文档《' + (hit.title || hit.file) + '》】\n' + slice + note;
-    } catch (e) { return '文档读取失败：' + (hit.title || hit.file); }
+    const fullText = await kbReadDocTextCached(env, KB_DOCS_PREFIX + hit.file);
+    if (fullText === null) return '文档读取失败：' + (hit.title || hit.file);
+    const totalLen = fullText.length;
+    if (offset >= totalLen) {
+      return '【知识库文档《' + (hit.title || hit.file) + '》】偏移量 offset=' + offset + ' 已超出文档总长度（' + totalLen + ' 字符）。';
+    }
+    const slice = fullText.slice(offset, offset + MAX);
+    const nextOffset = offset + slice.length;
+    let note = '';
+    if (nextOffset < totalLen) {
+      note = '\n\n> （当前显示第 ' + offset + ' ~ ' + nextOffset + ' 字符，全文共 ' + totalLen + ' 字符；如需继续阅读后续内容，请调用 read_doc 并传 offset=' + nextOffset + '）';
+    } else if (offset > 0) {
+      note = '\n\n> （当前显示第 ' + offset + ' ~ ' + totalLen + ' 字符，已读到文档末尾）';
+    }
+    return '【知识库文档《' + (hit.title || hit.file) + '》】\n' + slice + note;
   }
   // 标题无命中 → 全文多关键词相关性检索（最多查 30 篇，返回 Top 3 命中片段）
   const snippet = await kbSearchDocBody(env, reg.slice(0, 30), query);
@@ -119,15 +137,13 @@ async function toolReadDoc(env, args) {
     reg.map(e => '- ' + (e.title || e.file)).join('\n');
 }
 
-// v7.0.0 全文多关键词相关性检索：
-// 支持精确子串 + 多关键词分词/2-gram 匹配，对每篇文档按 1200 字滑动窗口打分，
-// 返回相关性最高的前 3 个片段及各自所在的 offset，方便 Agent 按需继续精读。
+// v7.1.0 全文多关键词相关性检索（带 L1 缓存与词频/标题饱和度加权）：
 async function kbSearchDocBody(env, entries, query) {
   const qLower = String(query || '').trim().toLowerCase();
   const tokens = docSearchTokens(query);
   if (!qLower && !tokens.length) return null;
 
-  const BATCH = 5;
+  const BATCH = 6;
   const candidates = [];
 
   for (let i = 0; i < entries.length; i += BATCH) {
@@ -135,19 +151,25 @@ async function kbSearchDocBody(env, entries, query) {
     const batchHits = await Promise.all(batch.map(async (entry) => {
       const k = typeof entry === 'string' ? entry : (KB_DOCS_PREFIX + entry.file);
       const docTitle = (entry && entry.title) ? entry.title : kbDocTitleOf(k);
+      const titleLower = String(docTitle || '').toLowerCase();
       try {
-        const obj = await env.R2.get(k);
-        if (!obj) return null;
-        const text = await obj.text();
+        const text = await kbReadDocTextCached(env, k);
+        if (!text) return null;
         const lower = text.toLowerCase();
+
+        // 标题相关性加成
+        let titleBonus = 0;
+        for (const tk of tokens) {
+          if (tk.length >= 2 && titleLower.indexOf(tk) !== -1) titleBonus += tk.length * 4;
+        }
 
         // 1) 优先检查完整 query 精确子串
         const exactIdx = qLower ? lower.indexOf(qLower) : -1;
         if (exactIdx !== -1) {
-          return { title: docTitle, text, bestOffset: exactIdx, score: 1000 + tokens.length * 10 };
+          return { title: docTitle, text, bestOffset: exactIdx, score: 1000 + tokens.length * 10 + titleBonus };
         }
 
-        // 2) 分词多关键词打分：按 800 字步长滑动窗口找最密集命中区
+        // 2) 分词多关键词打分：按 800 字步长滑动窗口找最密集命中区（引入词频饱和加权）
         if (!tokens.length) return null;
         const WIN = 1200;
         const STEP = 800;
@@ -155,19 +177,29 @@ async function kbSearchDocBody(env, entries, query) {
         let bestPos = -1;
         for (let pos = 0; pos < lower.length; pos += STEP) {
           const winText = lower.slice(pos, pos + WIN);
-          let score = 0;
+          let score = titleBonus;
           let matchedLongTokens = 0;
           for (const tk of tokens) {
-            if (winText.indexOf(tk) !== -1) {
+            let idx = winText.indexOf(tk);
+            if (idx !== -1) {
+              // 统计窗口内出现次数（上限 4 次，实现 BM25 风格的词频饱和）
+              let occ = 1;
+              let nextFrom = idx + tk.length;
+              while (occ < 4) {
+                const nxt = winText.indexOf(tk, nextFrom);
+                if (nxt === -1) break;
+                occ++;
+                nextFrom = nxt + tk.length;
+              }
+              const tfWeight = 1 + (occ - 1) * 0.3;
               if (tk.length >= 2) {
-                score += tk.length * 3;
+                score += tk.length * 3 * tfWeight;
                 matchedLongTokens++;
               } else {
                 score += 1;
               }
             }
           }
-          // 至少命中一个长度 >= 2 的词（或全部单字词）才算有效候选
           const hasLongTokenInQuery = tokens.some(t => t.length >= 2);
           if (hasLongTokenInQuery && matchedLongTokens === 0) continue;
           if (score > bestScore) {
@@ -176,7 +208,6 @@ async function kbSearchDocBody(env, entries, query) {
           }
         }
         if (bestScore > 0 && bestPos >= 0) {
-          // 定位窗口内首个命中词的精确位置以便居中截取
           let anchor = bestPos;
           const winSlice = lower.slice(bestPos, bestPos + WIN);
           for (const tk of tokens) {
@@ -222,7 +253,10 @@ async function toolDeleteDoc(env, args) {
     return '未找到标题包含"' + query + '"的文档。现有文档：\n' +
       reg.map(e => '- ' + (e.title || e.file)).join('\n');
   }
-  try { await env.R2.delete(KB_DOCS_PREFIX + hit.file); } catch (e) { return '删除失败：' + (hit.title || hit.file); }
+  const key = KB_DOCS_PREFIX + hit.file;
+  try { await env.R2.delete(key); } catch (e) { return '删除失败：' + (hit.title || hit.file); }
+  kbDocTextCache.delete(key);
+  kbDocTextExp.delete(key);
   const okReg = await kbSaveRegistry(env, reg.filter(e => e !== hit));
   if (!okReg) return '文档文件已删除，但注册表更新失败，列表可能仍显示旧条目；下次读取会自动重建注册表。《' + (hit.title || hit.file) + '》';
   return '已删除知识库文档《' + (hit.title || hit.file) + '》';

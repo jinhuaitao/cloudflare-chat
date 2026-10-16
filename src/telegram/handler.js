@@ -1,4 +1,5 @@
 // Telegram Webhook：命令、模型选择、文件/图片多模态处理、Agent 对话与回复发送
+// v7.1.0 增强：支持多模态图片识图与 18 项 Agent 工具链协同调用（若模型不支持图片+工具则自动无感降级）
 
 import { APP_VERSION } from '../constants.js';
 import { mapSetBounded, mapGetBounded, parseCommaSeparated, safeEqual } from '../utils.js';
@@ -19,7 +20,7 @@ const tgUserModelsExp = new Map();
 const seenUpdateIds = new Map();
 let warnedNoWebhookSecret = false;
 
-// ================= update_id 去重（v6.8.9：L1 内存 + L2 R2 滚动窗口） =================
+// ================= update_id 去重（L1 内存 + L2 R2 滚动窗口） =================
 const TG_DEDUP_KEY = 'tg_updates_dedup';
 const TG_DEDUP_WINDOW_MS = 10 * 60 * 1000;
 const TG_DEDUP_MAX = 200;
@@ -57,14 +58,14 @@ async function releaseUpdateForRetry(env, uid) {
   } catch (e) {}
 }
 
-// 命令解析（v6.8.6）：兼容群组里的 /cmd@botname 写法与命令后带参数。
+// 命令解析：兼容群组里的 /cmd@botname 写法与命令后带参数。
 function parseCommand(t) {
   const m = /^(\/[a-zA-Z]+)(?:@[a-zA-Z0-9_]+)?(?:\s+([\s\S]*))?$/.exec(String(t || '').trim());
   if (!m) return null;
   return { cmd: m[1].toLowerCase(), rest: (m[2] || '').trim() };
 }
 
-// v6.9.5：长消息按 3980 字符切分，自动闭合跨分片的 ``` 代码块
+// 长消息按 3980 字符切分，自动闭合跨分片的 ``` 代码块
 function splitTelegramMarkdown(text, maxLength = 3980) {
   const chunks = [];
   let remaining = String(text || '');
@@ -92,7 +93,7 @@ function splitTelegramMarkdown(text, maxLength = 3980) {
   return chunks;
 }
 
-// ================= v7.0.0：Telegram 文件直传与图片多模态辅助 =================
+// ================= Telegram 文件直传与图片多模态辅助 =================
 const SUPPORTED_DOC_EXT_RE = /\.(md|markdown|txt|csv|tsv|json|jsonl|log|py|js|mjs|ts|tsx|jsx|html|htm|css|xml|yaml|yml|toml|ini|conf|sh|bash|sql|go|rs|java|c|cpp|h)$/i;
 
 async function tgFetchFileBytes(env, fileId, maxBytes, timeoutMs) {
@@ -225,7 +226,6 @@ export async function handleTgWebhook(request, env) {
           }
         } else if (!userText && Array.isArray(msg.photo) && msg.photo.length > 0) {
           try {
-            // 选取不超过 1MB 的最高清图片尺寸
             const candidates = msg.photo.filter(p => !p.file_size || p.file_size <= 1024 * 1024);
             const picked = candidates.length ? candidates[candidates.length - 1] : msg.photo[msg.photo.length - 1];
             const bytes = await tgFetchFileBytes(env, picked.file_id, 2 * 1024 * 1024, tgApiTimeoutMs);
@@ -252,7 +252,7 @@ export async function handleTgWebhook(request, env) {
 
             await tgApi('sendMessage', {
               chat_id: chatId,
-              text: "⚙️ **请选择对话要使用的 AI 模型:**\n\n_支持多轮对话（最近 " + (parseInt(env.TG_HISTORY_ROUNDS || '10', 10) || 10) + " 轮），支持直接发送图片识图或上传 .md/.txt/.csv 文档，发送 /clear 可清空上下文。_\n\n🤖 **Agent 模式**（默认开启）：我会自主规划、调用 13 项工具（🔍 搜索、📄 网页、🌐 维基百科、💱 实时汇率/币价、🧮 科学计算、🌤 天气、🕐 时间/日期推算），并用 🧠🗑️ 管理长期记忆、用 💾📚📖 存取知识库文档。发送 /agent 可切换为普通对话模式，/help 查看全部命令。",
+              text: "⚙️ **请选择对话要使用的 AI 模型:**\n\n_支持多轮对话（最近 " + (parseInt(env.TG_HISTORY_ROUNDS || '10', 10) || 10) + " 轮），支持直接发送图片识图或上传 .md/.txt/.csv 文档，发送 /clear 可清空上下文。_\n\n🤖 **Agent 模式**（默认开启）：我会自主规划、调用 18 项工具（🔍 搜索、📄 网页、🌐 维基百科、🐙 GitHub、📑 arXiv 论文、📰 HackerNews、💱 实时汇率/币价、🛰️ DNS/IP 诊断、🧮 科学计算、🧰 实用工具箱、🌤 天气、🕐 时间/日期推算），并用 🧠🗑️ 管理长期记忆、用 💾📚📖 存取知识库文档。发送 /agent 可切换模式，/help 查看全部命令。",
               parse_mode: "Markdown",
               reply_markup: { inline_keyboard }
             });
@@ -277,9 +277,9 @@ export async function handleTgWebhook(request, env) {
                 + "/forget 关键词 —— 删除包含关键词的记忆\n"
                 + "/kb —— 知识库总览（文档列表 + 记忆统计）\n"
                 + "任务太长被暂停时，发送「继续」可接着做\n\n"
-                + "✨ 支持直接发送图片（多模态识图）或上传文本文件（.md/.txt/.csv/.json 等，可直接总结或说“存进知识库”）。\n"
-                + "🛠️ Agent 工具箱：🔍 联网搜索、📄 结构化网页阅读、🌐 维基百科、💱 实时汇率/加密币价、🧮 科学计算器、🌤 天气预报、🕐 时间与日期差推算、🧠🗑️ 长期记忆存取、💾📚📖 知识库文档分页精读与多关键词检索。"
-                + "\n\n📌 当前版本 v" + APP_VERSION + "（R2 持久化 · 全套零配置增强）"
+                + "✨ 支持直接发送图片（多模态识图 + 工具协同）或上传文本文件（.md/.txt/.csv/.json 等，可直接总结或说“存进知识库”）。\n"
+                + "🛠️ Agent 工具箱（18 项零密钥工具）：🔍 联网搜索、📄 结构化网页阅读（0ms 缓存翻页）、🌐 维基百科、🐙 GitHub 仓库/发版检索、📑 arXiv 论文检索、📰 HackerNews 热榜、💱 实时汇率/加密币价、🛰️ DNS/IP 网络诊断、🧮 科学计算器、🧰 全能工具箱（单位换算/SHA哈希/Base64/UUID/字数统计）、🌤 天气预报、🕐 时间与日期差推算、🧠🗑️ 长期记忆存取、💾📚📖 知识库文档分页精读与多关键词检索。"
+                + "\n\n📌 当前版本 v" + APP_VERSION + "（R2 持久化 · 高性能全功能增强版）"
             });
             return;
           }
@@ -331,7 +331,7 @@ export async function handleTgWebhook(request, env) {
             await tgApi('sendMessage', {
               chat_id: chatId,
               text: !cur
-                ? "🤖 **Agent 模式已开启**\n\n我会自主规划、调用工具（🔍 联网搜索、📄 网页读取、🌐 维基百科、💱 汇率/币价、🧮 科学计算、🌤 天气、🕐 时间与日期推算），长期记住或清理你告诉我的重要信息，还能用 💾 保存、📚 查阅知识库文档。"
+                ? "🤖 **Agent 模式已开启**\n\n我会自主规划、调用 18 项工具（🔍 搜索、📄 网页、🌐 维基百科、🐙 GitHub、📑 arXiv、📰 HackerNews、💱 汇率/币价、🛰️ DNS/IP、🧮 计算、🧰 工具箱、🌤 天气、🕐 时间），长期记住或清理你告诉我的重要信息，还能用 💾 保存、📚 查阅知识库文档。"
                 : "💬 **已切换为普通对话模式**\n\n单轮问答，不调用工具、不使用长期记忆。如需 Agent 能力再发送 /agent 切回。",
               parse_mode: "Markdown"
             });
@@ -384,8 +384,9 @@ export async function handleTgWebhook(request, env) {
           if (webhookBudgetMs > 240000) webhookBudgetMs = 240000;
           const agentOpts = { maxRuntimeMs: webhookBudgetMs, resumeKey: tgAgentResumeKey(chatId), origUserText: historyUserText };
 
-          // 图片消息优先走无工具单轮多模态调用（部分上游模型不支持 tools + image_url 混用），若开启 Agent 且非图片则走 ReAct 循环
-          if (useAgent && !multimodalContent) {
+          // v7.1.0：允许图片多模态消息直接进入 Agent 循环（可识图后联动汇率/搜索/入库等工具）；
+          // 若上游视觉模型不支持 tools + image_url，第 0 步会自动触发 r.fallback 退回无工具多模态问答
+          if (useAgent) {
             let lastProgressEdit = 0;
             const onProgress = async (text, force) => {
               if (!pendingMsgId) return;
@@ -416,7 +417,9 @@ export async function handleTgWebhook(request, env) {
               r = { error: '⚠️ Agent 执行出错：' + (e && e.message ? e.message : String(e)) };
             }
             if (r.error) {
-              agentErr = r.error;
+              agentErr = multimodalContent && /400|404|415|422|image|vision/i.test(r.error)
+                ? '⚠️ 当前模型可能不支持图片识别（请用 /model 切换到支持视觉的多模态模型，如 GPT-4o / Qwen-VL）。' + r.error
+                : r.error;
             } else {
               replyText = r.text;
               if (!r.paused) {
@@ -432,7 +435,7 @@ export async function handleTgWebhook(request, env) {
               }
             }
           } else {
-            // 普通模式或多模态图片识图问答
+            // 普通非 Agent 模式
             const aiConfig = buildAIRequest(env, targetModelId, history, false);
             if (aiConfig.error) {
               if (pendingMsgId) {

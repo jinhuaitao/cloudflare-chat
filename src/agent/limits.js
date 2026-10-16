@@ -1,9 +1,6 @@
-// Agent 运行上限与工具进度的可读文案（_worker.js 原第 1249-1278 行）
+// Agent 运行上限与工具进度的可读文案
 
-// ==================== Telegram Agent：主循环 ====================
-// ReAct 风格：LLM 决策 → 执行工具 → 结果回填 → 最多 MAX_STEPS 步。
-// 通道/模型不支持 tools 参数时返回 { fallback: true }，由调用方降级为普通对话。
-// Agent 运行限制（可配，防极端情况失控）
+// ==================== Telegram Agent：主循环限制与工具描述 ====================
 function agentLimits(env) {
   let maxSteps = parseInt(env.AGENT_MAX_STEPS || '6', 10);
   if (!(maxSteps > 0)) maxSteps = 6;
@@ -21,8 +18,13 @@ function describeToolCall(name, args) {
     case 'web_search': return '🔍 正在搜索：' + (args.query || '');
     case 'web_fetch': return '📄 正在读取网页' + offNote + '…';
     case 'wiki_lookup': return '🌐 正在查阅维基百科：' + (args.query || '');
+    case 'github_lookup': return '🐙 正在检索 GitHub：' + (args.query || '');
+    case 'arxiv_search': return '📑 正在检索 arXiv 论文：' + (args.query || '');
+    case 'hn_top': return '📰 正在获取 Hacker News：' + (args.query || '首页热榜');
     case 'exchange_rate': return '💱 正在查询汇率/行情：' + (args.from || '') + (args.to ? ' → ' + args.to : '');
+    case 'net_lookup': return '🛰️ 正在诊断网络/DNS：' + (args.target || '');
     case 'calculate': return '🧮 正在计算：' + (args.expression || '');
+    case 'toolkit': return '🧰 正在执行工具箱 (' + (args.action || 'tool') + ')…';
     case 'get_weather': return '🌤 正在查询天气：' + (args.city || '');
     case 'get_time': return '🕐 正在获取时间/推算日期…';
     case 'remember': return '🧠 正在记住…';

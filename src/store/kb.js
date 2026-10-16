@@ -2,7 +2,7 @@
 
 import { storePut } from './r2.js';
 
-// ---------- R2 文件夹布局（v6.6.6 起，v6.6.7 补充 md 镜像） ----------
+// ---------- R2 文件夹布局（v6.6.6 起，v6.6.7 补充 md 镜像，v7.1.0 性能优化） ----------
 // R2 没有真正的目录，用 key 前缀 + '/' 模拟文件夹，控制台按此展示层级。
 // 「知识库」（Agent 长期记忆）独立存放在 kb/ 文件夹下，与其它数据隔离，
 // 便于在控制台单独浏览、备份或设置生命周期规则；其余数据保持原样不动。
@@ -17,7 +17,7 @@ import { storePut } from './r2.js';
 //   tg_agent_<chatId>        Agent 断点续做（根目录，保持原样）
 //
 // 注意：md 镜像只是"可读副本"，机器人只读 JSON 索引。手动在控制台改 md
-// 不会生效；以索引为准，缺失的 md 会在下次加载时自动补建。
+// 不会生效；以索引为准，缺失 file 字段的旧条目会在首次加载时自动补建。
 const KB_PREFIX = 'kb/';
 function agentMemKey(chatId) { return KB_PREFIX + 'agent_mem_' + chatId; }
 function agentMemKeyLegacy(chatId) { return 'agent_mem_' + chatId; } // v6.6.5 及更早的旧 key（根目录），仅用于兼容迁移
@@ -52,19 +52,31 @@ async function kbDeleteMemDir(env, chatId) {
   } catch (e) {}
 }
 // 回补 md 镜像：给缺 file 字段的老条目分配文件名，并补建 R2 里缺失的 md 文件。
-// 返回 true 表示索引数组被修改过（调用方需重写索引）。
-async function kbBackfillMd(env, chatId, arr) {
+// v7.1.0 性能优化：当所有记忆条目均已具备 file 字段且未显式要求全量校验时，
+// 直接跳过昂贵的 R2.list（Class A 操作），消除每次 L1 缓存过期时的额外 R2 列表扫描延迟。
+async function kbBackfillMd(env, chatId, arr, forceVerify) {
   if (!env.R2 || !Array.isArray(arr) || !arr.length) return false;
   const dir = kbMemDir(chatId);
   let indexChanged = false;
   const need = [];
   for (const m of arr) {
     if (!m || !m.fact) continue;
-    if (!m.file) { m.file = kbNewMemFile(); indexChanged = true; }
-    need.push(m);
+    if (!m.file) {
+      m.file = kbNewMemFile();
+      indexChanged = true;
+      need.push(m);
+    } else if (forceVerify) {
+      need.push(m);
+    }
   }
   if (!need.length) return indexChanged;
-  // 查目录找出 R2 里缺失的 md（分页取全量，避免逐个 HEAD；超 1000 条也 OK）
+  // 若仅回补新分配了 file 的旧条目，直接并发写入即可，无需先 list 扫描
+  if (!forceVerify) {
+    const puts = need.map(m => storePut(env, dir + m.file, kbMemMarkdown(chatId, m.fact, m.ts)));
+    if (puts.length) await Promise.all(puts);
+    return indexChanged;
+  }
+  // 显式全量校验模式：查目录找出 R2 里缺失的 md
   const existing = new Set();
   try {
     let cursor;

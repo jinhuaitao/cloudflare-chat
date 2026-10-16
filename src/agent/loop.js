@@ -1,4 +1,8 @@
-// Telegram Agent 主循环：自主规划 → 工具调用 → 汇总作答（_worker.js 原第 1311-1344,1468-1704 行）
+// Telegram & Web Agent 主循环：自主规划 → 工具调用 → 汇总作答
+// v7.1.0 性能与可靠性升级：
+// 1) 启动时并发读取长期记忆与知识库注册表（Promise.all），降低首步 TTFB 延迟；
+// 2) 上游请求遭遇 429/502/503/504 或瞬时网络抖动时自动退避重试，并在多 Key 通道中自动切换备用 Key；
+// 3) 记录每个工具执行的精确耗时（ms）并回传给前端工具调用轨迹胶囊。
 
 import { buildAIRequest } from '../channel.js';
 import { parseDSMLToolCalls, stripDSMLBlocks } from './dsml.js';
@@ -11,15 +15,13 @@ import { agentGetMemories } from './memory.js';
 import { buildAgentSystemPrompt } from './prompt.js';
 import { kbGetRegistry } from '../kb/registry.js';
 
-// 工具结果是否算失败。只认工具层自己的固定前缀，避免正文里偶然出现
-// "失败"二字（如新闻标题）被误判，导致正常结果也被当成空转。
+// 工具结果是否算失败。只认工具层自己的固定前缀
 function isToolResultFailure(result) {
   const s = String(result == null ? '' : result);
-  return /^(搜索失败|搜索请求失败|搜索「[^」]*」无结果|抓取失败|URL 非法|该地址禁止抓取|不支持抓取|计算失败|计算结果非法|时区无效|天气查询失败|找不到城市|汇率查询失败|维基百科查询失败|维基百科未找到|维基百科查询关键词为空|关键词为空|工具执行失败|工具 [^ ]+ 执行超时|未知工具|R2 未绑定|知识库文档写入|记忆写入|内容为空|标题为空|城市名为空|表达式为空|表达式含非法字符)/.test(s);
+  return /^(搜索失败|搜索请求失败|搜索「[^」]*」无结果|抓取失败|URL 非法|该地址禁止抓取|不支持抓取|计算失败|计算结果非法|时区无效|天气查询失败|找不到城市|汇率查询失败|维基百科查询失败|维基百科未找到|维基百科查询关键词为空|GitHub 查询失败|GitHub 未找到|arXiv 查询失败|arXiv 未找到|Hacker News 查询失败|网络诊断失败|网络诊断拒绝|IP 归属查询失败|单位换算失败|关键词为空|工具执行失败|工具 [^ ]+ 执行超时|未知工具|R2 未绑定|知识库文档写入|记忆写入|内容为空|标题为空|城市名为空|表达式为空|表达式含非法字符)/.test(s);
 }
 
 // 步数用尽后的无工具收尾：不再提供 tools，强制模型把已有结果收成最终答案。
-// 剩余预算不足 8 秒或上游报错时返回 null，由调用方走原来的暂停 / 已产出兜底。
 async function agentWrapUp(env, targetModelId, messages, loopStartIdx, ctxBudget, deadline, onDelta) {
   if (Date.now() > deadline - 8000) return null;
   const sendMessages = trimAgentMessages(messages, loopStartIdx, ctxBudget).concat([{
@@ -69,11 +71,11 @@ function extractMsgPlainText(content) {
 async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTools, onProgress, opts) {
   const query = history.length ? extractMsgPlainText(history[history.length - 1].content) : '';
   const kbReadOnly = !!(opts && opts.kbReadOnly);
-  const memories = kbReadOnly ? [] : await agentGetMemories(env, chatId);
-  let kbDocs = null;
-  if (opts && opts.kbFirst) {
-    try { kbDocs = await kbGetRegistry(env); } catch (e) { kbDocs = null; }
-  }
+  // v7.1.0 性能优化：并发加载长期记忆与知识库文档注册表，减少冷启动 R2 串行等待
+  const [memories, kbDocs] = await Promise.all([
+    kbReadOnly ? Promise.resolve([]) : agentGetMemories(env, chatId),
+    (opts && opts.kbFirst) ? kbGetRegistry(env).catch(() => null) : Promise.resolve(null)
+  ]);
   const systemPrompt = buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly);
   const tools = allowTools ? getAgentTools(kbReadOnly) : null;
   const messages = [{ role: 'system', content: systemPrompt }];
@@ -148,28 +150,59 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
     const cfg = buildAIRequest(env, targetModelId, sendMessages, useUpstreamStream, tools);
     if (cfg.error) return { error: cfg.error };
 
-    let resp;
-    try {
-      const remainMs = Math.max(0, deadline - Date.now());
-      resp = await fetch(cfg.apiUrl, {
-        method: 'POST',
-        headers: { 'Authorization': 'Bearer ' + cfg.currentApiKey, 'Content-Type': 'application/json' },
-        body: JSON.stringify(cfg.payload),
-        signal: AbortSignal.timeout(Math.max(15000, Math.min(180000, remainMs)))
-      });
-    } catch (e) {
-      const nm = e && e.name ? String(e.name) : '';
-      const msg = String((e && e.message) || '');
+    // v7.1.0：支持瞬时 429/502/503/504 退避重试与多 Key 自动故障转移
+    const keyPool = Array.isArray(cfg.channelKeys) && cfg.channelKeys.length > 0 ? cfg.channelKeys : [cfg.currentApiKey];
+    let resp = null;
+    let lastFetchErr = null;
+    const maxAttempts = (Date.now() < deadline - 12000) ? 2 : 1;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const activeKey = attempt === 0
+        ? cfg.currentApiKey
+        : keyPool[(keyPool.indexOf(cfg.currentApiKey) + attempt) % keyPool.length];
+      try {
+        const remainMs = Math.max(0, deadline - Date.now());
+        resp = await fetch(cfg.apiUrl, {
+          method: 'POST',
+          headers: { 'Authorization': 'Bearer ' + activeKey, 'Content-Type': 'application/json' },
+          body: JSON.stringify(cfg.payload),
+          signal: AbortSignal.timeout(Math.max(15000, Math.min(180000, remainMs)))
+        });
+        lastFetchErr = null;
+        if (resp.ok) break;
+        const isTransient = resp.status === 429 || resp.status === 502 || resp.status === 503 || resp.status === 504;
+        if (isTransient && attempt + 1 < maxAttempts && Date.now() < deadline - 10000) {
+          try { if (resp.body) await resp.body.cancel(); } catch (e) {}
+          await new Promise(r => setTimeout(r, 900 * (attempt + 1)));
+          continue;
+        }
+        break;
+      } catch (e) {
+        lastFetchErr = e;
+        const nm = e && e.name ? String(e.name) : '';
+        const msg = String((e && e.message) || '');
+        const aborted = nm === 'AbortError' || nm === 'TimeoutError' || /abort/i.test(msg);
+        if (aborted) break;
+        if (attempt + 1 < maxAttempts && Date.now() < deadline - 10000) {
+          await new Promise(r => setTimeout(r, 800));
+          continue;
+        }
+      }
+    }
+
+    if (lastFetchErr) {
+      const nm = lastFetchErr && lastFetchErr.name ? String(lastFetchErr.name) : '';
+      const msg = String((lastFetchErr && lastFetchErr.message) || '');
       const aborted = nm === 'AbortError' || nm === 'TimeoutError' || /abort/i.test(msg);
       if (aborted && Date.now() >= deadline - 2000) return await pauseForResume();
       if (aborted) return { error: '上游响应超时，请重试或换个问法' };
-      return { error: '网络错误：' + (msg || String(e)) };
+      return { error: '网络错误：' + (msg || String(lastFetchErr)) };
     }
 
     if (!resp.ok) {
       const t = await readErrorBody(resp, 2048);
       if (allowTools && step === 0 &&
-          ((resp.status >= 400 && resp.status < 500) || /tool|function|unsupported/i.test(t))) {
+          ((resp.status >= 400 && resp.status < 500 && resp.status !== 401 && resp.status !== 429) || /tool|function|unsupported|vision|image/i.test(t))) {
         return { fallback: true };
       }
       return { error: 'API 报错 (' + resp.status + ')：' + String(t).slice(0, 500) };
@@ -258,9 +291,12 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       const fn = (tc && tc.function) || {};
       let args = {};
       try { args = JSON.parse(fn.arguments || '{}'); } catch (e) {}
-      if (!fn.name) return { tc, result: '工具调用缺少名称，已跳过', failed: true };
+      if (!fn.name) return { tc, result: '工具调用缺少名称，已跳过', failed: true, ms: 0, desc: '未知工具' };
+      const t0 = Date.now();
       const result = await execAgentTool(fn.name, args, env, chatId, kbReadOnly);
-      return { tc, result: truncateToolResult(result, 4000), failed: isToolResultFailure(result) };
+      const ms = Math.max(1, Date.now() - t0);
+      const failed = isToolResultFailure(result);
+      return { tc, result: truncateToolResult(result, 4000), failed, ms };
     }));
     let stepFailed = 0;
     for (const tr of toolResults) {

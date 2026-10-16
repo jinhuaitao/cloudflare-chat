@@ -1,16 +1,15 @@
-// Agent 稳定性增强：结果截断、调用签名、上下文预算裁剪（_worker.js 原第 1191-1247 行）
+// Agent 稳定性增强：结果截断、调用签名、带历史步骤摘要压缩的上下文预算裁剪
 
-// ==================== Agent 稳定性增强（v6.6.5） ====================
+// ==================== Agent 稳定性增强（v6.6.5，v7.1.0 智能压缩升级） ====================
 // 1) truncateToolResult：工具结果截断并明确标注，避免模型误以为拿到了完整数据。
 // 2) toolCallSignature：工具调用签名，用于"重复调用熔断"。
 // 3) trimAgentMessages：上下文预算裁剪。多步任务中工具结果（每条可达 4000 字）
 //    会快速堆积，超预算时从最旧的"整轮"（1 条 assistant + 其 tool 消息）开始删，
 //    成对删除保证 OpenAI 消息序列合法性（assistant tool_calls 后必须紧跟 tool 应答）。
-//    只动本轮循环产生的消息（loopStartIdx 之后），system 与历史对话永不裁剪。
+//    v7.1.0 升级：被裁剪的旧轮次不再静默丢弃，而是浓缩为一条轻量级【已完成步骤摘要】
+//    （仅占百余字符），防止模型在后续步骤中因"失忆"而重复调用第 1 步已经执行过的工具。
 
 // 工具结果截断：超长时保留前 maxChars 并标注，避免模型误判为完整数据
-// v6.8.7：不在代理对中间切断 —— emoji 等增补平面字符占两个 code unit，
-// 切开后会产出两个非法字符，可能污染下游的 JSON 序列化与前端渲染
 function truncateToolResult(result, maxChars) {
   const s = String(result == null ? '' : result);
   maxChars = maxChars > 0 ? maxChars : 4000;
@@ -21,8 +20,7 @@ function truncateToolResult(result, maxChars) {
   return s.slice(0, cut) + '\n…（结果过长，仅显示前 ' + cut + ' 字符）';
 }
 
-// v6.8.7：上游错误响应体带预算读取。错误页可能是几十 KB 的 HTML，
-// 失败路径上整段读入只为取前几百字符做诊断，既慢又浪费内存
+// 上游错误响应体带预算读取
 async function readErrorBody(resp, maxChars) {
   maxChars = maxChars > 0 ? maxChars : 2048;
   try {
@@ -51,13 +49,30 @@ function toolCallSignature(tc) {
   return (fn.name || '') + '|' + JSON.stringify(norm);
 }
 
+// 将被裁剪掉的旧工具轮次浓缩为单行摘要，避免模型遗忘已执行的步骤
+function summarizeDroppedRounds(arr, droppedRoundIndices) {
+  const lines = [];
+  for (const rIndices of droppedRoundIndices) {
+    for (const idx of rIndices) {
+      const m = arr[idx];
+      if (!m) continue;
+      if (m.role === 'tool') {
+        const name = m.name || 'tool';
+        const firstLine = String(m.content || '').replace(/\s+/g, ' ').trim().slice(0, 110);
+        lines.push('- ' + name + ': ' + firstLine + (String(m.content || '').length > 110 ? '…' : ''));
+      }
+    }
+  }
+  if (!lines.length) return '';
+  return '【早期步骤摘要（完整工具输出已折叠以节省上下文，请勿重复调用相同参数）】\n' + lines.slice(-8).join('\n');
+}
+
 // 按字符预算裁剪 Agent 循环消息；返回新数组（不修改原数组，便于测试与断点续存）
 function trimAgentMessages(messages, loopStartIdx, budget) {
   budget = budget > 0 ? budget : 24000;
   const arr = Array.isArray(messages) ? messages : [];
   if (arr.length <= 1) return arr.slice();
   let start = Math.max(0, Math.min(loopStartIdx | 0, arr.length));
-  // 估算字符数（JSON 长度近似 token 量的上界）
   const msgLen = (m) => {
     try { return JSON.stringify(m).length; } catch (e) { return 0; }
   };
@@ -73,12 +88,21 @@ function trimAgentMessages(messages, loopStartIdx, budget) {
   }
   // 至少保留最后一轮（当前正在进行的上下文），从最旧的轮次开始删
   const doomed = new Set();
+  const droppedRounds = [];
   for (let r = 0; r < rounds.length - 1 && total > budget; r++) {
+    droppedRounds.push(rounds[r]);
     for (const i of rounds[r]) { doomed.add(i); total -= msgLen(arr[i]); }
   }
   if (!doomed.size) return arr.slice();
+  const digest = summarizeDroppedRounds(arr, droppedRounds);
   const out = [];
-  for (let i = 0; i < arr.length; i++) if (!doomed.has(i)) out.push(arr[i]);
+  for (let i = 0; i < arr.length; i++) {
+    if (i === start && digest && out.length > 0 && out[0].role === 'system') {
+      // 把早期步骤摘要附加在 system prompt 末尾，既不破坏 user/assistant/tool 消息序列，又能让模型感知历史调用
+      out[0] = { role: 'system', content: out[0].content + '\n\n' + digest };
+    }
+    if (!doomed.has(i)) out.push(arr[i]);
+  }
   return out;
 }
 

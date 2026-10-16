@@ -1,9 +1,10 @@
-// 统一解析多通道配置（带内存缓存）并构建上游 AI 请求（_worker.js 原第 19-20,1706-1821 行）
+// 统一解析多通道配置（带内存缓存）并构建上游 AI 请求（v7.1.0：支持多 Key 轮询与故障切换池）
 
 import { parseCommaSeparated } from './utils.js';
 
-// 优化：不再校验 env 的引用，因为 Worker 生命周期内环境变量是恒定的
-let cachedConfig = null; 
+let cachedConfig = null;
+const keyRoundRobinIdx = new Map();
+
 // ======= 统一解析通道配置（带内存缓存） =======
 function getChannelConfig(env) {
   if (cachedConfig) {
@@ -20,7 +21,6 @@ function getChannelConfig(env) {
       const raw = arr[i].trim();
       if (!raw) continue;
       
-      // 用第一个冒号切分：模型 ID 本身不含冒号，显示名里允许出现冒号
       const colonIdx = raw.indexOf(':');
       const id = colonIdx > 0 ? raw.substring(0, colonIdx).trim() : raw;
       const name = colonIdx > 0 ? raw.substring(colonIdx + 1).trim() : raw;
@@ -65,7 +65,6 @@ function getChannelConfig(env) {
     return cachedConfig;
   }
 
-  // 兜底：只使用环境变量中显式配置的模型，不再内置任何默认模型
   const fallbackUrl = env.API_URL || "";
   const fallbackKeys = parseCommaSeparated(env.API_KEY);
   const fallbackModelStr = env.MODEL || "";
@@ -79,7 +78,7 @@ function getChannelConfig(env) {
 }
 
 // 提取共用的 AI 请求构建逻辑 (DRY原则)
-// tools: 可选，OpenAI 兼容的 tools 数组（Agent 模式用）；图片通道自动忽略
+// v7.1.0：采用 Round-Robin 均匀轮询多 Key，并暴露 channelKeys 供上游 429/5xx 时自动切 Key 重试
 function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
   const { models, modelMap } = getChannelConfig(env);
 
@@ -96,19 +95,23 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
   const channel = modelMap.get(selectedModel);
   if (!channel || !channel.url) return { error: `模型 ${selectedModel} 对应的 API_URL 未配置或异常` };
 
-  const currentApiKey = channel.keys.length > 0 ? channel.keys[Math.floor(Math.random() * channel.keys.length)] : "";
+  const keys = Array.isArray(channel.keys) ? channel.keys : [];
+  let currentApiKey = "";
+  if (keys.length === 1) {
+    currentApiKey = keys[0];
+  } else if (keys.length > 1) {
+    const cur = (keyRoundRobinIdx.get(selectedModel) || 0) % keys.length;
+    currentApiKey = keys[cur];
+    keyRoundRobinIdx.set(selectedModel, (cur + 1) % keys.length);
+  }
+
   const apiUrl = channel.url;
-  // 图片模型只认 images/generations 接口地址，不再按模型名猜测，避免误伤
   const isImageAPI = apiUrl.includes('images/generations');
 
-  // max_tokens 可配：环境变量 MAX_TOKENS，默认 4096，上限 32000
   let maxTokens = parseInt(env.MAX_TOKENS || '4096', 10);
   if (!(maxTokens > 0)) maxTokens = 16384;
   if (maxTokens > 32000) maxTokens = 32000;
 
-  // v6.8.9：图片通道取最后一条消息的纯文本。之前直接
-  // messagesArray[len-1].content —— 空数组会 TypeError，多模态 content（分片数组）
-  // 会把整个对象塞进 prompt，上游必然报错
   let lastPrompt = '';
   const lastMsg = messagesArray[messagesArray.length - 1];
   if (lastMsg) {
@@ -130,7 +133,6 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
       output_format: "png",
       response_format: "url"
     };
-    // 针对商汤生图模型显式关闭水印（公测免去水印）
     if (selectedModel.includes('sensenova')) {
       payload.watermark = false;
     }
@@ -150,7 +152,7 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
     if (tools && tools.length) payload.tools = tools;
   }
 
-  return { apiUrl, currentApiKey, payload, isImageAPI };
+  return { apiUrl, currentApiKey, channelKeys: keys, payload, isImageAPI };
 }
 
 export {

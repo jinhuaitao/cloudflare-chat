@@ -1,6 +1,5 @@
-// 应用版本号与复用的 HTTP 响应头常量（_worker.js 原第 22-43,54-77 行）
+// 应用版本号与复用的 HTTP 响应头常量
 
-// 复用 HTTP 响应头结构
 const CORS_HEADERS = {
   'Content-Type': 'application/json',
   'Access-Control-Allow-Origin': '*',
@@ -19,14 +18,20 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-// 7.0.0：全套零配置 Agent 增强与架构优化版。
-//  - 知识库 2.0：read_doc 支持 offset 分页读取 10 万字长文档 + 多关键词分词/2-gram 全文相关性排序检索；
-//  - 网页提取 2.0：web_fetch 保留 Markdown 结构（标题/代码块/表格/列表）+ 支持 offset 分页 + Jina 免密钥回退；
-//  - 新工具：wiki_lookup（中英维基百科词条）、exchange_rate（实时法币汇率 + 主流加密币价）、forget_memory（自然语言删记忆）；
-//  - 科学计算与日期推算：calculate 扩展 20 个科学函数与 pi/e 常量；get_time 支持日期间隔与加减天数推算；
-//  - Telegram 增强：零配置支持直接发送文本文件（.md/.txt/.csv/.json/代码）分析或入库，以及发送图片多模态识图问答；
-//  - Web UI 增强：新增可折叠「工具调用轨迹胶囊（Tool Trace）」，保留每步工具调用记录与总耗时。
-const APP_VERSION = '7.0.0';
+// 7.1.0：Agent 性能加速与 18 项零密钥工具全功能版。
+//  - 性能升级：
+//    1) 网页抓取 L1 内存缓存（5min TTL）+ 在途请求合并（in-flight dedup），长网页 offset 翻页续读实现 0ms 延迟；
+//    2) 知识库文档正文 L1 内存缓存（120s TTL）+ 词频饱和度（BM25-like）与标题加权相关性检索；
+//    3) 消除 kbBackfillMd 在记忆条目已含 file 字段时的冗余 R2.list（Class A 操作），并改为并发加载记忆与注册表；
+//    4) 上游模型请求支持 429/502/503/504 自动退避重试与多 Key Round-Robin 故障切换；
+//    5) 上游流式实时拦截 <｜DSML｜ 工具标记，消除网页端 XML 闪烁；
+//    6) 上下文预算裁剪（trimAgentMessages）自动生成【早期步骤摘要】，防止多步任务丢失早期工具调用记忆而重复调用。
+//  - 新增 5 项零密钥工具（总计 18 项）：
+//    github_lookup（GitHub 仓库/Release/README 检索）、arxiv_search（arXiv 学术论文检索）、
+//    hn_top（Hacker News 实时热榜与技术讨论）、net_lookup（Cloudflare DoH DNS 解析 & IP 归属/ASN 诊断）、
+//    toolkit（全能单位换算/SHA哈希/Base64/URL编解码/UUID/字数与Token精确统计）。
+//  - 多模态与前端增强：Telegram 图片识图支持直接联动 Agent 工具链；Web 端新增一键导出会话为 Markdown (.md)。
+const APP_VERSION = '7.1.0';
 const PNG_HEADERS = {
   'Content-Type': 'image/png',
   'Cache-Control': 'public, max-age=86400',
@@ -39,7 +44,6 @@ const MANIFEST_HEADERS = {
   'Access-Control-Allow-Origin': '*',
 };
 
-// SW 必须挂在根路径，并显式声明 scope；no-cache 保证新版本能及时下发
 const SW_HEADERS = {
   'Content-Type': 'application/javascript;charset=UTF-8',
   'Service-Worker-Allowed': '/',

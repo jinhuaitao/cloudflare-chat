@@ -1,4 +1,4 @@
-// 上游流式读取：把 SSE 还原成与非流式相同的 message 形状（_worker.js 原第 1346-1466 行）
+// 上游流式读取：把 SSE 还原成与非流式相同的 message 形状（v7.1.0 增强：流式实时拦截 DSML 工具调用标记）
 
 // ==================== 上游流式读取（Agent 真流式） ====================
 // 把上游的 SSE 流还原成与「非流式」完全相同的 message 形状：
@@ -6,11 +6,9 @@
 // 这样 Agent 循环里的 tool_calls 判定、DSML 兜底、熔断、工具执行等逻辑一行都不用改，
 // 变的只是"怎么拿到 msg"。同时把正文 / 推理增量实时回调出去，实现逐字输出。
 //
-// 兼容三种上游形态：
-//   1. 标准 SSE（data: {...}\n\n … data: [DONE]）—— 主流通道
-//   2. 忽略 stream 参数、直接返回完整 JSON —— 走 !sawSSE 兜底
-//   3. 图片生成通道 —— 返回 data[0].url
-// forwarded 表示"正文是否已经推给客户端"，调用方据此决定要不要再补发一次。
+// v7.1.0 性能优化与闪烁消除：
+// 当使用 DeepSeek 等输出 <｜DSML｜tool_calls> 文本标记的通道时，一旦检测到流中出现 DSML 起始标签，
+// 立即将 sawToolCalls 置为 true 并停止向前端透传后续 XML 原始字符，消除网页端看到整段 XML 刷屏再被撤回的闪烁。
 async function readUpstreamMessage(resp, onDelta) {
   const reader = resp.body.getReader();
   const decoder = new TextDecoder('utf-8');
@@ -21,7 +19,7 @@ async function readUpstreamMessage(resp, onDelta) {
   let forwarded = false;
   const toolMap = new Map(); // 按 index 合并流式 tool_calls 分片
   let sawSSE = false;
-  let sawToolCalls = false;  // 一旦出现工具调用，这一步的后续正文不再外发
+  let sawToolCalls = false;  // 一旦出现工具调用（含 DSML 标记），这一步的后续正文不再外发
 
   const emit = async (text, kind) => {
     if (!text || typeof onDelta !== 'function') return;
@@ -32,7 +30,6 @@ async function readUpstreamMessage(resp, onDelta) {
   // 返回 true 表示遇到 [DONE]，可以停止读取
   const consumeLine = async (line) => {
     line = line.trim();
-    // 空行、以 ':' 开头的注释（含保活行）直接跳过
     if (!line || line.charAt(0) === ':') return false;
     if (line.indexOf('data:') !== 0) return false;
     sawSSE = true;
@@ -47,12 +44,9 @@ async function readUpstreamMessage(resp, onDelta) {
     }
     const choice = ev && ev.choices && ev.choices[0];
     if (!choice) return false;
-    // 部分通道把完整 message 塞在一个 chunk 里（非增量），delta / message 两种都兼容
     const d = choice.delta || choice.message || {};
     const rc = d.reasoning_content || d.reasoning || '';
     if (rc) { reasoning += rc; await emit(rc, 'reasoning'); }
-    // 先处理 tool_calls：一旦这一步确定是工具调用，紧随其后的正文就不再外发，
-    // 少一次"先显示再撤回"的闪烁（前面已发出的部分仍由调用方 rollback 收回）
     if (Array.isArray(d.tool_calls) && d.tool_calls.length) {
       sawToolCalls = true;
       for (const tc of d.tool_calls) {
@@ -65,13 +59,16 @@ async function readUpstreamMessage(resp, onDelta) {
         if (tc.id) slot.id = tc.id;
         if (tc.type) slot.type = tc.type;
         const fn = tc.function || {};
-        // name 只在首个分片里给全，重复出现时不追加；arguments 按规范必须累加
         if (fn.name && !slot.function.name) slot.function.name = fn.name;
         if (fn.arguments) slot.function.arguments += fn.arguments;
       }
     }
     if (d.content) {
       content += d.content;
+      // v7.1.0：一旦流式正文中开始出现 <｜DSML｜ 标记，立即阻断后续内容向前端透传
+      if (!sawToolCalls && content.indexOf('DSML') !== -1 && /<\s*[|｜]\s*DSML/i.test(content)) {
+        sawToolCalls = true;
+      }
       if (!sawToolCalls) await emit(d.content, 'content');
     }
     return false;
@@ -82,7 +79,6 @@ async function readUpstreamMessage(resp, onDelta) {
     if (done) break;
     const chunk = decoder.decode(value, { stream: true });
     raw += chunk;
-    // 防 OOM：异常巨大的响应体直接掐断（正常对话远达不到 4MB）
     if (raw.length > 4000000) { try { await reader.cancel(); } catch (e) {} break; }
     buffer += chunk;
     const lines = buffer.split('\n');
@@ -93,12 +89,10 @@ async function readUpstreamMessage(resp, onDelta) {
     }
     if (stop) { try { await reader.cancel(); } catch (e) {} break; }
   }
-  // 收尾：最后一行可能没有换行符
   if (buffer.trim()) {
     try { await consumeLine(buffer); } catch (e) { if (e && e.name === 'UpstreamSSEError') throw e; }
   }
 
-  // 兜底：上游没有按 SSE 返回（部分通道忽略 stream 参数，直接给完整 JSON）
   if (!sawSSE) {
     try {
       const j = JSON.parse(raw);
