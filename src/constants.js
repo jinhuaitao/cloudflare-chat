@@ -30,7 +30,7 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 //    github_lookup（GitHub 仓库/Release/README 检索）、arxiv_search（arXiv 学术论文检索）、
 //    hn_top（Hacker News 实时热榜与技术讨论）、net_lookup（Cloudflare DoH DNS 解析 & IP 归属/ASN 诊断）、
 //    toolkit（全能单位换算/SHA哈希/Base64/URL编解码/UUID/字数与Token精确统计）。
-//  - 多模态与前端增强：Telegram 图片识图支持直接联动 Agent 工具链；Web 端新增一键导出会话为 Markdown (.md)。
+//  - 多模态增强：Telegram 图片识图支持直接联动 Agent 工具链。
 const APP_VERSION = '7.1.0';
 const PNG_HEADERS = {
   'Content-Type': 'image/png',
