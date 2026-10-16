@@ -1,164 +1,223 @@
-// Agent 工具：科学计算器、时间与日期推算、天气、实时汇率/加密币价、维基百科、GitHub 检索、arXiv 论文检索、HackerNews 热榜、DNS/IP 诊断、开发者全能工具箱
+// Agent 工具：科学计算器（支持多表达式批量计算）、时间与日期推算、天气（内置高频城市零延迟坐标表 + 多城市并发查询）、
+// 实时汇率/加密币价（支持多币种批量换算）、维基百科、GitHub 检索、arXiv 论文检索、HackerNews 热榜、DNS/IP 诊断、开发者全能工具箱
 
 import { mapSetBounded, mapGetBounded } from '../utils.js';
 import { isBlockedFetchHost } from '../net/ssrf.js';
 
-// v7.1.0：外部免密钥 API 结果 L1 缓存（TTL 3 分钟，最多 120 条），加速同轮/跨轮重复查询
+// 外部免密钥 API 结果 L1 缓存（TTL 3 分钟，最多 150 条），加速同轮/跨轮重复查询
 const localApiCache = new Map();
 const localApiExp = new Map();
 const LOCAL_API_TTL_MS = 3 * 60 * 1000;
+
+// 城市地理编码长效缓存（TTL 24 小时）+ 内置高频城市零延迟坐标表（省去 50% 的 Geocoding HTTP 往返）
+const geoCoordCache = new Map();
+const PRESET_CITY_COORDS = {
+  '北京': { name: '北京', country: '中国', latitude: 39.9042, longitude: 116.4074 },
+  'beijing': { name: '北京', country: '中国', latitude: 39.9042, longitude: 116.4074 },
+  '上海': { name: '上海', country: '中国', latitude: 31.2304, longitude: 121.4737 },
+  'shanghai': { name: '上海', country: '中国', latitude: 31.2304, longitude: 121.4737 },
+  '广州': { name: '广州', country: '中国', latitude: 23.1291, longitude: 113.2644 },
+  'guangzhou': { name: '广州', country: '中国', latitude: 23.1291, longitude: 113.2644 },
+  '深圳': { name: '深圳', country: '中国', latitude: 22.5431, longitude: 114.0579 },
+  'shenzhen': { name: '深圳', country: '中国', latitude: 22.5431, longitude: 114.0579 },
+  '杭州': { name: '杭州', country: '中国', latitude: 30.2741, longitude: 120.1551 },
+  'hangzhou': { name: '杭州', country: '中国', latitude: 30.2741, longitude: 120.1551 },
+  '成都': { name: '成都', country: '中国', latitude: 30.5728, longitude: 104.0668 },
+  'chengdu': { name: '成都', country: '中国', latitude: 30.5728, longitude: 104.0668 },
+  '武汉': { name: '武汉', country: '中国', latitude: 30.5928, longitude: 114.3055 },
+  '西安': { name: '西安', country: '中国', latitude: 34.3416, longitude: 108.9398 },
+  '南京': { name: '南京', country: '中国', latitude: 32.0603, longitude: 118.7969 },
+  '重庆': { name: '重庆', country: '中国', latitude: 29.5630, longitude: 106.5516 },
+  '天津': { name: '天津', country: '中国', latitude: 39.0842, longitude: 117.2010 },
+  '苏州': { name: '苏州', country: '中国', latitude: 31.2990, longitude: 120.5853 },
+  '香港': { name: '香港', country: '中国', latitude: 22.3193, longitude: 114.1694 },
+  'hongkong': { name: '香港', country: '中国', latitude: 22.3193, longitude: 114.1694 },
+  '台北': { name: '台北', country: '中国', latitude: 25.0330, longitude: 121.5654 },
+  'taipei': { name: '台北', country: '中国', latitude: 25.0330, longitude: 121.5654 },
+  '东京': { name: '东京', country: '日本', latitude: 35.6762, longitude: 139.6503 },
+  'tokyo': { name: 'Tokyo', country: 'Japan', latitude: 35.6762, longitude: 139.6503 },
+  '大阪': { name: '大阪', country: '日本', latitude: 34.6937, longitude: 135.5023 },
+  'osaka': { name: 'Osaka', country: 'Japan', latitude: 34.6937, longitude: 135.5023 },
+  '首尔': { name: '首尔', country: '韩国', latitude: 37.5665, longitude: 126.9780 },
+  'seoul': { name: 'Seoul', country: 'South Korea', latitude: 37.5665, longitude: 126.9780 },
+  '新加坡': { name: '新加坡', country: '新加坡', latitude: 1.3521, longitude: 103.8198 },
+  'singapore': { name: 'Singapore', country: 'Singapore', latitude: 1.3521, longitude: 103.8198 },
+  '纽约': { name: '纽约', country: '美国', latitude: 40.7128, longitude: -74.0060 },
+  'newyork': { name: 'New York', country: 'USA', latitude: 40.7128, longitude: -74.0060 },
+  '伦敦': { name: '伦敦', country: '英国', latitude: 51.5074, longitude: -0.1278 },
+  'london': { name: 'London', country: 'UK', latitude: 51.5074, longitude: -0.1278 },
+  '旧金山': { name: '旧金山', country: '美国', latitude: 37.7749, longitude: -122.4194 },
+  '巴黎': { name: '巴黎', country: '法国', latitude: 48.8566, longitude: 2.3522 },
+  '悉尼': { name: '悉尼', country: '澳大利亚', latitude: -33.8688, longitude: 151.2093 },
+};
 
 function getCachedApi(key) {
   return mapGetBounded(localApiCache, key, localApiExp);
 }
 function setCachedApi(key, val, ttlMs) {
-  mapSetBounded(localApiCache, key, val, 120, localApiExp, ttlMs || LOCAL_API_TTL_MS);
+  mapSetBounded(localApiCache, key, val, 150, localApiExp, ttlMs || LOCAL_API_TTL_MS);
 }
 
-// 安全科学计算器：递归下降解析，支持四则运算、乘方、括号、科学常量（pi/e）与常用数学函数，绝不使用 eval
+// 单条数学表达式求值辅助
+function evalSingleExpr(rawExpr) {
+  const s = String(rawExpr || '')
+    .replace(/\s+/g, '')
+    .replace(/×/g, '*')
+    .replace(/÷/g, '/')
+    .replace(/（/g, '(')
+    .replace(/）/g, ')')
+    .replace(/，/g, ',')
+    .replace(/π/g, 'pi');
+  if (!s) throw new Error('表达式为空');
+  if (s.length > 500) throw new Error('表达式过长（上限 500 字符）');
+  if (/[^0-9a-zA-Z_+\-*/%^(),.]/.test(s)) throw new Error('表达式含非法字符');
+
+  const FUNCS = {
+    sqrt: (a) => Math.sqrt(a[0]),
+    cbrt: (a) => Math.cbrt(a[0]),
+    abs: (a) => Math.abs(a[0]),
+    round: (a) => a.length > 1 ? Number(a[0].toFixed(Math.max(0, Math.min(10, a[1] | 0)))) : Math.round(a[0]),
+    floor: (a) => Math.floor(a[0]),
+    ceil: (a) => Math.ceil(a[0]),
+    sin: (a) => Math.sin(a[0]),
+    cos: (a) => Math.cos(a[0]),
+    tan: (a) => Math.tan(a[0]),
+    asin: (a) => Math.asin(a[0]),
+    acos: (a) => Math.acos(a[0]),
+    atan: (a) => Math.atan(a[0]),
+    ln: (a) => Math.log(a[0]),
+    log: (a) => a.length > 1 ? Math.log(a[0]) / Math.log(a[1]) : Math.log10(a[0]),
+    log10: (a) => Math.log10(a[0]),
+    log2: (a) => Math.log2(a[0]),
+    exp: (a) => Math.exp(a[0]),
+    pow: (a) => Math.pow(a[0], a[1]),
+    min: (a) => Math.min(...a),
+    max: (a) => Math.max(...a),
+    sum: (a) => a.reduce((acc, x) => acc + x, 0),
+    avg: (a) => a.reduce((acc, x) => acc + x, 0) / a.length,
+  };
+  const CONSTS = { pi: Math.PI, e: Math.E };
+
+  let i = 0;
+  let depth = 0;
+  const MAX_DEPTH = 64;
+  function enter() {
+    depth += 1;
+    if (depth > MAX_DEPTH) throw new Error('表达式嵌套过深');
+  }
+  function leave() { depth -= 1; }
+  function parseExpr() {
+    enter();
+    try { return parseExprBody(); }
+    finally { leave(); }
+  }
+  function parseExprBody() {
+    let v = parseTerm();
+    while (i < s.length && (s[i] === '+' || s[i] === '-')) {
+      const op = s[i++]; const r = parseTerm();
+      v = op === '+' ? v + r : v - r;
+    }
+    return v;
+  }
+  function parseTerm() {
+    let v = parseFactor();
+    while (i < s.length && (s[i] === '*' || s[i] === '/' || s[i] === '%')) {
+      const op = s[i++]; const r = parseFactor();
+      v = op === '*' ? v * r : op === '/' ? v / r : v % r;
+    }
+    return v;
+  }
+  function parseFactor() {
+    if (s[i] === '-') { i++; return -parseFactor(); }
+    if (s[i] === '+') { i++; return parseFactor(); }
+    let v = parsePrimary();
+    if (i < s.length && s[i] === '^') { i++; v = Math.pow(v, parseFactor()); }
+    return v;
+  }
+  function parsePrimary() {
+    if (s[i] === '(') {
+      i++;
+      const v = parseExpr();
+      if (s[i] !== ')') throw new Error('括号不匹配');
+      i++;
+      return v;
+    }
+    if (/[a-zA-Z_]/.test(s[i])) {
+      let j = i;
+      while (j < s.length && /[a-zA-Z0-9_]/.test(s[j])) j++;
+      const ident = s.slice(i, j).toLowerCase();
+      i = j;
+      if (s[i] === '(') {
+        const fn = FUNCS[ident];
+        if (!fn) throw new Error('不支持的函数: ' + ident);
+        i++;
+        const args = [];
+        if (s[i] !== ')') {
+          args.push(parseExpr());
+          while (i < s.length && s[i] === ',') {
+            i++;
+            args.push(parseExpr());
+          }
+        }
+        if (s[i] !== ')') throw new Error('函数括号不匹配: ' + ident);
+        i++;
+        if (!args.length) throw new Error('函数缺少参数: ' + ident);
+        return fn(args);
+      }
+      if (Object.prototype.hasOwnProperty.call(CONSTS, ident)) {
+        return CONSTS[ident];
+      }
+      throw new Error('未知常量或标识符: ' + ident);
+    }
+    let j = i;
+    while (j < s.length && /[0-9.]/.test(s[j])) j++;
+    if (j === i) throw new Error('意外的字符: ' + s[i]);
+    const numStr = s.slice(i, j);
+    if (!/^(\d+\.?\d*|\.\d+)$/.test(numStr)) throw new Error('数字格式非法: ' + numStr);
+    const n = parseFloat(numStr);
+    i = j;
+    if (i < s.length && (s[i] === 'e' || s[i] === 'E') && /[0-9+\-]/.test(s[i + 1] || '')) {
+      let k = i + 1;
+      if (s[k] === '+' || s[k] === '-') k++;
+      const expStart = k;
+      while (k < s.length && /[0-9]/.test(s[k])) k++;
+      if (k > expStart) {
+        const sciVal = parseFloat(numStr + s.slice(i, k));
+        i = k;
+        if (!isFinite(sciVal)) throw new Error('数字非法');
+        return sciVal;
+      }
+    }
+    if (!isFinite(n)) throw new Error('数字非法');
+    return n;
+  }
+  const v = parseExpr();
+  if (i !== s.length) throw new Error('表达式未完全解析');
+  if (!isFinite(v)) throw new Error('计算结果非法（可能除零或结果溢出）');
+  const av = Math.abs(v);
+  return (av >= 1e-6 && av < 1e15) ? Math.round(v * 1e10) / 1e10 : v;
+}
+
+// 安全科学计算器：支持单表达式及用分号 ; 分隔的多表达式批量计算
 function toolCalculate(expr) {
   try {
-    const s = String(expr || '')
-      .replace(/\s+/g, '')
-      .replace(/×/g, '*')
-      .replace(/÷/g, '/')
-      .replace(/（/g, '(')
-      .replace(/）/g, ')')
-      .replace(/，/g, ',')
-      .replace(/π/g, 'pi');
-    if (!s) return '表达式为空';
-    if (s.length > 500) return '表达式过长（上限 500 字符）';
-    if (/[^0-9a-zA-Z_+\-*/%^(),.]/.test(s)) return '表达式含非法字符';
-
-    const FUNCS = {
-      sqrt: (a) => Math.sqrt(a[0]),
-      cbrt: (a) => Math.cbrt(a[0]),
-      abs: (a) => Math.abs(a[0]),
-      round: (a) => a.length > 1 ? Number(a[0].toFixed(Math.max(0, Math.min(10, a[1] | 0)))) : Math.round(a[0]),
-      floor: (a) => Math.floor(a[0]),
-      ceil: (a) => Math.ceil(a[0]),
-      sin: (a) => Math.sin(a[0]),
-      cos: (a) => Math.cos(a[0]),
-      tan: (a) => Math.tan(a[0]),
-      asin: (a) => Math.asin(a[0]),
-      acos: (a) => Math.acos(a[0]),
-      atan: (a) => Math.atan(a[0]),
-      ln: (a) => Math.log(a[0]),
-      log: (a) => a.length > 1 ? Math.log(a[0]) / Math.log(a[1]) : Math.log10(a[0]),
-      log10: (a) => Math.log10(a[0]),
-      log2: (a) => Math.log2(a[0]),
-      exp: (a) => Math.exp(a[0]),
-      pow: (a) => Math.pow(a[0], a[1]),
-      min: (a) => Math.min(...a),
-      max: (a) => Math.max(...a),
-      sum: (a) => a.reduce((acc, x) => acc + x, 0),
-      avg: (a) => a.reduce((acc, x) => acc + x, 0) / a.length,
-    };
-    const CONSTS = {
-      pi: Math.PI,
-      e: Math.E,
-    };
-
-    let i = 0;
-    let depth = 0;
-    const MAX_DEPTH = 64;
-    function enter() {
-      depth += 1;
-      if (depth > MAX_DEPTH) throw new Error('表达式嵌套过深');
+    const raw = String(expr || '').trim();
+    if (!raw) return '表达式为空';
+    const parts = raw.split(/[;；\r\n]+/).map(x => x.trim()).filter(Boolean);
+    if (!parts.length) return '表达式为空';
+    if (parts.length === 1) {
+      return '计算结果：' + String(evalSingleExpr(parts[0]));
     }
-    function leave() { depth -= 1; }
-    function parseExpr() {
-      enter();
-      try { return parseExprBody(); }
-      finally { leave(); }
-    }
-    function parseExprBody() {
-      let v = parseTerm();
-      while (i < s.length && (s[i] === '+' || s[i] === '-')) {
-        const op = s[i++]; const r = parseTerm();
-        v = op === '+' ? v + r : v - r;
-      }
-      return v;
-    }
-    function parseTerm() {
-      let v = parseFactor();
-      while (i < s.length && (s[i] === '*' || s[i] === '/' || s[i] === '%')) {
-        const op = s[i++]; const r = parseFactor();
-        v = op === '*' ? v * r : op === '/' ? v / r : v % r;
-      }
-      return v;
-    }
-    function parseFactor() {
-      if (s[i] === '-') { i++; return -parseFactor(); }
-      if (s[i] === '+') { i++; return parseFactor(); }
-      let v = parsePrimary();
-      if (i < s.length && s[i] === '^') { i++; v = Math.pow(v, parseFactor()); }
-      return v;
-    }
-    function parsePrimary() {
-      if (s[i] === '(') {
-        i++;
-        const v = parseExpr();
-        if (s[i] !== ')') throw new Error('括号不匹配');
-        i++;
-        return v;
-      }
-      if (/[a-zA-Z_]/.test(s[i])) {
-        let j = i;
-        while (j < s.length && /[a-zA-Z0-9_]/.test(s[j])) j++;
-        const ident = s.slice(i, j).toLowerCase();
-        i = j;
-        if (s[i] === '(') {
-          const fn = FUNCS[ident];
-          if (!fn) throw new Error('不支持的函数: ' + ident);
-          i++; // skip '('
-          const args = [];
-          if (s[i] !== ')') {
-            args.push(parseExpr());
-            while (i < s.length && s[i] === ',') {
-              i++;
-              args.push(parseExpr());
-            }
-          }
-          if (s[i] !== ')') throw new Error('函数括号不匹配: ' + ident);
-          i++;
-          if (!args.length) throw new Error('函数缺少参数: ' + ident);
-          return fn(args);
-        }
-        if (Object.prototype.hasOwnProperty.call(CONSTS, ident)) {
-          return CONSTS[ident];
-        }
-        throw new Error('未知常量或标识符: ' + ident);
-      }
-      let j = i;
-      while (j < s.length && /[0-9.]/.test(s[j])) j++;
-      if (j === i) throw new Error('意外的字符: ' + s[i]);
-      const numStr = s.slice(i, j);
-      if (!/^(\d+\.?\d*|\.\d+)$/.test(numStr)) throw new Error('数字格式非法: ' + numStr);
-      const n = parseFloat(numStr);
-      i = j;
-      if (i < s.length && (s[i] === 'e' || s[i] === 'E') && /[0-9+\-]/.test(s[i + 1] || '')) {
-        let k = i + 1;
-        if (s[k] === '+' || s[k] === '-') k++;
-        const expStart = k;
-        while (k < s.length && /[0-9]/.test(s[k])) k++;
-        if (k > expStart) {
-          const sciVal = parseFloat(numStr + s.slice(i, k));
-          i = k;
-          if (!isFinite(sciVal)) throw new Error('数字非法');
-          return sciVal;
-        }
-      }
-      if (!isFinite(n)) throw new Error('数字非法');
-      return n;
-    }
-    const v = parseExpr();
-    if (i !== s.length) throw new Error('表达式未完全解析');
-    if (!isFinite(v)) return '计算结果非法（可能除零或结果溢出）';
-    const av = Math.abs(v);
-    const out = (av >= 1e-6 && av < 1e15) ? Math.round(v * 1e10) / 1e10 : v;
-    return '计算结果：' + String(out);
-  } catch (e) { return '计算失败: ' + e.message; }
+    const results = parts.slice(0, 10).map(p => {
+      try { return `${p} = ${evalSingleExpr(p)}`; }
+      catch (e) { return `${p} → 计算失败 (${e.message})`; }
+    });
+    return '批量计算结果：\n' + results.join('\n');
+  } catch (e) {
+    if (/非法字符|为空|过长/.test(e.message)) return e.message;
+    if (/计算结果非法/.test(e.message)) return e.message;
+    return '计算失败: ' + e.message;
+  }
 }
 
 // 解析 YYYY-MM-DD 为 UTC 零点毫秒数
@@ -173,7 +232,7 @@ function parseIsoDateUtc(str) {
   return ms;
 }
 
-// 增强版时间与日期推算：支持当前时间、两日期间隔天数（target_date）、日期加减天数（add_days）与 Unix 时间戳互转
+// 增强版时间与日期推算：支持当前时间、两日期间隔天数（target_date）、日期加减天数（add_days）与 Unix 时间戳
 function toolGetTime(timezone, opts) {
   if (timezone && typeof timezone === 'object') {
     opts = timezone;
@@ -250,16 +309,21 @@ async function fetchText(url, timeoutMs, headers) {
   } finally { clearTimeout(timer); }
 }
 
-async function toolGetWeather(city) {
+async function querySingleCityWeather(city) {
   city = String(city || '').trim();
   if (!city) return '城市名为空';
   const cacheKey = 'weather:' + city.toLowerCase();
   const cached = getCachedApi(cacheKey);
   if (cached) return cached;
   try {
-    const g = await fetchJson('https://geocoding-api.open-meteo.com/v1/search?name=' + encodeURIComponent(city) + '&count=1&language=zh&format=json');
-    if (!g.results || !g.results.length) return '找不到城市：' + city;
-    const loc = g.results[0];
+    const normKey = city.toLowerCase().replace(/\s+/g, '');
+    let loc = PRESET_CITY_COORDS[city] || PRESET_CITY_COORDS[normKey] || geoCoordCache.get(normKey);
+    if (!loc) {
+      const g = await fetchJson('https://geocoding-api.open-meteo.com/v1/search?name=' + encodeURIComponent(city) + '&count=1&language=zh&format=json');
+      if (!g.results || !g.results.length) return '找不到城市：' + city;
+      loc = g.results[0];
+      mapSetBounded(geoCoordCache, normKey, loc, 300);
+    }
     const w = await fetchJson('https://api.open-meteo.com/v1/forecast?latitude=' + loc.latitude + '&longitude=' + loc.longitude +
       '&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m' +
       '&daily=temperature_2m_max,temperature_2m_min,weather_code&timezone=auto&forecast_days=3');
@@ -271,6 +335,16 @@ async function toolGetWeather(city) {
     setCachedApi(cacheKey, t, 5 * 60 * 1000);
     return t;
   } catch (e) { return '天气查询失败: ' + e.message; }
+}
+
+// 支持单城市或逗号分隔的多城市并发查询（如 "北京, 上海, 东京"）
+async function toolGetWeather(city) {
+  const raw = String(city || '').trim();
+  if (!raw) return '城市名为空';
+  const cities = raw.split(/[,，、;；]+/).map(s => s.trim()).filter(Boolean);
+  if (cities.length <= 1) return await querySingleCityWeather(cities[0] || raw);
+  const resList = await Promise.all(cities.slice(0, 5).map(c => querySingleCityWeather(c)));
+  return resList.join('\n\n');
 }
 
 // 实时法币汇率换算 & 主流加密货币实时行情
@@ -311,11 +385,9 @@ function normCurrencyCode(c) {
   return CURRENCY_ALIASES[raw] || CURRENCY_ALIASES[up] || up;
 }
 
-async function toolExchangeRate(args) {
-  args = args || {};
-  const from = normCurrencyCode(args.from || 'USD');
-  const to = normCurrencyCode(args.to || 'CNY');
-  const amount = isFinite(parseFloat(args.amount)) && parseFloat(args.amount) > 0 ? parseFloat(args.amount) : 1;
+async function querySingleExchangeRate(fromCode, toCode, amount) {
+  const from = normCurrencyCode(fromCode || 'USD');
+  const to = normCurrencyCode(toCode || 'CNY');
   if (!from || !to) return '汇率查询失败: 请提供源货币与目标货币代码（如 USD、CNY、JPY、BTC）';
 
   const cacheKey = `fx:${from}:${to}:${amount}`;
@@ -330,7 +402,7 @@ async function toolExchangeRate(args) {
       const cg = await fetchJson(
         `https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(cryptoId)}&vs_currencies=${encodeURIComponent(fiat)},usd,cny&include_24hr_change=true`,
         10000,
-        { 'Accept': 'application/json', 'User-Agent': 'Cloudflare-Chat/7.1' }
+        { 'Accept': 'application/json', 'User-Agent': 'Cloudflare-Chat/7.2' }
       );
       const item = cg && cg[cryptoId];
       if (!item) return '汇率查询失败: 未找到加密货币 ' + (isFromCrypto ? from : to) + ' 的实时行情';
@@ -374,6 +446,18 @@ async function toolExchangeRate(args) {
   }
 }
 
+// 支持单币种或逗号分隔多币种并发查询（如 from="USD, JPY, BTC", to="CNY"）
+async function toolExchangeRate(args) {
+  args = args || {};
+  const rawFrom = String(args.from || 'USD').trim();
+  const to = args.to || 'CNY';
+  const amount = isFinite(parseFloat(args.amount)) && parseFloat(args.amount) > 0 ? parseFloat(args.amount) : 1;
+  const fromList = rawFrom.split(/[,，、;；]+/).map(s => s.trim()).filter(Boolean);
+  if (fromList.length <= 1) return await querySingleExchangeRate(fromList[0] || rawFrom, to, amount);
+  const resList = await Promise.all(fromList.slice(0, 6).map(f => querySingleExchangeRate(f, to, amount)));
+  return resList.join('\n\n');
+}
+
 // 维基百科权威词条检索（自动识别中英文，支持搜索 + 摘要提取）
 async function toolWikiLookup(query, lang) {
   query = String(query || '').trim();
@@ -386,7 +470,7 @@ async function toolWikiLookup(query, lang) {
 
   const host = `https://${wikiLang}.wikipedia.org`;
   const headers = {
-    'User-Agent': 'Cloudflare-Chat/7.1 (https://workers.cloudflare.com)',
+    'User-Agent': 'Cloudflare-Chat/7.2 (https://workers.cloudflare.com)',
     'Accept-Language': wikiLang === 'zh' ? 'zh-CN,zh;q=0.9' : 'en-US,en;q=0.9'
   };
   try {
@@ -422,7 +506,7 @@ async function toolWikiLookup(query, lang) {
   }
 }
 
-// ==================== v7.1.0 新增免密钥工具 1：GitHub 开源仓库与 Release 检索 ====================
+// ==================== 新增免密钥工具 1：GitHub 开源仓库与 Release 检索 ====================
 async function toolGithubLookup(args) {
   args = args || {};
   const query = String(args.query || '').trim();
@@ -435,11 +519,15 @@ async function toolGithubLookup(args) {
 
   const headers = {
     'Accept': 'application/vnd.github+json',
-    'User-Agent': 'Cloudflare-Chat/7.1'
+    'User-Agent': 'Cloudflare-Chat/7.2'
   };
   try {
     if (isRepoSlug) {
-      const repo = await fetchJson(`https://api.github.com/repos/${query}`, 10000, headers);
+      const [repo, rel, readme] = await Promise.all([
+        fetchJson(`https://api.github.com/repos/${query}`, 10000, headers),
+        fetchJson(`https://api.github.com/repos/${query}/releases/latest`, 6000, headers).catch(() => null),
+        fetchJson(`https://api.github.com/repos/${query}/readme`, 6000, headers).catch(() => null)
+      ]);
       let out = `【GitHub 仓库：${repo.full_name}】\n`
         + `链接：${repo.html_url}\n`
         + `简介：${repo.description || '无'}\n`
@@ -448,11 +536,6 @@ async function toolGithubLookup(args) {
       if (Array.isArray(repo.topics) && repo.topics.length) {
         out += `\n标签：${repo.topics.slice(0, 10).join(', ')}`;
       }
-      // 并发尝试读取最新 Release 与 README 前 1500 字
-      const [rel, readme] = await Promise.all([
-        fetchJson(`https://api.github.com/repos/${query}/releases/latest`, 6000, headers).catch(() => null),
-        fetchJson(`https://api.github.com/repos/${query}/readme`, 6000, headers).catch(() => null)
-      ]);
       if (rel && rel.tag_name) {
         out += `\n最新发版：${rel.tag_name}（${(rel.published_at || '').slice(0, 10)}）${rel.name ? ' - ' + rel.name : ''}`;
         if (rel.body) out += `\n发版说明摘要：${String(rel.body).replace(/\s+/g, ' ').slice(0, 350)}`;
@@ -491,7 +574,7 @@ async function toolGithubLookup(args) {
   }
 }
 
-// ==================== v7.1.0 新增免密钥工具 2：arXiv 学术论文检索 ====================
+// ==================== 新增免密钥工具 2：arXiv 学术论文检索 ====================
 async function toolArxivSearch(args) {
   args = args || {};
   const query = String(args.query || '').trim();
@@ -504,7 +587,7 @@ async function toolArxivSearch(args) {
 
   try {
     const url = `https://export.arxiv.org/api/query?search_query=all:${encodeURIComponent(query)}&start=0&max_results=${maxResults}&sortBy=${sortBy}&sortOrder=descending`;
-    const xml = await fetchText(url, 12000, { 'User-Agent': 'Cloudflare-Chat/7.1' });
+    const xml = await fetchText(url, 12000, { 'User-Agent': 'Cloudflare-Chat/7.2' });
     const entryRe = /<entry>([\s\S]*?)<\/entry>/g;
     const entries = [];
     let m;
@@ -547,7 +630,7 @@ async function toolArxivSearch(args) {
   }
 }
 
-// ==================== v7.1.0 新增免密钥工具 3：Hacker News 科技热榜与实时讨论检索 ====================
+// ==================== 新增免密钥工具 3：Hacker News 科技热榜与实时讨论检索 ====================
 async function toolHnTop(args) {
   args = args || {};
   const query = String(args.query || '').trim();
@@ -560,7 +643,7 @@ async function toolHnTop(args) {
     const apiUrl = query
       ? `https://hn.algolia.com/api/v1/search?query=${encodeURIComponent(query)}&tags=story&hitsPerPage=${count}`
       : `https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=${count}`;
-    const data = await fetchJson(apiUrl, 10000, { 'User-Agent': 'Cloudflare-Chat/7.1' });
+    const data = await fetchJson(apiUrl, 10000, { 'User-Agent': 'Cloudflare-Chat/7.2' });
     const hits = (data && data.hits) || [];
     if (!hits.length) return query ? `Hacker News 未找到「${query}」相关讨论` : 'Hacker News 首页热榜暂时为空';
     let out = query ? `Hacker News 关于「${query}」的热门讨论：\n` : 'Hacker News 当前首页科技热榜：\n';
@@ -577,7 +660,7 @@ async function toolHnTop(args) {
   }
 }
 
-// ==================== v7.1.0 新增免密钥工具 4：DNS 权威解析 (DoH) 与 IP 归属地/ASN 诊断 ====================
+// ==================== 新增免密钥工具 4：DNS 权威解析 (DoH) 与 IP 归属地/ASN 诊断 ====================
 async function toolNetLookup(args) {
   args = args || {};
   const target = String(args.target || '').trim();
@@ -595,7 +678,7 @@ async function toolNetLookup(args) {
 
   try {
     if (isIp || recordType === 'IP' || recordType === 'GEO') {
-      const info = await fetchJson(`https://ipwho.is/${encodeURIComponent(target)}`, 10000, { 'User-Agent': 'Cloudflare-Chat/7.1' });
+      const info = await fetchJson(`https://ipwho.is/${encodeURIComponent(target)}`, 10000, { 'User-Agent': 'Cloudflare-Chat/7.2' });
       if (!info || info.success === false) {
         return `IP 归属查询失败: ${info && info.message ? info.message : '无法解析该地址'}`;
       }
@@ -630,26 +713,20 @@ async function toolNetLookup(args) {
   }
 }
 
-// ==================== v7.1.0 新增免密钥工具 5：全能确定性工具箱（单位换算 / 哈希摘要 / 编解码 / 文本统计 / UUID） ====================
+// ==================== 新增免密钥工具 5：全能确定性工具箱（单位换算 / 哈希摘要 / 编解码 / 文本统计 / UUID） ====================
 const UNIT_TABLE = {
-  // 长度（基准：米 m）
   mm: { cat: 'len', k: 0.001 }, cm: { cat: 'len', k: 0.01 }, m: { cat: 'len', k: 1 }, km: { cat: 'len', k: 1000 },
   in: { cat: 'len', k: 0.0254 }, inch: { cat: 'len', k: 0.0254 }, ft: { cat: 'len', k: 0.3048 }, foot: { cat: 'len', k: 0.3048 },
   yd: { cat: 'len', k: 0.9144 }, mi: { cat: 'len', k: 1609.344 }, mile: { cat: 'len', k: 1609.344 }, nmi: { cat: 'len', k: 1852 },
-  // 重量（基准：克 g）
   mg: { cat: 'wt', k: 0.001 }, g: { cat: 'wt', k: 1 }, kg: { cat: 'wt', k: 1000 }, t: { cat: 'wt', k: 1e6 },
   oz: { cat: 'wt', k: 28.349523125 }, lb: { cat: 'wt', k: 453.59237 }, jin: { cat: 'wt', k: 500 }, '斤': { cat: 'wt', k: 500 }, '两': { cat: 'wt', k: 50 },
-  // 面积（基准：平方米 m2）
   cm2: { cat: 'area', k: 0.0001 }, m2: { cat: 'area', k: 1 }, sqm: { cat: 'area', k: 1 }, km2: { cat: 'area', k: 1e6 },
   ha: { cat: 'area', k: 10000 }, acre: { cat: 'area', k: 4046.8564224 }, sqft: { cat: 'area', k: 0.09290304 },
   mu: { cat: 'area', k: 666.6666667 }, '亩': { cat: 'area', k: 666.6666667 }, '坪': { cat: 'area', k: 3.305785 },
-  // 体积（基准：升 l）
   ml: { cat: 'vol', k: 0.001 }, l: { cat: 'vol', k: 1 }, m3: { cat: 'vol', k: 1000 },
   gal: { cat: 'vol', k: 3.785411784 }, floz: { cat: 'vol', k: 0.0295735296 }, cup: { cat: 'vol', k: 0.2365882365 },
-  // 速度（基准：m/s）
   'm/s': { cat: 'spd', k: 1 }, 'km/h': { cat: 'spd', k: 1 / 3.6 }, kph: { cat: 'spd', k: 1 / 3.6 },
   mph: { cat: 'spd', k: 0.44704 }, kn: { cat: 'spd', k: 1852 / 3600 }, knot: { cat: 'spd', k: 1852 / 3600 },
-  // 数据存储（基准：Byte）
   b: { cat: 'data', k: 1 }, kb: { cat: 'data', k: 1e3 }, mb: { cat: 'data', k: 1e6 }, gb: { cat: 'data', k: 1e9 }, tb: { cat: 'data', k: 1e12 },
   kib: { cat: 'data', k: 1024 }, mib: { cat: 'data', k: 1048576 }, gib: { cat: 'data', k: 1073741824 }, tib: { cat: 'data', k: 1099511627776 },
 };
@@ -658,7 +735,6 @@ function convertUnits(val, fromRaw, toRaw) {
   const f = String(fromRaw || '').trim().toLowerCase();
   const t = String(toRaw || '').trim().toLowerCase();
   if (!isFinite(val)) return '单位换算失败: 数值非法';
-  // 温度换算（C / F / K）
   const normTemp = (u) => ({ c: 'c', '°c': 'c', celsius: 'c', '摄氏度': 'c', f: 'f', '°f': 'f', fahrenheit: 'f', '华氏度': 'f', k: 'k', kelvin: 'k', '开尔文': 'k' }[u] || '');
   const tf = normTemp(f), tt = normTemp(t);
   if (tf && tt) {
@@ -666,7 +742,6 @@ function convertUnits(val, fromRaw, toRaw) {
     let outVal = tt === 'c' ? cVal : (tt === 'f' ? cVal * 9 / 5 + 32 : cVal + 273.15);
     return `单位换算结果：${val} ${fromRaw} = ${Number(outVal.toFixed(4))} ${toRaw}`;
   }
-  // 油耗换算（MPG <-> L/100km）
   const isMpg = (u) => u === 'mpg';
   const isL100 = (u) => u === 'l/100km' || u === 'l100km';
   if ((isMpg(f) && isL100(t)) || (isL100(f) && isMpg(t))) {

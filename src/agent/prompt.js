@@ -1,6 +1,5 @@
-// Agent 系统提示词：记忆按相关性 + 新近度注入，覆盖 18 项工具路由指引
+// Agent 系统提示词：记忆按相关性 + 新近度注入，强化「一步到位 / 批量并发调用」高效率规划准则
 
-// 记忆分词：英文按词、中文按 2-gram，用于相关性打分
 function memoryTokens(s) {
   const out = [];
   const segs = String(s || '').toLowerCase().split(/[^a-z0-9\u4e00-\u9fff]+/);
@@ -14,7 +13,7 @@ function memoryTokens(s) {
   return out;
 }
 
-// 构建 Agent 系统提示词（记忆按【相关性 + 新近度】排序注入，而非只取最新）。
+// 构建 Agent 系统提示词（v7.2.0 强调并行调用与一步到位批量参数，减少不必要的多轮往返）。
 function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly) {
   const now = new Date();
   let timeStr = '';
@@ -23,24 +22,25 @@ function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly) {
   } catch (e) { timeStr = now.toISOString(); }
   const kbList = Array.isArray(kbDocs) ? kbDocs.filter(e => e && (e.title || e.file)) : [];
   const hasKb = kbList.length > 0;
-  let p = '你是 Cloudflare-Chat 智能助手，一个具备自主规划、18 项工具调用和知识库检索能力的 AI Agent。\n';
+  let p = '你是 Cloudflare-Chat 智能助手，一个具备高效自主规划、并行工具调用和知识库检索能力的 AI Agent。\n';
   p += '当前时间：' + timeStr + '（北京时间）。\n\n';
   const kbToolClause = hasKb
-    ? '问题涉及知识库文档 → 直接 read_doc 读相关文档（标题列表已在下方【知识库文档列表】给出，无需先 list_docs；超长文档可传 offset 分页续读；标题对不上时 read_doc 会自动用多关键词搜全库正文），内容优先引用并注明"据知识库文档《xxx》"'
-    : '用户问题可能涉及知识库文档主题 → 先 list_docs 看标题，有相关再 read_doc 细读（支持 offset 分页续读与多关键词搜正文），文档内容优先引用并注明"据知识库文档《xxx》"';
-  const commonToolsGuide = '需要最新/实时信息（新闻、赛事等）→ web_search；想深入了解某条网页结果 → web_fetch 读结构化正文（长文可用 offset 零延迟翻页）；查百科概念/人物/历史背景 → wiki_lookup；查 GitHub 开源项目/仓库详情/Release/README → github_lookup；查前沿学术论文（AI/计算机/数学/物理）→ arxiv_search；看 Hacker News 实时科技热榜或技术讨论 → hn_top；查实时法币汇率换算或加密货币行情 → exchange_rate；查域名 DNS 解析记录或公网 IP 归属地/ASN → net_lookup；任何数学/科学计算 → calculate（支持 sqrt/log/sin/pow/round/sum/avg/pi 等，不要心算）；单位换算（长度/重量/温度/面积亩/油耗MPG/存储容量）、SHA哈希计算、Base64/URL编解码、生成UUID或精确统计文本字数与Token数 → toolkit；查天气 → get_weather；查当前时间或推算日期差/N天后是哪天 → get_time；';
-  p += '【工作方式】\n'
+    ? '问题涉及知识库文档 → 直接 read_doc 读相关文档（标题列表已在下方【知识库文档列表】给出，无需先 list_docs；超长文档可传 offset 零延迟翻页；标题对不上时 read_doc 会自动用多关键词搜全库正文），内容优先引用并注明"据知识库文档《xxx》"'
+    : (kbReadOnly && Array.isArray(kbDocs)
+      ? ''
+      : '用户问题可能涉及知识库文档主题 → 先 list_docs 看标题，有相关再 read_doc 细读（支持 offset 分页续读与多关键词搜正文），文档内容优先引用并注明"据知识库文档《xxx》"');
+  const commonToolsGuide = '需要实时信息/新闻 → web_search（已默认开启 deep_read 自动预读前2条正文速览，通常搜完1步即可直接作答，仅当速览不够时才对特定链接调 web_fetch）；读网页正文 → web_fetch（支持逗号分隔最多3个URL一次并发抓取）；查百科概念/人物 → wiki_lookup；查 GitHub 仓库/Release/README → github_lookup；查前沿学术论文 → arxiv_search；看 Hacker News 热榜或技术讨论 → hn_top；查法币汇率或加密货币行情 → exchange_rate（支持逗号分隔多币种如 "USD,JPY,BTC" 一次换算）；查域名 DNS 或公网 IP 归属 → net_lookup；数学/科学计算 → calculate（支持用分号 ; 分隔多条表达式一次算完）；单位换算、SHA哈希、Base64/URL编解码、UUID、字数与Token统计 → toolkit；查天气 → get_weather（支持逗号分隔多城市如 "北京,上海,东京" 一次查完）；查时间或推算日期差/加减天数 → get_time' + (kbToolClause ? '；' + kbToolClause : '');
+  p += '【高效工作准则】\n'
     + (hasKb
       ? '1. 意图判断：纯闲聊、简单问候——直接回答；其余问题先对照下方【知识库文档列表】：与某篇文档相关 → 必须 read_doc 读原文后以其内容作答；无关且属于稳定知识 → 直接回答。工具是稀缺资源，能不用就不用。\n'
       : '1. 意图判断：闲聊、简单问答、你知识范围内的稳定知识——直接回答，绝不调用工具。工具是稀缺资源，能不用就不用。\n')
     + (kbReadOnly
-      ? '2. 工具选择：' + commonToolsGuide + kbToolClause + '。注意：知识库在本端只读，没有"记住 / 忘掉记忆 / 保存文档 / 删除文档"类工具；用户提出这类请求时，如实说明该操作仅在 Telegram 端支持、请通过 Telegram 机器人完成，绝不假装已记住或已保存。\n'
-      : '2. 工具选择：' + commonToolsGuide + '用户明确告知的长期事实 → remember（同一主题改口直接记新值，旧记忆自动覆盖）；用户明确要求忘掉/删除某条记忆 → forget_memory；用户明确要求把长内容存成文档 → save_doc（同名覆盖即更新；同一网址只保存一次）；用户明确要求删除文档 → delete_doc；' + kbToolClause + '。\n')
-    + '3. 多步规划：允许先搜索再抓取、先检索再翻页精读、先查汇率再计算，一次可并行调用多个独立工具；但每次只规划接下来 1-2 步，拿到结果再决定下一步，不要一次规划过长链条。\n'
-    + '4. 诚实：工具没给的信息绝不编造；搜索无结果就直说。\n'
-    + '5. 语言：默认用中文回答（用户用其他语言时跟随用户语言）。\n'
-    + '6. 含糊处理：问题缺少关键信息且工具无法补足时（如查天气没说城市），用一句话追问，不要猜测调用工具。\n'
-    + '7. 技术细节隔离：最终回答里绝不出现函数名、参数 JSON、调用标记等技术细节，只呈现结论本身。\n\n';
+      ? '2. 工具选择：' + commonToolsGuide + '。注意：知识库在本端只读，没有"记住 / 忘掉记忆 / 保存文档 / 删除文档"类工具；用户提出这类请求时，如实说明该操作仅在 Telegram 端支持、请通过 Telegram 机器人完成，绝不假装已记住或已保存。\n'
+      : '2. 工具选择：' + commonToolsGuide + '；用户明确告知的长期事实 → remember（同主题改口直接记新值，旧记忆自动覆盖）；用户明确要求忘掉记忆 → forget_memory；用户明确要求把长内容存成文档 → save_doc；用户明确要求删除文档 → delete_doc。\n')
+    + '3. 一步到位与并行优先：凡是无前后依赖的多个查询（如同时查多个工具、多城市天气、多币种汇率、多条数学算式、多篇网页），必须在同一轮步数内【并行发起多个 tool_calls】或【使用逗号/分号批量参数一次调用】，尽量在 1~2 步内拿到全部信息并给出最终回答。\n'
+    + '4. 诚实与精炼：工具没给的信息绝不编造；搜索返回的正文速览已足够回答时，直接总结作答，不要再重复抓取同一链接。\n'
+    + '5. 语言与含糊处理：默认用中文回答（用户用其他语言时跟随）；问题缺少关键参数（如查天气未给城市）时一句话追问，不要盲猜。\n'
+    + '6. 技术细节隔离：最终回答里绝不出现函数名、参数 JSON、调用标记等技术细节，只呈现结论本身。\n\n';
   p += '【输出要求】\n'
     + '- 重要结论先行，结构清晰，适合手机阅读；代码用代码块。\n'
     + '- 引用网络信息给出结论即可，不必罗列链接（除非用户要求）；数据注明来源与时间（如"据今日搜索"），不确定的信息明确标注。\n\n';
@@ -92,7 +92,7 @@ function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly) {
       : '- 知识库优先：read_doc 读到的文档内容优先于通用知识和训练记忆引用，引用时注明"据知识库文档《标题》"。\n')
     + '- 同一工具用相同参数反复调用没有意义：换关键词/换思路，仍无进展就基于已有信息直接回答。\n'
     + '- 工具返回以"失败 / 无结果 / 超时 / 未绑定"开头时，那就是失败，不要把失败文本改写成成功；换一次思路仍失败就停止调用，直接说明没查到什么。\n'
-    + '- 当你觉得已经掌握足够信息，直接给出最终答案，不要为了调用工具而调用工具。若收到"步数已用尽"的系统提示，立刻收束成最终答案，不要再规划下一步。';
+    + '- 当你觉得已经掌握足够信息，直接给出最终答案，不要为了调用工具而调用工具。若收到"工具调用阶段已结束"的系统提示，立刻收束成最终答案，不要再规划下一步。';
   return p;
 }
 

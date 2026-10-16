@@ -1,23 +1,31 @@
-// Agent 稳定性增强：结果截断、调用签名、带历史步骤摘要压缩的上下文预算裁剪
+// Agent 稳定性增强：智能边界截断（自动闭合代码块）、调用签名、带历史步骤摘要压缩的上下文预算裁剪
 
-// ==================== Agent 稳定性增强（v6.6.5，v7.1.0 智能压缩升级） ====================
-// 1) truncateToolResult：工具结果截断并明确标注，避免模型误以为拿到了完整数据。
-// 2) toolCallSignature：工具调用签名，用于"重复调用熔断"。
-// 3) trimAgentMessages：上下文预算裁剪。多步任务中工具结果（每条可达 4000 字）
-//    会快速堆积，超预算时从最旧的"整轮"（1 条 assistant + 其 tool 消息）开始删，
-//    成对删除保证 OpenAI 消息序列合法性（assistant tool_calls 后必须紧跟 tool 应答）。
-//    v7.1.0 升级：被裁剪的旧轮次不再静默丢弃，而是浓缩为一条轻量级【已完成步骤摘要】
-//    （仅占百余字符），防止模型在后续步骤中因"失忆"而重复调用第 1 步已经执行过的工具。
+// ==================== Agent 稳定性增强（v7.2.0 智能边界截断与步骤摘要） ====================
+// 1) truncateToolResult：超长工具结果优先在段落/换行边界截断，并自动闭合未配对的 ``` 代码块围栏，
+//    防止截断在半句话或半个代码块中间破坏上下文结构。
+// 2) toolCallSignature：工具调用签名，用于"重复调用熔断"与"同轮记忆化去重"。
+// 3) trimAgentMessages：上下文预算裁剪，被裁剪的旧轮次自动浓缩为轻量级【早期步骤摘要】。
 
-// 工具结果截断：超长时保留前 maxChars 并标注，避免模型误判为完整数据
 function truncateToolResult(result, maxChars) {
   const s = String(result == null ? '' : result);
   maxChars = maxChars > 0 ? maxChars : 4000;
   if (s.length <= maxChars) return s;
   let cut = maxChars;
-  const prev = s.charCodeAt(cut - 1);
-  if (prev >= 0xd800 && prev <= 0xdbff) cut -= 1;
-  return s.slice(0, cut) + '\n…（结果过长，仅显示前 ' + cut + ' 字符）';
+  // 优先在最后 240 字符窗口内的换行符处整齐截断，避免切断半行数据或 URL
+  const lastNl = s.lastIndexOf('\n', cut);
+  if (lastNl >= maxChars - 240 && lastNl > 0) {
+    cut = lastNl;
+  } else {
+    const prev = s.charCodeAt(cut - 1);
+    if (prev >= 0xd800 && prev <= 0xdbff) cut -= 1;
+  }
+  let sliced = s.slice(0, cut);
+  // 若截断处有未闭合的 ``` 代码块，自动补齐闭合围栏
+  const fences = sliced.match(/```/g);
+  if (fences && fences.length % 2 === 1) {
+    sliced += '\n```';
+  }
+  return sliced + '\n…（结果过长，仅显示前 ' + cut + ' 字符）';
 }
 
 // 上游错误响应体带预算读取
@@ -79,14 +87,12 @@ function trimAgentMessages(messages, loopStartIdx, budget) {
   let total = 0;
   for (const m of arr) total += msgLen(m);
   if (total <= budget) return arr.slice();
-  // 找出本轮循环内的"轮次"边界：每轮以 role=assistant 开头
   const rounds = [];
   let cur = -1;
   for (let i = start; i < arr.length; i++) {
     if (arr[i] && arr[i].role === 'assistant') { cur = rounds.length; rounds.push([i]); }
     else if (cur >= 0) rounds[cur].push(i);
   }
-  // 至少保留最后一轮（当前正在进行的上下文），从最旧的轮次开始删
   const doomed = new Set();
   const droppedRounds = [];
   for (let r = 0; r < rounds.length - 1 && total > budget; r++) {
@@ -98,7 +104,6 @@ function trimAgentMessages(messages, loopStartIdx, budget) {
   const out = [];
   for (let i = 0; i < arr.length; i++) {
     if (i === start && digest && out.length > 0 && out[0].role === 'system') {
-      // 把早期步骤摘要附加在 system prompt 末尾，既不破坏 user/assistant/tool 消息序列，又能让模型感知历史调用
       out[0] = { role: 'system', content: out[0].content + '\n\n' + digest };
     }
     if (!doomed.has(i)) out.push(arr[i]);

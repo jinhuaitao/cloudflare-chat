@@ -1,12 +1,15 @@
-// Agent 工具：DuckDuckGo 搜索与网页结构化正文抓取（支持 offset 零延迟内存缓存分页、在途请求合并与 Jina 免密钥回退）
+// Agent 工具：DuckDuckGo 对冲并发搜索（支持 deep_read 一站式预读）与网页结构化正文抓取（支持批量多 URL、0ms 内存缓存翻页与 Jina 回退）
 
 import { isBlockedFetchHost } from '../net/ssrf.js';
 import { mapSetBounded, mapGetBounded } from '../utils.js';
 
-// v7.1.0 性能优化：
-// 1) 搜索结果 L1 缓存（TTL 3 分钟，最多 100 条），消除同会话重复搜索开销；
-// 2) 网页结构化正文 L1 缓存（TTL 5 分钟，最多 60 篇）+ 在途请求合并（in-flight deduplication），
-//    使长网页 offset 分页续读（如 offset=6000、12000）直接命中内存（0ms 网络延迟），不再重复请求源站。
+// v7.2.0 性能与效率升级：
+// 1) 搜索结果 L1 缓存（TTL 3 分钟，最多 100 条）；
+// 2) 网页结构化正文 L1 缓存（TTL 5 分钟，最多 60 篇）+ 在途请求合并（in-flight deduplication）；
+// 3) 对冲并发搜索（Hedged Search）：主搜索源超过 2.2s 未响应自动并发拉起备用源竞速，消除长尾超时；
+// 4) 搜索自动深读（deep_read）：在 web_search 阶段自动并发预取前 2 条网页的核心正文摘要并预热缓存，
+//    将原本「先搜索 → 等模型思考 → 再抓取」的 2 步串行流程压缩为 1 步完成；
+// 5) 批量网页抓取：web_fetch 支持一次传入最多 3 个 URL（逗号或空格分隔）并发读取。
 const webSearchCache = new Map();
 const webSearchExp = new Map();
 const WEB_SEARCH_TTL_MS = 3 * 60 * 1000;
@@ -24,7 +27,7 @@ function unwrapDdgHref(href) {
   return u;
 }
 
-// DuckDuckGo HTML 结果解析（抽出以便测试）
+// DuckDuckGo HTML 结果解析
 function parseDuckDuckGo(html, count) {
   const out = [];
   const seen = new Set();
@@ -77,44 +80,36 @@ async function readBodyBudget(res, maxChars) {
   return out.length > maxChars ? out.slice(0, maxChars) : out;
 }
 
-// v7.1.0：结构化 HTML → 轻量 Markdown 提取，保留页面标题、标题层级、代码块、链接、列表、表格与段落换行
+// 结构化 HTML → 轻量 Markdown 提取，保留页面标题、标题层级、代码块、链接、列表、表格与段落换行
 function htmlToStructuredText(html) {
   let s = String(html || '');
-  // 提取网页 <title>
   let pageTitle = '';
   const tm = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(s);
   if (tm && tm[1]) {
     pageTitle = tm[1].replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160);
   }
-  // 移除不可见/导航噪音区块
   s = s.replace(/<(?:script|style|noscript|svg|canvas|iframe|footer|nav|head)[\s\S]*?<\/(?:script|style|noscript|svg|canvas|iframe|footer|nav|head)>/gi, ' ');
   s = s.replace(/<!--[\s\S]*?-->/g, ' ');
-  // 保留代码块与行内代码
   s = s.replace(/<pre[^>]*>\s*<code[^>]*>([\s\S]*?)<\/code>\s*<\/pre>/gi, (_, c) => '\n```\n' + c.replace(/<[^>]*>/g, '').trim() + '\n```\n');
   s = s.replace(/<pre[^>]*>([\s\S]*?)<\/pre>/gi, (_, c) => '\n```\n' + c.replace(/<[^>]*>/g, '').trim() + '\n```\n');
   s = s.replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, (_, c) => '`' + c.replace(/<[^>]*>/g, '').trim() + '`');
-  // 保留标题 h1~h4
   s = s.replace(/<h1[^>]*>([\s\S]*?)<\/h1>/gi, (_, c) => '\n# ' + c.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim() + '\n');
   s = s.replace(/<h2[^>]*>([\s\S]*?)<\/h2>/gi, (_, c) => '\n## ' + c.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim() + '\n');
   s = s.replace(/<h3[^>]*>([\s\S]*?)<\/h3>/gi, (_, c) => '\n### ' + c.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim() + '\n');
   s = s.replace(/<h4[^>]*>([\s\S]*?)<\/h4>/gi, (_, c) => '\n#### ' + c.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim() + '\n');
-  // 保留有意义的绝对链接 <a href="https://...">文本</a> 为 Markdown 链接，便于 Agent 进一步深入抓取
   s = s.replace(/<a[^>]*\bhref\s*=\s*["'](https?:\/\/[^"'\s>]{4,160})["'][^>]*>([\s\S]*?)<\/a>/gi, (_, href, inner) => {
     const label = inner.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
     if (!label || label.length > 80) return ' ' + label + ' ';
     return ` [${label}](${href}) `;
   });
-  // 保留列表与表格基本结构
   s = s.replace(/<li[^>]*>/gi, '\n- ');
   s = s.replace(/<\/(?:tr|p|div|section|article|blockquote)>/gi, '\n');
   s = s.replace(/<br\s*\/?>/gi, '\n');
   s = s.replace(/<\/(?:td|th)>/gi, ' | ');
-  // 剥离剩余标签并解码常见 HTML 实体
   s = s.replace(/<[^>]*>/g, ' ');
   s = s.replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&lt;/gi, '<')
     .replace(/&gt;/gi, '>').replace(/&quot;/gi, '"').replace(/&#39;|&apos;/gi, "'")
     .replace(/&#(\d+);/g, (_, n) => { try { return String.fromCodePoint(parseInt(n, 10)); } catch (e) { return ''; } });
-  // 规整空白与多余空行
   s = s.replace(/[ \t]+/g, ' ').replace(/\n[ \t]+/g, '\n').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
   if (pageTitle && s && s.indexOf(pageTitle) === -1) {
     s = '# ' + pageTitle + '\n\n' + s;
@@ -128,7 +123,7 @@ async function tryJinaFallback(targetUrl, signal) {
     const jinaUrl = 'https://r.jina.ai/' + targetUrl;
     const res = await fetch(jinaUrl, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; Cloudflare-Chat/7.1)',
+        'User-Agent': 'Mozilla/5.0 (compatible; Cloudflare-Chat/7.2)',
         'X-Return-Format': 'markdown'
       },
       signal
@@ -144,56 +139,6 @@ async function tryJinaFallback(targetUrl, signal) {
   }
 }
 
-async function toolWebSearch(query, count) {
-  query = String(query || '').trim();
-  if (!query) return '搜索关键词为空';
-  count = Math.min(Math.max(parseInt(count) || 5, 1), 8);
-  const cacheKey = query.toLowerCase() + '|' + count;
-  const cached = mapGetBounded(webSearchCache, cacheKey, webSearchExp);
-  if (cached) return cached;
-
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 12000);
-  try {
-    const endpoints = [
-      'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(query),
-      'https://lite.duckduckgo.com/lite/?q=' + encodeURIComponent(query)
-    ];
-    let out = [];
-    let lastStatus = 0;
-    for (const endpoint of endpoints) {
-      if (ctrl.signal.aborted) break;
-      let res;
-      try {
-        res = await fetch(endpoint, {
-          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36' },
-          signal: ctrl.signal
-        });
-      } catch (e) {
-        if (e && e.name === 'AbortError') return '搜索失败: 超时';
-        continue;
-      }
-      lastStatus = res.status;
-      if (!res.ok) { try { if (res.body) await res.body.cancel(); } catch (e) {} continue; }
-      let html = '';
-      try { html = await readBodyBudget(res, 300000); }
-      catch (e) { continue; }
-      out = endpoint.indexOf('/lite/') !== -1 ? parseDuckDuckGoLite(html, count) : parseDuckDuckGo(html, count);
-      if (!out.length && endpoint.indexOf('/lite/') === -1) out = parseDuckDuckGoLite(html, count);
-      if (out.length) break;
-    }
-    if (!out.length && lastStatus && lastStatus !== 200) return '搜索请求失败，HTTP ' + lastStatus;
-    if (!out.length) return '搜索「' + query + '」无结果';
-    let text = '搜索「' + query + '」结果：\n';
-    out.forEach((r, i) => { text += (i + 1) + '. ' + r.title + '\n   ' + r.url + (r.snip ? '\n   摘要：' + r.snip : '') + '\n'; });
-    const finalRes = text.slice(0, 4000);
-    mapSetBounded(webSearchCache, cacheKey, finalRes, 100, webSearchExp, WEB_SEARCH_TTL_MS);
-    return finalRes;
-  } catch (e) {
-    return '搜索失败: ' + (e.name === 'AbortError' ? '超时' : e.message);
-  } finally { clearTimeout(timer); }
-}
-
 function sliceWebPageText(text, offset, pageSize) {
   const totalLen = text.length;
   if (offset >= totalLen) {
@@ -207,9 +152,9 @@ function sliceWebPageText(text, offset, pageSize) {
   return slice;
 }
 
-async function fetchAndParseWebPage(url) {
+async function fetchAndParseWebPage(url, customTimeoutMs) {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 16000);
+  const timer = setTimeout(() => ctrl.abort(), customTimeoutMs || 14000);
   try {
     let current = url;
     let res = null;
@@ -263,36 +208,168 @@ async function fetchAndParseWebPage(url) {
   }
 }
 
-async function toolWebFetch(url, offset) {
-  url = String(url || '').trim();
-  if (!/^https?:\/\//i.test(url)) return 'URL 非法，仅支持 http/https';
-  offset = Math.max(0, parseInt(offset, 10) || 0);
-  const PAGE_SIZE = 6000;
-
-  let fetchHost = '';
-  try { fetchHost = new URL(url).hostname; } catch (e) { return 'URL 非法，仅支持 http/https'; }
-  if (isBlockedFetchHost(fetchHost)) return '该地址禁止抓取（内网 / 本机 / 云元数据地址）';
-
-  // 1) 优先命中 L1 页面正文缓存（使 offset 翻页续读达到 0ms 延迟）
+// 内部带缓存与在途合并的单页获取辅助
+async function getOrFetchPageText(url, timeoutMs) {
   const cachedText = mapGetBounded(webPageCache, url, webPageExp);
   if (typeof cachedText === 'string' && cachedText.length > 0) {
-    return sliceWebPageText(cachedText, offset, PAGE_SIZE);
+    return { text: cachedText, fromCache: true };
   }
-
-  // 2) 在途请求合并（防止并发调用同一 URL 产生双倍请求）
   let pending = inflightFetches.get(url);
   if (!pending) {
-    pending = fetchAndParseWebPage(url).finally(() => {
+    pending = fetchAndParseWebPage(url, timeoutMs).finally(() => {
       inflightFetches.delete(url);
     });
     inflightFetches.set(url, pending);
   }
-
   const res = await pending;
-  if (res.err) return res.err;
   if (res.text && res.text.length <= 250000) {
     mapSetBounded(webPageCache, url, res.text, 60, webPageExp, WEB_PAGE_TTL_MS);
   }
+  return res;
+}
+
+// 单一 DuckDuckGo 端点查询尝试
+async function fetchDdgEndpoint(endpoint, count, signal) {
+  const res = await fetch(endpoint, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36' },
+    signal
+  });
+  if (!res.ok) {
+    try { if (res.body) await res.body.cancel(); } catch (e) {}
+    const err = new Error('HTTP ' + res.status);
+    err.status = res.status;
+    throw err;
+  }
+  const html = await readBodyBudget(res, 300000);
+  let out = endpoint.indexOf('/lite/') !== -1 ? parseDuckDuckGoLite(html, count) : parseDuckDuckGo(html, count);
+  if (!out.length && endpoint.indexOf('/lite/') === -1) out = parseDuckDuckGoLite(html, count);
+  if (!out.length) {
+    const emptyErr = new Error('EMPTY');
+    emptyErr.status = 200;
+    throw emptyErr;
+  }
+  return out;
+}
+
+async function toolWebSearch(query, count, deepRead) {
+  if (query && typeof query === 'object') {
+    const a = query;
+    query = a.query;
+    count = a.count;
+    deepRead = a.deep_read;
+  }
+  query = String(query || '').trim();
+  if (!query) return '搜索关键词为空';
+  count = Math.min(Math.max(parseInt(count) || 5, 1), 8);
+  const wantDeep = deepRead !== false; // 默认开启自动预读首条高价值正文摘要，一步到位免二次 tool call
+  const cacheKey = query.toLowerCase() + '|' + count + '|' + (wantDeep ? '1' : '0');
+  const cached = mapGetBounded(webSearchCache, cacheKey, webSearchExp);
+  if (cached) return cached;
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 11000);
+  let hedgeTimer = null;
+  try {
+    const epHtml = 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(query);
+    const epLite = 'https://lite.duckduckgo.com/lite/?q=' + encodeURIComponent(query);
+
+    // v7.2.0 对冲并发请求（Hedged Request）：主源先行，若 2.0 秒未返回或报错则立即并发拉起 Lite 源竞速
+    let out = [];
+    let lastStatus = 0;
+    try {
+      const pPrimary = fetchDdgEndpoint(epHtml, count, ctrl.signal);
+      const pHedge = new Promise((resolve, reject) => {
+        hedgeTimer = setTimeout(() => {
+          fetchDdgEndpoint(epLite, count, ctrl.signal).then(resolve, reject);
+        }, 2000);
+        pPrimary.catch(() => {
+          if (hedgeTimer) { clearTimeout(hedgeTimer); hedgeTimer = null; }
+          fetchDdgEndpoint(epLite, count, ctrl.signal).then(resolve, reject);
+        });
+      });
+      out = await Promise.any([pPrimary, pHedge]);
+    } catch (aggErr) {
+      const errs = (aggErr && aggErr.errors) || [aggErr];
+      for (const er of errs) {
+        if (er && er.status) lastStatus = er.status;
+        if (er && er.name === 'AbortError') return '搜索失败: 超时';
+      }
+    }
+
+    if (!out.length && lastStatus && lastStatus !== 200) return '搜索请求失败，HTTP ' + lastStatus;
+    if (!out.length) return '搜索「' + query + '」无结果';
+
+    let text = '搜索「' + query + '」结果：\n';
+    out.forEach((r, i) => {
+      text += (i + 1) + '. ' + r.title + '\n   ' + r.url + (r.snip ? '\n   摘要：' + r.snip : '') + '\n';
+    });
+
+    // v7.2.0 一站式预读（Auto-Prefetch Top 2）：并发抓取前 2 条非屏蔽 URL 的正文前 1100 字并预热 L1 缓存
+    if (wantDeep && out.length > 0) {
+      const topTargets = out.slice(0, 2).filter(r => {
+        try { return !isBlockedFetchHost(new URL(r.url).hostname); } catch (e) { return false; }
+      });
+      if (topTargets.length) {
+        const previews = await Promise.all(topTargets.map(async (item, idx) => {
+          try {
+            const pRes = await getOrFetchPageText(item.url, 4200);
+            if (pRes && pRes.text && pRes.text.length >= 60) {
+              return `【结果 ${idx + 1} 正文速览（已缓存，如需阅读全文可对 ${item.url} 调用 web_fetch 并传 offset=1100）】\n`
+                + pRes.text.slice(0, 1100) + (pRes.text.length > 1100 ? '…' : '');
+            }
+          } catch (e) {}
+          return '';
+        }));
+        const validPreviews = previews.filter(Boolean);
+        if (validPreviews.length) {
+          text += '\n' + validPreviews.join('\n\n');
+        }
+      }
+    }
+
+    const finalRes = text.slice(0, 4000);
+    mapSetBounded(webSearchCache, cacheKey, finalRes, 100, webSearchExp, WEB_SEARCH_TTL_MS);
+    return finalRes;
+  } catch (e) {
+    return '搜索失败: ' + (e.name === 'AbortError' ? '超时' : e.message);
+  } finally {
+    clearTimeout(timer);
+    if (hedgeTimer) clearTimeout(hedgeTimer);
+  }
+}
+
+async function toolWebFetch(url, offset) {
+  const rawInput = String(url || '').trim();
+  if (!rawInput) return 'URL 非法，仅支持 http/https';
+  offset = Math.max(0, parseInt(offset, 10) || 0);
+
+  // v7.2.0：支持一次传入最多 3 个 URL（逗号或换行分隔）并发批量抓取，大幅减少对比阅读步数
+  const urlList = rawInput.split(/[\r\n,，]+/).map(s => s.trim()).filter(Boolean);
+  if (urlList.length > 1 && offset === 0) {
+    const batch = urlList.slice(0, 3);
+    const perUrlLimit = Math.floor(5400 / batch.length);
+    const results = await Promise.all(batch.map(async (u, i) => {
+      if (!/^https?:\/\//i.test(u)) return `【网页 ${i + 1}：${u}】URL 非法`;
+      let host = '';
+      try { host = new URL(u).hostname; } catch (e) { return `【网页 ${i + 1}：${u}】URL 非法`; }
+      if (isBlockedFetchHost(host)) return `【网页 ${i + 1}：${u}】该地址禁止抓取`;
+      const r = await getOrFetchPageText(u, 14000);
+      if (r.err) return `【网页 ${i + 1}：${u}】${r.err}`;
+      return `【网页 ${i + 1}：${u}（共 ${r.text.length} 字符）】\n` + r.text.slice(0, perUrlLimit) + (r.text.length > perUrlLimit ? '…' : '');
+    }));
+    return results.join('\n\n---\n\n');
+  }
+
+  const singleUrl = urlList[0];
+  if (!/^https?:\/\//i.test(singleUrl)) return 'URL 非法，仅支持 http/https';
+  const PAGE_SIZE = 6000;
+
+  let fetchHost = '';
+  try { fetchHost = new URL(singleUrl).hostname; } catch (e) { return 'URL 非法，仅支持 http/https'; }
+  if (isBlockedFetchHost(fetchHost)) return '该地址禁止抓取（内网 / 本机 / 云元数据地址）';
+
+  const res = await getOrFetchPageText(singleUrl, 16000);
+  if (res.err) return res.err;
   return sliceWebPageText(res.text, offset, PAGE_SIZE);
 }
 
