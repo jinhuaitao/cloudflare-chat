@@ -1,5 +1,8 @@
-// Telegram Webhook：命令、模型选择、文件/图片多模态处理、Agent 对话与回复发送
-// v7.1.0 增强：支持多模态图片识图与 18 项 Agent 工具链协同调用（若模型不支持图片+工具则自动无感降级）
+// Telegram Webhook：命令、模型选择、群组 @提及与引用回复识别、文件/图片多模态处理、Agent 对话与回复发送
+// v7.3.0 增强：
+// 1) 原生支持 Telegram 群组（group / supergroup）智能触发：默认仅在被 @提及、回复机器人消息或发送 /命令 时响应，平时静默不刷屏；
+// 2) 自动通过 getMe 获取并缓存机器人自身的 @username 与 id（零额外配置，亦可通过 TG_BOT_USERNAME 指定）；
+// 3) 群聊消息自动剥离 @bot_username 前缀（如 "@bot 继续" 自动识别为断点续做），并在群内以引用回复（reply_to_message_id）形式应答。
 
 import { APP_VERSION } from '../constants.js';
 import { mapSetBounded, mapGetBounded, parseCommaSeparated, safeEqual } from '../utils.js';
@@ -19,6 +22,34 @@ const tgUserModelsExp = new Map();
 // update_id 去重缓存（L1 内存）：
 const seenUpdateIds = new Map();
 let warnedNoWebhookSecret = false;
+
+// 缓存机器人自身信息（由 getMe 自动探测或环境变量 TG_BOT_USERNAME 提供）
+let cachedBotIdentity = null;
+let cachedBotTokenRef = '';
+
+async function getBotIdentity(env, tgApi) {
+  const envUser = String((env && env.TG_BOT_USERNAME) || '').replace(/^@/, '').trim().toLowerCase();
+  const token = String((env && env.TG_BOT_TOKEN) || '');
+  if (cachedBotIdentity && cachedBotTokenRef === token) {
+    if (envUser && !cachedBotIdentity.username) cachedBotIdentity.username = envUser;
+    return cachedBotIdentity;
+  }
+  try {
+    const res = await tgApi('getMe', {});
+    if (res && res.ok) {
+      const data = await res.json();
+      if (data && data.result) {
+        cachedBotIdentity = {
+          id: data.result.id || null,
+          username: String(data.result.username || envUser || '').toLowerCase()
+        };
+        cachedBotTokenRef = token;
+        return cachedBotIdentity;
+      }
+    }
+  } catch (e) {}
+  return { id: null, username: envUser };
+}
 
 // ================= update_id 去重（L1 内存 + L2 R2 滚动窗口） =================
 const TG_DEDUP_KEY = 'tg_updates_dedup';
@@ -59,10 +90,76 @@ async function releaseUpdateForRetry(env, uid) {
 }
 
 // 命令解析：兼容群组里的 /cmd@botname 写法与命令后带参数。
-function parseCommand(t) {
-  const m = /^(\/[a-zA-Z]+)(?:@[a-zA-Z0-9_]+)?(?:\s+([\s\S]*))?$/.exec(String(t || '').trim());
+function parseCommand(t, botUsername) {
+  const m = /^(\/[a-zA-Z]+)(?:@([a-zA-Z0-9_]+))?(?:\s+([\s\S]*))?$/.exec(String(t || '').trim());
   if (!m) return null;
-  return { cmd: m[1].toLowerCase(), rest: (m[2] || '').trim() };
+  const targetBot = m[2] ? m[2].toLowerCase() : '';
+  // 若命令显式指定了 @其它机器人，则忽略
+  if (targetBot && botUsername && targetBot !== botUsername.toLowerCase()) {
+    return { cmd: m[1].toLowerCase(), rest: (m[3] || '').trim(), forOtherBot: true };
+  }
+  return { cmd: m[1].toLowerCase(), rest: (m[3] || '').trim(), forOtherBot: false };
+}
+
+// 判定群组消息是否应当触发机器人响应，并剥离文本中的 @bot_username
+function inspectGroupTrigger(msg, botIdentity, replyAllInGroup) {
+  const chatType = (msg && msg.chat && msg.chat.type) || 'private';
+  const isGroup = chatType === 'group' || chatType === 'supergroup';
+  const rawText = typeof msg.text === 'string' ? msg.text : (typeof msg.caption === 'string' ? msg.caption : '');
+  const botUser = (botIdentity && botIdentity.username) ? String(botIdentity.username).toLowerCase() : '';
+  const botId = (botIdentity && botIdentity.id) || null;
+
+  if (!isGroup) {
+    return { shouldHandle: true, isGroup: false, cleanedText: rawText };
+  }
+
+  // 1) 检查是否为发给本机器人的 /命令
+  const cmdCheck = parseCommand(rawText, botUser);
+  if (cmdCheck) {
+    if (cmdCheck.forOtherBot) return { shouldHandle: false, isGroup: true, cleanedText: rawText };
+    return { shouldHandle: true, isGroup: true, cleanedText: rawText };
+  }
+
+  // 2) 检查是否包含 @bot_username 提及
+  let mentioned = false;
+  let cleaned = rawText;
+  if (botUser) {
+    const esc = botUser.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const mentionRe = new RegExp('(?:^|\\s)@' + esc + '(?=\\s|$|[，,。！？!?:：;；])', 'gi');
+    const anyAtRe = new RegExp('@' + esc + '\\b', 'gi');
+    if (mentionRe.test(rawText) || anyAtRe.test(rawText)) {
+      mentioned = true;
+      cleaned = rawText.replace(anyAtRe, ' ').replace(/[ \t]{2,}/g, ' ').trim();
+    }
+  }
+  const entities = (Array.isArray(msg.entities) ? msg.entities : []).concat(Array.isArray(msg.caption_entities) ? msg.caption_entities : []);
+  if (!mentioned && entities.length) {
+    for (const ent of entities) {
+      if (ent && ent.type === 'text_mention' && ent.user && botId && ent.user.id === botId) {
+        mentioned = true;
+      } else if (ent && ent.type === 'mention' && !botUser) {
+        // 未能获知 botUser 时，若消息含 @mention 实体则放行并剥离首个 @xxx
+        mentioned = true;
+        cleaned = rawText.replace(/@[a-zA-Z0-9_]+/, ' ').trim();
+      }
+    }
+  }
+
+  // 3) 检查是否直接“引用回复（Reply）”了本机器人的消息
+  let repliedToBot = false;
+  const rtm = msg && msg.reply_to_message;
+  if (rtm && rtm.from) {
+    if (botId && rtm.from.id === botId) {
+      repliedToBot = true;
+    } else if (botUser && rtm.from.username && String(rtm.from.username).toLowerCase() === botUser) {
+      repliedToBot = true;
+    } else if (!botId && !botUser && rtm.from.is_bot) {
+      repliedToBot = true;
+    }
+  }
+
+  const shouldHandle = !!(replyAllInGroup || mentioned || repliedToBot);
+  return { shouldHandle, isGroup: true, cleanedText: cleaned, mentioned, repliedToBot };
 }
 
 // 长消息按 3980 字符切分，自动闭合跨分片的 ``` 代码块
@@ -194,10 +291,36 @@ export async function handleTgWebhook(request, env) {
         const chatId = msg.chat.id;
         if (!isChatAllowed(chatId)) return;
 
+        // v7.3.0：群组（group / supergroup）智能触发检测与 @bot_username 剥离
+        const chatType = msg.chat.type || 'private';
+        const isGroupChat = chatType === 'group' || chatType === 'supergroup';
+        let botIdentity = null;
+        if (isGroupChat) {
+          botIdentity = await getBotIdentity(env, tgApi);
+        }
+        const groupInfo = inspectGroupTrigger(msg, botIdentity, env.TG_GROUP_REPLY_ALL === '1');
+        if (!groupInfo.shouldHandle) return;
+
+        // 群内回复默认带上 reply_to_message_id，清晰指示回复哪位群友
+        const replyExtra = isGroupChat && msg.message_id
+          ? { reply_to_message_id: msg.message_id, allow_sending_without_reply: true }
+          : {};
+
         // 提取消息内容：支持纯文本、文本文档直传（.md/.txt/.csv/.json/代码）、图片（Vision 多模态）
-        let userText = typeof msg.text === 'string' ? msg.text : '';
+        let userText = typeof msg.text === 'string' ? groupInfo.cleanedText : '';
+        const cleanedCaption = typeof msg.caption === 'string' ? groupInfo.cleanedText : '';
         let multimodalContent = null;
         let historyUserText = userText;
+
+        // 群聊里只发了一个 "@bot" 而没有任何问题文字、图片或文件时，给出友好引导
+        if (isGroupChat && !userText && !msg.document && !(Array.isArray(msg.photo) && msg.photo.length > 0)) {
+          await tgApi('sendMessage', {
+            chat_id: chatId,
+            text: '👋 我在！请在 @我 后面直接输入你的问题（或直接回复我的消息继续追问），也可以发送 /help 查看全部功能。',
+            ...replyExtra
+          });
+          return;
+        }
 
         if (!userText && msg.document) {
           const doc = msg.document;
@@ -207,7 +330,8 @@ export async function handleTgWebhook(request, env) {
           if (!isTextDoc) {
             await tgApi('sendMessage', {
               chat_id: chatId,
-              text: '⚠️ 暂仅支持文本类文档（如 .md / .txt / .csv / .json / 代码文件），当前文件类型：' + (mime || fileName)
+              text: '⚠️ 暂仅支持文本类文档（如 .md / .txt / .csv / .json / 代码文件），当前文件类型：' + (mime || fileName),
+              ...replyExtra
             });
             return;
           }
@@ -217,11 +341,11 @@ export async function handleTgWebhook(request, env) {
             if (docText.length > 60000) {
               docText = docText.slice(0, 60000) + '\n\n…（文件较长，已截取前 60000 字符）';
             }
-            const caption = String(msg.caption || '').trim() || '请阅读并总结这份文档的核心内容；如果我要求保存到知识库，请调用 save_doc 工具。';
+            const caption = cleanedCaption.trim() || '请阅读并总结这份文档的核心内容；如果我要求保存到知识库，请调用 save_doc 工具。';
             userText = `【上传文件：《${fileName}》】\n用户说明：${caption}\n\n文件内容如下：\n\`\`\`\n${docText}\n\`\`\``;
             historyUserText = `【上传文件：《${fileName}》】${caption}`;
           } catch (e) {
-            await tgApi('sendMessage', { chat_id: chatId, text: '⚠️ 读取上传文件失败：' + (e && e.message ? e.message : String(e)) });
+            await tgApi('sendMessage', { chat_id: chatId, text: '⚠️ 读取上传文件失败：' + (e && e.message ? e.message : String(e)), ...replyExtra });
             return;
           }
         } else if (!userText && Array.isArray(msg.photo) && msg.photo.length > 0) {
@@ -230,7 +354,7 @@ export async function handleTgWebhook(request, env) {
             const picked = candidates.length ? candidates[candidates.length - 1] : msg.photo[msg.photo.length - 1];
             const bytes = await tgFetchFileBytes(env, picked.file_id, 2 * 1024 * 1024, tgApiTimeoutMs);
             const dataUrl = 'data:image/jpeg;base64,' + uint8ToBase64(bytes);
-            const caption = String(msg.caption || '').trim() || '请详细查看并分析这张图片的内容。';
+            const caption = cleanedCaption.trim() || '请详细查看并分析这张图片的内容。';
             userText = caption;
             historyUserText = '[图片] ' + caption;
             multimodalContent = [
@@ -238,13 +362,15 @@ export async function handleTgWebhook(request, env) {
               { type: 'image_url', image_url: { url: dataUrl } }
             ];
           } catch (e) {
-            await tgApi('sendMessage', { chat_id: chatId, text: '⚠️ 读取图片失败：' + (e && e.message ? e.message : String(e)) });
+            await tgApi('sendMessage', { chat_id: chatId, text: '⚠️ 读取图片失败：' + (e && e.message ? e.message : String(e)), ...replyExtra });
             return;
           }
         }
 
         if (userText) {
-          const cmd = !multimodalContent ? parseCommand(userText) : null;
+          const cmd = !multimodalContent ? parseCommand(userText, botIdentity && botIdentity.username) : null;
+          if (cmd && cmd.forOtherBot) return;
+
           if (cmd && (cmd.cmd === '/start' || cmd.cmd === '/model')) {
             const inline_keyboard = modelObjList.map((model, index) => {
               return [{ text: model.name, callback_data: `M:${index}` }];
@@ -252,9 +378,10 @@ export async function handleTgWebhook(request, env) {
 
             await tgApi('sendMessage', {
               chat_id: chatId,
-              text: "⚙️ **请选择对话要使用的 AI 模型:**\n\n_支持多轮对话（最近 " + (parseInt(env.TG_HISTORY_ROUNDS || '10', 10) || 10) + " 轮），支持直接发送图片识图或上传 .md/.txt/.csv 文档，发送 /clear 可清空上下文。_\n\n🤖 **Agent 模式**（默认开启）：我会自主规划、调用 18 项工具（🔍 搜索、📄 网页、🌐 维基百科、🐙 GitHub、📑 arXiv 论文、📰 HackerNews、💱 实时汇率/币价、🛰️ DNS/IP 诊断、🧮 科学计算、🧰 实用工具箱、🌤 天气、🕐 时间/日期推算），并用 🧠🗑️ 管理长期记忆、用 💾📚📖 存取知识库文档。发送 /agent 可切换模式，/help 查看全部命令。",
+              text: "⚙️ **请选择对话要使用的 AI 模型:**\n\n_支持多轮对话（最近 " + (parseInt(env.TG_HISTORY_ROUNDS || '10', 10) || 10) + " 轮），群聊中直接 @我 或回复我的消息即可对话，支持发送图片识图或上传 .md/.txt/.csv 文档，发送 /clear 可清空上下文。_\n\n🤖 **Agent 模式**（默认开启）：我会自主规划、调用 18 项工具（🔍 搜索、📄 网页、🌐 维基百科、🐙 GitHub、📑 arXiv 论文、📰 HackerNews、💱 实时汇率/币价、🛰️ DNS/IP 诊断、🧮 科学计算、🧰 实用工具箱、🌤 天气、🕐 时间/日期推算），并用 🧠🗑️ 管理长期记忆、用 💾📚📖 存取知识库文档。发送 /agent 可切换模式，/help 查看全部命令。",
               parse_mode: "Markdown",
-              reply_markup: { inline_keyboard }
+              reply_markup: { inline_keyboard },
+              ...replyExtra
             });
             return;
           }
@@ -262,7 +389,7 @@ export async function handleTgWebhook(request, env) {
           if (cmd && (cmd.cmd === '/clear' || cmd.cmd === '/new')) {
             await tgClearHistory(env, chatId);
             await agentClearResumeState(env, chatId);
-            await tgApi('sendMessage', { chat_id: chatId, text: "🧹 上下文已清空，可以开始新的话题了。" });
+            await tgApi('sendMessage', { chat_id: chatId, text: "🧹 上下文已清空，可以开始新的话题了。", ...replyExtra });
             return;
           }
 
@@ -276,10 +403,12 @@ export async function handleTgWebhook(request, env) {
                 + "/memory —— 查看长期记忆\n"
                 + "/forget 关键词 —— 删除包含关键词的记忆\n"
                 + "/kb —— 知识库总览（文档列表 + 记忆统计）\n"
-                + "任务太长被暂停时，发送「继续」可接着做\n\n"
+                + "任务太长被暂停时，发送「继续」（群聊可 @我 继续 或直接回复我「继续」）可接着做\n\n"
+                + "👥 群聊用法：在群里直接 `@机器人 你的问题`，或直接「回复（Reply）」机器人的上一条消息即可连续对话（传图/传文件同理）。\n"
                 + "✨ 支持直接发送图片（多模态识图 + 工具协同）或上传文本文件（.md/.txt/.csv/.json 等，可直接总结或说“存进知识库”）。\n"
-                + "🛠️ Agent 工具箱（18 项零密钥工具）：🔍 联网搜索、📄 结构化网页阅读（0ms 缓存翻页）、🌐 维基百科、🐙 GitHub 仓库/发版检索、📑 arXiv 论文检索、📰 HackerNews 热榜、💱 实时汇率/加密币价、🛰️ DNS/IP 网络诊断、🧮 科学计算器、🧰 全能工具箱（单位换算/SHA哈希/Base64/UUID/字数统计）、🌤 天气预报、🕐 时间与日期差推算、🧠🗑️ 长期记忆存取、💾📚📖 知识库文档分页精读与多关键词检索。"
-                + "\n\n📌 当前版本 v" + APP_VERSION + "（R2 持久化 · 高性能全功能增强版）"
+                + "🛠️ Agent 工具箱（18 项零密钥工具）：🔍 联网搜索（一步深读）、📄 结构化网页阅读（0ms 缓存翻页）、🌐 维基百科、🐙 GitHub 仓库/发版检索、📑 arXiv 论文检索、📰 HackerNews 热榜、💱 实时汇率/加密币价、🛰️ DNS/IP 网络诊断、🧮 科学计算器、🧰 全能工具箱（单位换算/SHA哈希/Base64/UUID/字数统计）、🌤 天气预报、🕐 时间与日期差推算、🧠🗑️ 长期记忆存取、💾📚📖 知识库文档分页精读与多关键词检索。"
+                + "\n\n📌 当前版本 v" + APP_VERSION + "（当前会话 ID: " + chatId + "）",
+              ...replyExtra
             });
             return;
           }
@@ -287,13 +416,13 @@ export async function handleTgWebhook(request, env) {
           if (cmd && cmd.cmd === '/memory') {
             const mems = await agentGetMemories(env, chatId);
             if (!mems.length) {
-              await tgApi('sendMessage', { chat_id: chatId, text: "🧠 暂无长期记忆。\n\n对我说「记住xxx」即可保存，比如：记住，我养了一只猫叫汤圆" });
+              await tgApi('sendMessage', { chat_id: chatId, text: "🧠 暂无长期记忆。\n\n对我说「记住xxx」即可保存，比如：记住，我养了一只猫叫汤圆", ...replyExtra });
             } else {
               let text = '🧠 长期记忆（共' + mems.length + '条）：\n';
               mems.forEach((mm, i) => { text += (i + 1) + '. ' + mm.fact + '\n'; });
               text += '\n用 /forget 关键词 删除记忆，或直接对我说「忘掉关于xxx的记忆」。';
               for (let s = 0; s < text.length; s += 4000) {
-                await tgApi('sendMessage', { chat_id: chatId, text: text.slice(s, s + 4000) });
+                await tgApi('sendMessage', { chat_id: chatId, text: text.slice(s, s + 4000), ...replyExtra });
               }
             }
             return;
@@ -306,7 +435,7 @@ export async function handleTgWebhook(request, env) {
             text += await toolListDocs(env);
             text += '\n\n💾 保存文档：对我说"把…存成知识库文档"或直接上传 .md/.txt 文件；🗑️ 删文档：说"删除知识库文档《标题》"';
             for (let s = 0; s < text.length; s += 4000) {
-              await tgApi('sendMessage', { chat_id: chatId, text: text.slice(s, s + 4000) });
+              await tgApi('sendMessage', { chat_id: chatId, text: text.slice(s, s + 4000), ...replyExtra });
             }
             return;
           }
@@ -314,12 +443,13 @@ export async function handleTgWebhook(request, env) {
           if (cmd && cmd.cmd === '/forget') {
             const kw = cmd.rest;
             if (!kw) {
-              await tgApi('sendMessage', { chat_id: chatId, text: "用法：/forget 关键词\n例如：/forget 猫 —— 删除所有包含「猫」的记忆" });
+              await tgApi('sendMessage', { chat_id: chatId, text: "用法：/forget 关键词\n例如：/forget 猫 —— 删除所有包含「猫」的记忆", ...replyExtra });
             } else {
               const rr = await agentForgetMemory(env, chatId, kw);
               await tgApi('sendMessage', {
                 chat_id: chatId,
-                text: rr.persistError ? '⚠️ ' + rr.persistError : (rr.removed > 0 ? '🗑 已删除 ' + rr.removed + ' 条包含「' + kw + '」的记忆。' : '没有找到包含「' + kw + '」的记忆。')
+                text: rr.persistError ? '⚠️ ' + rr.persistError : (rr.removed > 0 ? '🗑 已删除 ' + rr.removed + ' 条包含「' + kw + '」的记忆。' : '没有找到包含「' + kw + '」的记忆。'),
+                ...replyExtra
               });
             }
             return;
@@ -333,7 +463,8 @@ export async function handleTgWebhook(request, env) {
               text: !cur
                 ? "🤖 **Agent 模式已开启**\n\n我会自主规划、调用 18 项工具（🔍 搜索、📄 网页、🌐 维基百科、🐙 GitHub、📑 arXiv、📰 HackerNews、💱 汇率/币价、🛰️ DNS/IP、🧮 计算、🧰 工具箱、🌤 天气、🕐 时间），长期记住或清理你告诉我的重要信息，还能用 💾 保存、📚 查阅知识库文档。"
                 : "💬 **已切换为普通对话模式**\n\n单轮问答，不调用工具、不使用长期记忆。如需 Agent 能力再发送 /agent 切回。",
-              parse_mode: "Markdown"
+              parse_mode: "Markdown",
+              ...replyExtra
             });
             return;
           }
@@ -361,7 +492,8 @@ export async function handleTgWebhook(request, env) {
           const pendingMsgPromise = tgApi('sendMessage', {
             chat_id: chatId,
             text: "⏳ _正在思考并生成内容，请稍候..._",
-            parse_mode: "Markdown"
+            parse_mode: "Markdown",
+            ...replyExtra
           }).then(async res => {
             if (res.ok) {
               const data = await res.json();
@@ -373,7 +505,7 @@ export async function handleTgWebhook(request, env) {
           const [, pendingMsgId] = await Promise.all([sendActionPromise, pendingMsgPromise]);
           pendingCleanup = async (err) => {
             if (pendingMsgId) tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {});
-            tgApi('sendMessage', { chat_id: chatId, text: '⚠️ 处理消息时出错：' + (err && err.message ? err.message : String(err)) }).catch(() => {});
+            tgApi('sendMessage', { chat_id: chatId, text: '⚠️ 处理消息时出错：' + (err && err.message ? err.message : String(err)), ...replyExtra }).catch(() => {});
           };
 
           let replyText = null;
@@ -384,8 +516,6 @@ export async function handleTgWebhook(request, env) {
           if (webhookBudgetMs > 240000) webhookBudgetMs = 240000;
           const agentOpts = { maxRuntimeMs: webhookBudgetMs, resumeKey: tgAgentResumeKey(chatId), origUserText: historyUserText };
 
-          // v7.1.0：允许图片多模态消息直接进入 Agent 循环（可识图后联动汇率/搜索/入库等工具）；
-          // 若上游视觉模型不支持 tools + image_url，第 0 步会自动触发 r.fallback 退回无工具多模态问答
           if (useAgent) {
             let lastProgressEdit = 0;
             const onProgress = async (text, force) => {
@@ -441,7 +571,7 @@ export async function handleTgWebhook(request, env) {
               if (pendingMsgId) {
                 tgApi('deleteMessage', { chat_id: chatId, message_id: pendingMsgId }).catch(() => {});
               }
-              await tgApi('sendMessage', { chat_id: chatId, text: '⚠️ ' + aiConfig.error });
+              await tgApi('sendMessage', { chat_id: chatId, text: '⚠️ ' + aiConfig.error, ...replyExtra });
               return;
             }
             const { apiUrl, currentApiKey, payload } = aiConfig;
@@ -499,7 +629,7 @@ export async function handleTgWebhook(request, env) {
           }
 
           if (agentErr) {
-            await tgApi('sendMessage', { chat_id: chatId, text: agentErr });
+            await tgApi('sendMessage', { chat_id: chatId, text: agentErr, ...replyExtra });
             return;
           }
 
@@ -508,8 +638,8 @@ export async function handleTgWebhook(request, env) {
               for (let attempt = 1; attempt <= 2; attempt++) {
                 try {
                   const r = await tgApi('sendMessage', useMarkdown
-                    ? { chat_id: chatId, text, parse_mode: "Markdown" }
-                    : { chat_id: chatId, text });
+                    ? { chat_id: chatId, text, parse_mode: "Markdown", ...replyExtra }
+                    : { chat_id: chatId, text, ...replyExtra });
                   if (r.ok || attempt === 2) return r;
                 } catch (e) {
                   if (attempt === 2) return { ok: false };
@@ -554,6 +684,7 @@ export async function handleTgWebhook(request, env) {
 
 export {
   parseCommand,
+  inspectGroupTrigger,
   splitTelegramMarkdown,
   markUpdateSeen,
   releaseUpdateForRetry,
