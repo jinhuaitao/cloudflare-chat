@@ -13,6 +13,11 @@
 | 📚 **R2 知识库 2.0+** | 长期记忆（同主题自动覆盖）+ 文档库（`offset` 0ms 翻页与多词加权检索），全量持久化于 R2 `kb/`；**Web 只读、TG 读写** |
 
 ## 🚀 三步快速部署
+##### 方式一
+
+![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)
+
+##### 方式二
 
 1. **导入 Git 部署**：Cloudflare 控制台 → **Workers & Pages** → **连接到 Git** 选择本仓库（构建命令留空，部署命令 `npx wrangler deploy`）。
    > 💡 `wrangler.toml` 已开启 **R2 自动置备**与 `keep_vars = true`，首次部署会自动创建并绑定 R2 存储桶，无需手动建桶。
