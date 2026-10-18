@@ -1,9 +1,9 @@
 {
   "name": "cloudflare-chat",
-  "version": "7.3.0",
+  "version": "7.4.0",
   "private": true,
   "type": "module",
-  "description": "Cloudflare Worker 上的多通道 AI 对话前端 + Telegram 机器人（支持群组 @回复 + 18 项零密钥 Agent 工具）",
+  "description": "Cloudflare Worker 上的多通道 AI 对话前端 + Telegram & 微信 ClawBot (iLink) 机器人（支持 18 项零密钥 Agent 工具 + R2 知识库）",
   "devDependencies": {
     "wrangler": "^4.0.0"
   }

@@ -1,8 +1,7 @@
 // Telegram Webhook：命令、模型选择、群组 @提及与引用回复识别、文件/图片多模态处理、Agent 对话与回复发送
-// v7.3.0 增强：
-// 1) 原生支持 Telegram 群组（group / supergroup）智能触发：默认仅在被 @提及、回复机器人消息或发送 /命令 时响应，平时静默不刷屏；
-// 2) 自动通过 getMe 获取并缓存机器人自身的 @username 与 id（零额外配置，亦可通过 TG_BOT_USERNAME 指定）；
-// 3) 群聊消息自动剥离 @bot_username 前缀（如 "@bot 继续" 自动识别为断点续做），并在群内以引用回复（reply_to_message_id）形式应答。
+// v7.4.0 增强：
+// 1) 原生支持 Telegram 群组（group / supergroup）智能触发：默认仅在被 @提及、回复机器人消息或发送 /命令 时响应；
+// 2) 新增私聊管理员专属微信 ClawBot 绑定命令（/wxlogin、/wxstatus、/wxunbind），无需打开网页即可在 Telegram 私聊中安全完成微信扫码绑定。
 
 import { APP_VERSION } from '../constants.js';
 import { mapSetBounded, mapGetBounded, parseCommaSeparated, safeEqual } from '../utils.js';
@@ -15,6 +14,23 @@ import { agentLoadResumeState, agentClearResumeState, tgAgentResumeKey } from '.
 import { tgAgentChat, tgAgentResume } from '../agent/loop.js';
 import { readErrorBody } from '../agent/stability.js';
 import { toolListDocs } from '../kb/doc-tools.js';
+import {
+  DEFAULT_ILINK_BASE_URL,
+  DEFAULT_ILINK_CDN_URL,
+  DEFAULT_ILINK_CHANNEL_VERSION,
+  normalizeBaseUrl,
+  ilinkGetQrCode,
+  ilinkGetQrStatus,
+  ilinkNotifyStart,
+  ilinkNotifyStop,
+} from '../wechat/ilink.js';
+import {
+  getWxCredentials,
+  saveWxCredentials,
+  clearWxCredentials,
+  saveWxCursor,
+  kickWxAutoDaemon,
+} from '../wechat/handler.js';
 
 // 全局内存缓存（L1 缓存，带 60s TTL）
 const tgUserModels = new Map();
@@ -94,7 +110,6 @@ function parseCommand(t, botUsername) {
   const m = /^(\/[a-zA-Z]+)(?:@([a-zA-Z0-9_]+))?(?:\s+([\s\S]*))?$/.exec(String(t || '').trim());
   if (!m) return null;
   const targetBot = m[2] ? m[2].toLowerCase() : '';
-  // 若命令显式指定了 @其它机器人，则忽略
   if (targetBot && botUsername && targetBot !== botUsername.toLowerCase()) {
     return { cmd: m[1].toLowerCase(), rest: (m[3] || '').trim(), forOtherBot: true };
   }
@@ -113,14 +128,12 @@ function inspectGroupTrigger(msg, botIdentity, replyAllInGroup) {
     return { shouldHandle: true, isGroup: false, cleanedText: rawText };
   }
 
-  // 1) 检查是否为发给本机器人的 /命令
   const cmdCheck = parseCommand(rawText, botUser);
   if (cmdCheck) {
     if (cmdCheck.forOtherBot) return { shouldHandle: false, isGroup: true, cleanedText: rawText };
     return { shouldHandle: true, isGroup: true, cleanedText: rawText };
   }
 
-  // 2) 检查是否包含 @bot_username 提及
   let mentioned = false;
   let cleaned = rawText;
   if (botUser) {
@@ -138,14 +151,12 @@ function inspectGroupTrigger(msg, botIdentity, replyAllInGroup) {
       if (ent && ent.type === 'text_mention' && ent.user && botId && ent.user.id === botId) {
         mentioned = true;
       } else if (ent && ent.type === 'mention' && !botUser) {
-        // 未能获知 botUser 时，若消息含 @mention 实体则放行并剥离首个 @xxx
         mentioned = true;
         cleaned = rawText.replace(/@[a-zA-Z0-9_]+/, ' ').trim();
       }
     }
   }
 
-  // 3) 检查是否直接“引用回复（Reply）”了本机器人的消息
   let repliedToBot = false;
   const rtm = msg && msg.reply_to_message;
   if (rtm && rtm.from) {
@@ -371,6 +382,124 @@ export async function handleTgWebhook(request, env) {
           const cmd = !multimodalContent ? parseCommand(userText, botIdentity && botIdentity.username) : null;
           if (cmd && cmd.forOtherBot) return;
 
+          // ===== 新增：Telegram 私聊安全管理微信 ClawBot（/wxstatus, /wxlogin, /wxunbind） =====
+          if (cmd && (cmd.cmd === '/wxstatus' || cmd.cmd === '/wxlogin' || cmd.cmd === '/wxunbind')) {
+            if (isGroupChat) {
+              await tgApi('sendMessage', { chat_id: chatId, text: '🔒 为保护你的微信账号隐私，请在与我的【私聊】窗口中使用微信 ClawBot 绑定命令。', ...replyExtra });
+              return;
+            }
+            const chanVer = String((env && env.WX_CHANNEL_VERSION) || DEFAULT_ILINK_CHANNEL_VERSION).trim();
+            const defaultBase = normalizeBaseUrl((env && env.WX_BASE_URL) || DEFAULT_ILINK_BASE_URL);
+
+            if (cmd.cmd === '/wxstatus') {
+              const creds = await getWxCredentials(env, true);
+              if (creds && creds.bot_token && !creds.expired) {
+                await tgApi('sendMessage', {
+                  chat_id: chatId,
+                  text: `🟢 微信 ClawBot 状态：已连接（已加锁保护）\n`
+                    + `• 机器人 ID：${creds.ilink_bot_id || '-'}\n`
+                    + `• 唯一绑定微信用户：${creds.ilink_user_id || '-'}\n`
+                    + `• 来源：${creds.source === 'env' ? '环境变量 WX_BOT_TOKEN' : 'R2 扫码持久化'}\n`
+                    + `• 如需解绑重绑，请发 /wxunbind`,
+                  ...replyExtra
+                });
+              } else if (creds && creds.expired) {
+                await tgApi('sendMessage', { chat_id: chatId, text: `⚠️ 微信 ClawBot 会话已过期 (ret=-14)，请发送 /wxlogin 重新扫码绑定。`, ...replyExtra });
+              } else {
+                await tgApi('sendMessage', { chat_id: chatId, text: `⚪ 微信 ClawBot 尚未绑定。发送 /wxlogin 即可在私聊中获取专属绑定二维码。`, ...replyExtra });
+              }
+              return;
+            }
+
+            if (cmd.cmd === '/wxunbind') {
+              const creds = await getWxCredentials(env, true);
+              if (creds && creds.source === 'env') {
+                await tgApi('sendMessage', { chat_id: chatId, text: '⚠️ 当前通过环境变量 WX_BOT_TOKEN 固定绑定，请在 Cloudflare 控制台移除该变量。', ...replyExtra });
+                return;
+              }
+              if (creds && creds.bot_token) {
+                await ilinkNotifyStop(creds.baseurl, creds.bot_token, chanVer, 5000);
+              }
+              await clearWxCredentials(env);
+              await tgApi('sendMessage', { chat_id: chatId, text: '✅ 已解绑并清除微信 ClawBot 登录凭证。如需重新绑定请发 /wxlogin。', ...replyExtra });
+              return;
+            }
+
+            if (cmd.cmd === '/wxlogin') {
+              const existing = await getWxCredentials(env, true);
+              if (existing && existing.bot_token && !existing.expired) {
+                await tgApi('sendMessage', {
+                  chat_id: chatId,
+                  text: `🔒 当前已绑定微信账号（${existing.ilink_user_id || existing.ilink_bot_id}）。为防误覆盖，请先发送 /wxunbind 解绑后再执行 /wxlogin。`,
+                  ...replyExtra
+                });
+                return;
+              }
+              try {
+                const qrData = await ilinkGetQrCode(defaultBase, chanVer, 12000);
+                if (!qrData || !qrData.qrcode) {
+                  await tgApi('sendMessage', { chat_id: chatId, text: '⚠️ 获取微信二维码失败，请稍后重试。', ...replyExtra });
+                  return;
+                }
+                const qrUrl = qrData.qrcode_img_content || '';
+                const statusMsgRes = await tgApi('sendMessage', {
+                  chat_id: chatId,
+                  text: `📱 请在 45 秒内打开下方官方链接并用手机微信扫码确认连接：\n${qrUrl}\n\n⏳ 正在等待你扫码确认…`,
+                  ...replyExtra
+                });
+                let statusMsgId = null;
+                if (statusMsgRes && statusMsgRes.ok) {
+                  try { const d = await statusMsgRes.json(); statusMsgId = d && d.result && d.result.message_id; } catch (e) {}
+                }
+                const deadline = Date.now() + 50000;
+                let pollBase = defaultBase;
+                while (Date.now() < deadline) {
+                  await new Promise(r => setTimeout(r, 2000));
+                  const st = await ilinkGetQrStatus(pollBase, qrData.qrcode, chanVer, 6000);
+                  if (st && st.redirect_baseurl) {
+                    pollBase = st.redirect_baseurl;
+                  }
+                  if (st && st.status === 'confirmed' && st.bot_token) {
+                    const newCreds = {
+                      bot_token: st.bot_token,
+                      ilink_bot_id: st.ilink_bot_id || 'wx_bot',
+                      ilink_user_id: st.ilink_user_id || '',
+                      baseurl: normalizeBaseUrl(st.redirect_baseurl || st.baseurl || pollBase || defaultBase),
+                      cdn_url: String((env && env.WX_CDN_BASE_URL) || DEFAULT_ILINK_CDN_URL).trim(),
+                      expired: false,
+                      errmsg: '',
+                      updated_at: new Date().toISOString(),
+                    };
+                    await saveWxCredentials(env, newCreds);
+                    newCreds.relay_origin = new URL(request.url).origin;
+                    await saveWxCredentials(env, newCreds);
+                    await saveWxCursor(env, newCreds.ilink_bot_id, '');
+                    await ilinkNotifyStart(newCreds.baseurl, newCreds.bot_token, chanVer, 6000);
+                    kickWxAutoDaemon(env, null, newCreds.relay_origin);
+                    const okText = `🎉 微信 ClawBot 绑定成功并已自动加锁！\n• 机器人 ID：${newCreds.ilink_bot_id}\n• 唯一授权微信用户：${newCreds.ilink_user_id}\n现在可以直接在手机微信 ClawBot 中与我对话了。`;
+                    if (statusMsgId) {
+                      await tgApi('editMessageText', { chat_id: chatId, message_id: statusMsgId, text: okText }).catch(() => {});
+                    } else {
+                      await tgApi('sendMessage', { chat_id: chatId, text: okText, ...replyExtra });
+                    }
+                    return;
+                  } else if (st && st.status === 'expired') {
+                    break;
+                  }
+                }
+                const timeoutText = '⌛ 扫码等待窗口已结束。如尚未完成确认，请重新发送 /wxlogin 获取新二维码。';
+                if (statusMsgId) {
+                  await tgApi('editMessageText', { chat_id: chatId, message_id: statusMsgId, text: timeoutText }).catch(() => {});
+                } else {
+                  await tgApi('sendMessage', { chat_id: chatId, text: timeoutText, ...replyExtra });
+                }
+              } catch (e) {
+                await tgApi('sendMessage', { chat_id: chatId, text: '⚠️ 微信扫码绑定异常：' + (e && e.message ? e.message : String(e)), ...replyExtra });
+              }
+              return;
+            }
+          }
+
           if (cmd && (cmd.cmd === '/start' || cmd.cmd === '/model')) {
             const inline_keyboard = modelObjList.map((model, index) => {
               return [{ text: model.name, callback_data: `M:${index}` }];
@@ -403,6 +532,7 @@ export async function handleTgWebhook(request, env) {
                 + "/memory —— 查看长期记忆\n"
                 + "/forget 关键词 —— 删除包含关键词的记忆\n"
                 + "/kb —— 知识库总览（文档列表 + 记忆统计）\n"
+                + "/wxlogin、/wxstatus、/wxunbind ——（私聊专属）安全扫码绑定/查看/解绑微信 ClawBot\n"
                 + "任务太长被暂停时，发送「继续」（群聊可 @我 继续 或直接回复我「继续」）可接着做\n\n"
                 + "👥 群聊用法：在群里直接 `@机器人 你的问题`，或直接「回复（Reply）」机器人的上一条消息即可连续对话（传图/传文件同理）。\n"
                 + "✨ 支持直接发送图片（多模态识图 + 工具协同）或上传文本文件（.md/.txt/.csv/.json 等，可直接总结或说“存进知识库”）。\n"

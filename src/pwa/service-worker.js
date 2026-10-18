@@ -93,7 +93,7 @@ self.addEventListener('fetch', function (event) {
 
   // 实时接口：直连网络，不缓存
   if (url.pathname.indexOf('/api/') === 0) return;
-  if (url.pathname === '/tg-webhook') return;
+  if (url.pathname === '/tg-webhook' || url.pathname === '/wx-webhook') return;
 
   // 页面导航：network-first，断网时回退到缓存的页面外壳
   if (req.mode === 'navigate') {

@@ -301,7 +301,7 @@ function getAgentTools(kbReadOnly, opts) {
 async function execAgentTool(name, args, env, chatId, kbReadOnly) {
   args = args || {};
   if (kbReadOnly && (name === 'remember' || name === 'forget_memory' || name === 'save_doc' || name === 'delete_doc')) {
-    return '工具 ' + name + ' 在本端不可用：知识库为只读，写入与删除（记忆 / 文档保存与删除）仅 Telegram 端支持。请如实告知用户，并引导其通过 Telegram 机器人完成该操作；不要声称已完成。';
+    return '工具 ' + name + ' 在本端不可用：知识库为只读，写入与删除（记忆 / 文档保存与删除）仅 Telegram 或微信 ClawBot 机器人端支持。请如实告知用户，并引导其通过 Telegram 或微信 ClawBot 机器人完成该操作；不要声称已完成。';
   }
   let toolTimeoutMs = parseInt(env.AGENT_TOOL_TIMEOUT_MS || '30000', 10);
   if (!(toolTimeoutMs > 0)) toolTimeoutMs = 30000;

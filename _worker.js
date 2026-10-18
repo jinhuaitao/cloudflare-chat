@@ -8,6 +8,7 @@ import { getChannelConfig, buildAIRequest } from './src/channel.js';
 import { readErrorBody } from './src/agent/stability.js';
 import { handleWebAgent } from './src/web-agent.js';
 import { handleTgWebhook } from './src/telegram/handler.js';
+import { handleWxWebhook, handleWxApi, handleWxScheduled, maybeWakeWxDaemon } from './src/wechat/handler.js';
 import { ICON_B64, getIconBytes } from './src/pwa/icons.js';
 import { MANIFEST_JSON } from './src/pwa/manifest.js';
 import { SW_JS } from './src/pwa/service-worker.js';
@@ -53,6 +54,15 @@ async function routeRequest(request, env, ctx) {
     //    永远「探测成功」→ 自动重连逻辑形同虚设。
     if (request.method === 'GET' && url.pathname === '/healthz') {
       return new Response(JSON.stringify({ ok: true, t: Date.now() }), { headers: HEALTH_HEADERS });
+    }
+
+    // 微信 ClawBot (iLink) Web 管理与扫码绑定接口（内部由 checkWxAdminAuth 强制校验 WX_ADMIN_SECRET 或 ACCESS_PASSWORD）
+    if (url.pathname !== '/wx-webhook') {
+      maybeWakeWxDaemon(request, env, ctx);
+    }
+
+    if (url.pathname.startsWith('/api/wx/')) {
+      return await handleWxApi(request, env, url, ctx);
     }
 
     if (request.method === 'POST' && url.pathname === '/api/chat') {
@@ -112,8 +122,10 @@ async function routeRequest(request, env, ctx) {
           
           if (responseData.data && responseData.data[0]?.url) {
             imageUrlOrText = `![生成结果](${responseData.data[0].url})`;
+          } else if (responseData.data && responseData.data[0]?.b64_json) {
+            imageUrlOrText = `![生成结果](data:image/png;base64,${responseData.data[0].b64_json})`;
           } else if (responseData.choices && responseData.choices[0]?.message) {
-            imageUrlOrText = responseData.choices[0].message.content;
+            imageUrlOrText = responseData.choices[0]?.message.content;
           }
 
           const encoder = new TextEncoder();
@@ -161,6 +173,11 @@ async function routeRequest(request, env, ctx) {
       return await handleTgWebhook(request, env);
     }
 
+    // 微信 ClawBot (iLink) Webhook：支持第三方 iLink 网关推送消息
+    if ((request.method === 'POST' || request.method === 'GET') && url.pathname === '/wx-webhook') {
+      return await handleWxWebhook(request, env, url, ctx);
+    }
+
     return new Response('Not Found', { status: 404 });
   } catch (error) {
     return new Response(JSON.stringify({ error: error && error.message ? error.message : String(error) }), { status: 500, headers: CORS_HEADERS });
@@ -182,5 +199,10 @@ export default {
       h.delete('Access-Control-Allow-Origin');
     }
     return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h });
+  },
+
+  // Cloudflare Cron Triggers：后台自动长轮询微信 ClawBot (iLink) 新消息并回复
+  async scheduled(event, env, ctx) {
+    await handleWxScheduled(event, env, ctx);
   },
 };

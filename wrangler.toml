@@ -6,9 +6,9 @@ compatibility_date = "2024-03-20"
 keep_vars = true
 
 # ============================================================
-# R2 存储桶：持久化层（机器人模型选择、对话历史、Agent 记忆与开关）
+# R2 存储桶：持久化层（机器人模型选择、对话历史、Agent 记忆与开关、微信 ClawBot 凭证与游标）
 # ============================================================
-# ，触发 Wrangler 自动置备：
+# 触发 Wrangler 自动置备：
 # 部署时自动创建 bucket（名字以 Worker 名为前缀，如 cloudflare-chat-r2）
 # 并绑定到 Worker，代码里用 env.R2 访问。
 # 若自动置备未生效，去控制台 R2 页面手动创建一个 bucket，
@@ -19,3 +19,11 @@ keep_vars = true
 [[r2_buckets]]
 binding = "R2"
 # bucket_name = "cloudflare-chat-r2"
+
+# ============================================================
+# 定时触发器（Cron Triggers）：驱动微信 ClawBot (iLink) 后台长轮询收发消息
+# ============================================================
+# 微信官方 ClawBot (iLink Bot API) 采用长轮询（getupdates）拉取消息。
+# 开启每分钟 Cron 触发后，Worker 会在后台自动连接 iLink 长轮询拉取新消息并回复。
+[triggers]
+crons = ["* * * * *"]
