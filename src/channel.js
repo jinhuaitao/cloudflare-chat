@@ -6,32 +6,37 @@ let cachedConfig = null;
 const keyRoundRobinIdx = new Map();
 
 // ======= 统一解析通道配置（带内存缓存） =======
+// 每条模型拆成四个字段：
+//   id       —— 发给上游的 model 名（第一个冒号之前的部分）
+//   name     —— 下拉框 / TG / 微信列表里的显示名（第一个冒号之后的部分），仅用于展示
+//   original —— 环境变量里的原始串（id:name）
+//   key      —— 选择键。id 全局唯一时等于 id；同一 id 被多个供应商复用时取 original，
+//               这样「同一个上游模型名 + 不同 API_URL/API_KEY」的多条通道可以并存，互不覆盖。
+//               下游（前端、TG、微信、断点续做）统一保存 key，转发上游时用 id。
 function getChannelConfig(env) {
   if (cachedConfig) {
     return cachedConfig;
   }
 
-  const models = [];
-  const modelMap = new Map();
+  const pending = [];
+  const seenOriginal = new Set();
 
   const addModels = (modelStr, url, keys) => {
     if (!modelStr) return;
     const arr = modelStr.split(',');
     for (let i = 0; i < arr.length; i++) {
       const raw = arr[i].trim();
-      if (!raw) continue;
-      
+      if (!raw || seenOriginal.has(raw)) continue;
+      seenOriginal.add(raw);
+
       const colonIdx = raw.indexOf(':');
       const id = colonIdx > 0 ? raw.substring(0, colonIdx).trim() : raw;
       const name = colonIdx > 0 ? raw.substring(colonIdx + 1).trim() : raw;
-
-      if (!modelMap.has(id)) {
-        models.push({ id, name, original: raw });
-        modelMap.set(id, { url, keys });
-      }
+      pending.push({ id, name, original: raw, url, keys });
     }
   };
 
+  let parsedApiConfig = false;
   if (env.API_CONFIG) {
     try {
       const channels = JSON.parse(env.API_CONFIG);
@@ -41,40 +46,65 @@ function getChannelConfig(env) {
         const modelStr = Array.isArray(ch.models) ? ch.models.join(',') : ch.models;
         if (url && modelStr) addModels(modelStr, url, keys);
       });
-      if (models.length > 0) {
-        cachedConfig = { models, modelMap };
-        return cachedConfig;
-      }
+      if (pending.length > 0) parsedApiConfig = true;
     } catch (e) {
       console.log("API_CONFIG 解析失败:", e);
     }
   }
 
-  let hasIndexed = false;
-  for (let i = 1; i <= 20; i++) {
-    const url = env[`API_URL_${i}`];
-    const modelStr = env[`MODEL_${i}`];
-    if (url && modelStr) {
-      hasIndexed = true;
-      const keys = parseCommaSeparated(env[`API_KEY_${i}`]);
-      addModels(modelStr, url, keys);
+  if (!parsedApiConfig) {
+    let hasIndexed = false;
+    for (let i = 1; i <= 20; i++) {
+      const url = env[`API_URL_${i}`];
+      const modelStr = env[`MODEL_${i}`];
+      if (url && modelStr) {
+        hasIndexed = true;
+        addModels(modelStr, url, parseCommaSeparated(env[`API_KEY_${i}`]));
+      }
+    }
+    if (!hasIndexed || pending.length === 0) {
+      const fallbackUrl = env.API_URL || "";
+      const fallbackModelStr = env.MODEL || "";
+      if (fallbackUrl && fallbackModelStr) {
+        addModels(fallbackModelStr, fallbackUrl, parseCommaSeparated(env.API_KEY));
+      }
     }
   }
-  if (hasIndexed && models.length > 0) {
-    cachedConfig = { models, modelMap };
-    return cachedConfig;
+
+  // 先统计每个上游模型名出现次数，再决定选择键：唯一 → 沿用 id（保持与旧版存储兼容）；
+  // 重复 → 用完整配置串 original，让同名模型的多个供应商各自成为独立选项。
+  const models = [];
+  const modelMap = new Map();
+  const idCount = new Map();
+  for (const e of pending) {
+    idCount.set(e.id, (idCount.get(e.id) || 0) + 1);
   }
-
-  const fallbackUrl = env.API_URL || "";
-  const fallbackKeys = parseCommaSeparated(env.API_KEY);
-  const fallbackModelStr = env.MODEL || "";
-
-  if (fallbackUrl && fallbackModelStr) {
-    addModels(fallbackModelStr, fallbackUrl, fallbackKeys);
+  for (const e of pending) {
+    let key = idCount.get(e.id) > 1 ? e.original : e.id;
+    if (modelMap.has(key)) key = e.original + '#' + (models.length + 1);
+    const meta = { key, id: e.id, name: e.name, original: e.original };
+    models.push(meta);
+    modelMap.set(key, { ...meta, url: e.url, keys: e.keys });
   }
 
   cachedConfig = { models, modelMap };
   return cachedConfig;
+}
+
+// 把各种历史 / 外部传入的模型标识统一解析成当前模型的元信息：
+// 依次匹配 key（选择键）→ id（旧版前端 localStorage、TG / 微信 / 断点续做里的裸模型名）→ name（显示名）
+function findModelEntry(models, value) {
+  if (value == null || value === '') return null;
+  const v = String(value);
+  return models.find(m => m.key === v)
+    || models.find(m => m.id === v)
+    || models.find(m => m.name === v)
+    || null;
+}
+
+function resolveModelKey(models, value) {
+  const entry = findModelEntry(models, value);
+  return entry ? entry.key : null;
 }
 
 // 提取共用的 AI 请求构建逻辑 (DRY原则)
@@ -86,23 +116,21 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
     return { error: "未配置任何可用模型。请在 Worker 的环境变量中设置 API_URL_1 / API_KEY_1 / MODEL_1（或 API_URL / API_KEY / MODEL），保存后重新部署一次。" };
   }
 
-  let selectedModel = requestedModel || models[0].id;
+  const found = findModelEntry(models, requestedModel) || models[0];
+  const channel = modelMap.get(found.key);
+  if (!channel || !channel.url) return { error: `模型 ${found.id} 对应的 API_URL 未配置或异常` };
 
-  if (!modelMap.has(selectedModel)) {
-    selectedModel = models[0].id;
-  }
-
-  const channel = modelMap.get(selectedModel);
-  if (!channel || !channel.url) return { error: `模型 ${selectedModel} 对应的 API_URL 未配置或异常` };
+  const selectedKey = channel.key;
+  const upstreamModel = channel.id;
 
   const keys = Array.isArray(channel.keys) ? channel.keys : [];
   let currentApiKey = "";
   if (keys.length === 1) {
     currentApiKey = keys[0];
   } else if (keys.length > 1) {
-    const cur = (keyRoundRobinIdx.get(selectedModel) || 0) % keys.length;
+    const cur = (keyRoundRobinIdx.get(selectedKey) || 0) % keys.length;
     currentApiKey = keys[cur];
-    keyRoundRobinIdx.set(selectedModel, (cur + 1) % keys.length);
+    keyRoundRobinIdx.set(selectedKey, (cur + 1) % keys.length);
   }
 
   const apiUrl = channel.url;
@@ -126,19 +154,19 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
   let payload;
   if (isImageAPI) {
     payload = {
-      model: selectedModel,
+      model: upstreamModel,
       prompt: lastPrompt,
       n: 1,
       size: "auto",
       output_format: "png",
       response_format: "url"
     };
-    if (selectedModel.includes('sensenova')) {
+    if (upstreamModel.includes('sensenova')) {
       payload.watermark = false;
     }
   } else {
     payload = {
-      model: selectedModel,
+      model: upstreamModel,
       messages: messagesArray.map(m => {
         const o = { role: m.role, content: m.content };
         if (m.tool_calls) o.tool_calls = m.tool_calls;
@@ -157,5 +185,6 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
 
 export {
   getChannelConfig,
+  resolveModelKey,
   buildAIRequest,
 };

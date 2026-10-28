@@ -6,7 +6,11 @@ export default `  const settingsModal = document.getElementById('settingsModal')
   const accessTokenSetting = document.getElementById('accessTokenSetting');
 
   if (defaultModelSetting) {
-    defaultModelSetting.value = localStorage.getItem('default_model') || (modelSelect.options.length > 0 ? modelSelect.options[0].value : "");
+    const savedDefault = localStorage.getItem('default_model') || "";
+    const savedExists = Array.from(defaultModelSetting.options).some(o => o.value === savedDefault);
+    defaultModelSetting.value = savedExists
+      ? savedDefault
+      : (modelSelect.options.length > 0 ? modelSelect.options[0].value : "");
   }
   if (accessTokenSetting) {
     accessTokenSetting.value = accessToken;

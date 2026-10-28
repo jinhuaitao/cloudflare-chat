@@ -17,7 +17,7 @@
 import { APP_VERSION, CORS_HEADERS } from '../constants.js';
 import { mapSetBounded, mapGetBounded, parseCommaSeparated, safeEqual } from '../utils.js';
 import { storeGet, storePut, storePutChecked, storeDelete } from '../store/r2.js';
-import { getChannelConfig, buildAIRequest } from '../channel.js';
+import { getChannelConfig, resolveModelKey, buildAIRequest } from '../channel.js';
 import { tgTrimHistory, tgGetHistory, tgSaveHistory, tgClearHistory } from '../tg-history.js';
 import { agentGetMemories, agentForgetMemory } from '../agent/memory.js';
 import { agentGetMode, agentSetMode } from '../agent/mode.js';
@@ -872,7 +872,7 @@ async function processWechatMessage(env, creds, rawMsg) {
         // 获取当前选中的模型
         let fModelId = mapGetBounded(wxUserModels, chatId, env && env.R2 ? wxUserModelsExp : null);
         if (!fModelId) fModelId = await storeGet(env, `tg_user_${chatId}`);
-        const useModelId = (fModelId && modelObjList.some(m => m.id === fModelId)) ? fModelId : modelObjList[0].id;
+        const useModelId = resolveModelKey(modelObjList, fModelId) || modelObjList[0].key;
 
         const docTitle = String(fm.fileName || '微信上传文档').replace(/\.[^.]+$/, '').trim() || fm.fileName;
         const orgRes = await autoOrganizeAndSaveKbDoc(
@@ -921,10 +921,8 @@ async function processWechatMessage(env, creds, rawMsg) {
       targetModelId = await storeGet(env, `tg_user_${chatId}`);
       if (targetModelId) mapSetBounded(wxUserModels, chatId, targetModelId, undefined, wxUserModelsExp);
     }
-    const activeModelId = (targetModelId && modelObjList.some(m => m.id === targetModelId))
-      ? targetModelId
-      : modelObjList[0].id;
-    const activeModelObj = modelObjList.find(m => m.id === activeModelId) || modelObjList[0];
+    const activeModelId = resolveModelKey(modelObjList, targetModelId) || modelObjList[0].key;
+    const activeModelObj = modelObjList.find(m => m.key === activeModelId) || modelObjList[0];
 
     const cmd = !multimodalContent ? parseWxCommand(userText) : null;
 
@@ -937,22 +935,22 @@ async function processWechatMessage(env, creds, rawMsg) {
           picked = modelObjList[idx - 1];
         } else {
           const q = arg.toLowerCase();
-          picked = modelObjList.find(m => m.id.toLowerCase() === q || m.name.toLowerCase() === q)
-            || modelObjList.find(m => m.id.toLowerCase().includes(q) || m.name.toLowerCase().includes(q));
+          picked = modelObjList.find(m => m.key.toLowerCase() === q || m.id.toLowerCase() === q || m.name.toLowerCase() === q)
+            || modelObjList.find(m => m.key.toLowerCase().includes(q) || m.id.toLowerCase().includes(q) || m.name.toLowerCase().includes(q));
         }
         if (!picked) {
           await sendReply(`⚠️ 未找到匹配的模型「${arg}」。\n请直接发送「模型」或「/model」查看可用模型列表与编号。`, true);
           return { processed: true };
         }
-        mapSetBounded(wxUserModels, chatId, picked.id, undefined, wxUserModelsExp);
-        await storePut(env, `tg_user_${chatId}`, picked.id);
+        mapSetBounded(wxUserModels, chatId, picked.key, undefined, wxUserModelsExp);
+        await storePut(env, `tg_user_${chatId}`, picked.key);
         await sendReply(`✅ 已切换模型为：${picked.name} (${picked.id})`, true);
         return { processed: true };
       }
 
       const useAgentNow = await agentGetMode(env, chatId);
       const listLines = modelObjList.map((m, i) => {
-        const mark = m.id === activeModelId ? ' ✅ [当前]' : '';
+        const mark = m.key === activeModelId ? ' ✅ [当前]' : '';
         return `${i + 1}. ${m.name} (${m.id})${mark}`;
       }).join('\n');
 
@@ -1125,9 +1123,9 @@ async function processWechatMessage(env, creds, rawMsg) {
 
       let drawModelId = activeModelId;
       for (const m of modelObjList) {
-        const probe = buildAIRequest(env, m.id, [{ role: 'user', content: drawPrompt }], false);
+        const probe = buildAIRequest(env, m.key, [{ role: 'user', content: drawPrompt }], false);
         if (probe && probe.isImageAPI) {
-          drawModelId = m.id;
+          drawModelId = m.key;
           break;
         }
       }

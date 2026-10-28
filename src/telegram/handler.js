@@ -281,8 +281,8 @@ export async function handleTgWebhook(request, env) {
             const index = parseInt(data.substring(2), 10);
             if (modelObjList[index]) {
               const selected = modelObjList[index];
-              mapSetBounded(tgUserModels, chatId, selected.id, undefined, tgUserModelsExp);
-              await storePut(env, `tg_user_${chatId}`, selected.id);
+              mapSetBounded(tgUserModels, chatId, selected.key, undefined, tgUserModelsExp);
+              await storePut(env, `tg_user_${chatId}`, selected.key);
 
               const safeModelName = String(selected.name || selected.id).replace(/`/g, "'");
               await tgApi('sendMessage', {
