@@ -15,7 +15,6 @@ import { SW_JS } from './src/pwa/service-worker.js';
 import { getPwaVersion } from './src/pwa/version.js';
 import { HTML_CONTENT } from './src/ui/index.js';
 
-// v6.8.9：CORS 收紧（可选）。配置 CORS_ORIGIN（如 https://chat.example.com，
 // 逗号分隔可多个）后，Access-Control-Allow-Origin 只回显名单内的 Origin，
 // 名单外的跨站请求拿不到 CORS 头 —— 别的网站即使拿到了泄露的访问令牌，
 // 也无法从浏览器直接调用 /api/chat。未配置时保持 *，与旧部署完全兼容。
