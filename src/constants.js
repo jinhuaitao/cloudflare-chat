@@ -18,8 +18,9 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
+// 7.5.0：知识库 3.0 —— 分块索引 + 相关度检索 + 回答前自动预检索 + kb_search / kb_ingest 工具 + 网页端知识库面板。
 // 7.4.0：新增微信 ClawBot（腾讯官方 iLink Bot API / openclaw-weixin 协议）通道支持 + 四重防盗绑安全锁。
-const APP_VERSION = '7.4.0';
+const APP_VERSION = '7.5.0';
 const PNG_HEADERS = {
   'Content-Type': 'image/png',
   'Cache-Control': 'public, max-age=86400',

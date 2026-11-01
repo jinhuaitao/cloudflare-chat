@@ -111,6 +111,73 @@ export default `</head>
   </div>
 </div>
 
+<div class="settings-modal-overlay" id="kbModal">
+  <div class="settings-box kb-box">
+    <h3>📚 知识库 Agent</h3>
+
+    <div class="kb-stats" id="kbStats">正在读取知识库状态…</div>
+
+    <div class="kb-search-row">
+      <input type="text" id="kbSearchInput" class="settings-input" placeholder="检索知识库：输入关键词，直接定位原文片段">
+      <button type="button" id="kbSearchBtn" class="settings-btn kb-btn-inline">🔍 检索</button>
+    </div>
+
+    <div id="kbSearchResults" class="kb-results" style="display:none;"></div>
+
+    <div id="kbReader" class="kb-reader" style="display:none;">
+      <div class="kb-reader-head">
+        <span id="kbReaderTitle">文档</span>
+        <button type="button" id="kbReaderClose" class="btn">收起</button>
+      </div>
+      <pre id="kbReaderBody" class="kb-reader-body"></pre>
+      <button type="button" id="kbReaderMore" class="btn kb-reader-more" style="display:none;">加载更多</button>
+    </div>
+
+    <div class="kb-section-head">
+      <span id="kbListTitle">文档列表</span>
+      <span class="kb-head-actions">
+        <button type="button" id="kbRefreshBtn" class="btn">刷新</button>
+        <button type="button" id="kbReindexBtn" class="btn">重建索引</button>
+      </span>
+    </div>
+    <div id="kbDocList" class="kb-doc-list">正在加载…</div>
+
+    <details class="kb-details" id="kbUploadDetails">
+      <summary>➕ 新建 / 导入文档</summary>
+      <div class="settings-field">
+        <label class="settings-label" for="kbTitleInput">标题</label>
+        <input type="text" id="kbTitleInput" class="settings-input" placeholder="例如：Cloudflare Workers 入门笔记">
+      </div>
+      <div class="settings-field">
+        <label class="settings-label" for="kbSourceInput">来源链接（可选，用于去重）</label>
+        <input type="text" id="kbSourceInput" class="settings-input" placeholder="https://...">
+      </div>
+      <div class="settings-field">
+        <label class="settings-label" for="kbFileInput">选择文件（.md / .txt / .csv / .json / .html，自动填充正文）</label>
+        <input type="file" id="kbFileInput" class="kb-file-input" accept=".md,.markdown,.txt,.csv,.json,.log,.html,.htm">
+      </div>
+      <div class="settings-field">
+        <label class="settings-label" for="kbContentInput">正文（Markdown）</label>
+        <textarea id="kbContentInput" class="settings-input kb-textarea" rows="6" placeholder="粘贴或输入文档正文…"></textarea>
+      </div>
+      <div class="kb-row-btns">
+        <button type="button" id="kbSaveBtn" class="settings-btn kb-btn-inline">💾 保存到知识库</button>
+        <button type="button" id="kbFetchBtn" class="btn">📥 从链接抓取入库</button>
+      </div>
+    </details>
+
+    <div class="settings-field">
+      <label class="settings-label" for="kbAdminToken">🔑 知识库管理员密钥（写入需 KB_ADMIN_SECRET 或 WX_ADMIN_SECRET）</label>
+      <input type="password" id="kbAdminToken" class="settings-input" placeholder="仅保存在本机浏览器，不会上传" autocomplete="off">
+      <div class="settings-hint">读取可用访问口令；写入必须管理员密钥。只配置 ACCESS_PASSWORD 时，网页端仍保持只读，写入请用 Telegram 或微信 ClawBot。</div>
+    </div>
+
+    <div class="settings-actions">
+      <button id="closeKbModalBtn" class="settings-btn">关闭</button>
+    </div>
+  </div>
+</div>
+
 <div class="app-container">
   <div class="sidebar" id="sidebar">
     <div class="sidebar-header">
@@ -128,6 +195,9 @@ export default `</head>
       <div class="side-tools">
         <button class="theme-toggle" id="settingsToggle" title="系统设置">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+        </button>
+        <button class="theme-toggle" id="kbModalToggle" title="知识库 Agent：检索 / 浏览 / 上传 / 管理文档">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path><line x1="9" y1="7" x2="16" y2="7"></line><line x1="9" y1="11" x2="16" y2="11"></line></svg>
         </button>
         <button class="theme-toggle" id="wxModalToggle" title="微信 ClawBot 通道绑定与管理" style="position:relative;">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path></svg>
@@ -165,7 +235,7 @@ export default `</head>
       <div class="empty-state" id="emptyState">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path></svg>
         <h2>今天我能为你提供什么帮助？</h2>
-        <p>输入问题即可开始，支持 Markdown、代码高亮、18 项 Agent 工具、Telegram 与微信 ClawBot 通道。</p>
+        <p>输入问题即可开始，支持 Markdown、代码高亮、20 项 Agent 工具（含 📚 知识库分块检索）、Telegram 与微信 ClawBot 通道。</p>
         <div class="suggestion-grid" id="suggestionGrid">
           <button class="suggestion-chip" type="button" data-prompt="帮我写一封得体的商务邮件">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"></path><polyline points="22,6 12,13 2,6"></polyline></svg>
@@ -208,7 +278,7 @@ export default `</head>
               {{MODEL_OPTIONS}}
             </select>
           </div>
-          <button class="agent-toggle" id="agentToggle" title="Agent 模式：自主规划并调用工具（🔍 搜索 / 📄 网页 / 🌐 维基 / 🐙 GitHub / 🎓 论文 / 🔥 热榜 / 💱 汇率 / 🧮 计算 / 📏 换算 / 🔤 编码 / 🖧 网络 / 🌤 天气 / 🕐 时间），回答优先查知识库文档；知识库在本端只读，保存文档/记住信息请通过 Telegram 或微信 ClawBot 机器人">🤖 Agent</button>
+          <button class="agent-toggle" id="agentToggle" title="Agent 模式：自主规划并调用工具（🔍 搜索 / 📄 网页 / 🌐 维基 / 🐙 GitHub / 🎓 论文 / 🔥 热榜 / 💱 汇率 / 🧮 计算 / 📏 换算 / 🔤 编码 / 🖧 网络 / 🌤 天气 / 🕐 时间 / 📚 知识库检索），回答前会自动在知识库中定位相关原文；知识库在本端只读，保存文档/记住信息请通过 Telegram 或微信 ClawBot 机器人">🤖 Agent</button>
         </div>
       </div>
       <div class="disclaimer">AI 生成的内容可能不准确，请核实重要信息。</div>

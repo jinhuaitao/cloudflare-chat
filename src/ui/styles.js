@@ -863,5 +863,75 @@ export default `  <style>
       .msg-actions { opacity: 1; }
       .delete-btn { opacity: 1; }
     }
+
+    /* ---------------- 知识库面板（v7.5.0） ---------------- */
+    .kb-box { max-width: 640px; max-height: 88vh; overflow-y: auto; }
+    .kb-stats {
+      padding: 10px 12px; border-radius: 10px; background: var(--bg-soft);
+      border: 1px solid var(--border); font-size: 13px; line-height: 1.6; color: var(--text);
+    }
+    .kb-stats-sub { margin-top: 4px; font-size: 11.5px; color: var(--muted); }
+    .kb-search-row { display: flex; gap: 8px; margin-top: 12px; align-items: stretch; }
+    .kb-search-row .settings-input { flex: 1; }
+    .kb-btn-inline { width: auto; padding: 9px 16px; white-space: nowrap; }
+    .kb-results {
+      margin-top: 10px; max-height: 300px; overflow-y: auto;
+      border: 1px solid var(--border); border-radius: 10px; background: var(--panel);
+    }
+    .kb-hits-head {
+      padding: 8px 12px; font-size: 11.5px; color: var(--muted);
+      border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--panel);
+    }
+    .kb-hit { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+    .kb-hit:last-child { border-bottom: none; }
+    .kb-hit-head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+    .kb-hit-title { font-size: 13px; font-weight: 600; color: var(--text); }
+    .kb-hit-score { font-size: 11px; color: var(--accent); white-space: nowrap; }
+    .kb-hit-body {
+      margin: 6px 0 8px; font-size: 12.5px; line-height: 1.65; color: var(--text-2);
+      white-space: pre-wrap; word-break: break-word; max-height: 160px; overflow: hidden;
+    }
+    .kb-reader {
+      margin-top: 10px; border: 1px solid var(--border); border-radius: 10px;
+      background: var(--bg-soft); overflow: hidden;
+    }
+    .kb-reader-head {
+      display: flex; justify-content: space-between; align-items: center; gap: 8px;
+      padding: 8px 12px; font-size: 12.5px; font-weight: 600; color: var(--text);
+      border-bottom: 1px solid var(--border); background: var(--panel);
+    }
+    .kb-reader-body {
+      margin: 0; padding: 12px; font-size: 12.5px; line-height: 1.7;
+      white-space: pre-wrap; word-break: break-word; max-height: 320px; overflow-y: auto;
+      color: var(--text-2); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .kb-reader-more { margin: 8px 12px 12px; }
+    .kb-section-head {
+      display: flex; justify-content: space-between; align-items: center; gap: 8px;
+      margin: 16px 0 8px; font-size: 12.5px; font-weight: 600; color: var(--text);
+    }
+    .kb-head-actions { display: flex; gap: 6px; }
+    .kb-doc-list {
+      border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+      max-height: 260px; overflow-y: auto; background: var(--panel);
+    }
+    .kb-doc-row {
+      display: flex; align-items: center; justify-content: space-between; gap: 10px;
+      padding: 9px 12px; border-bottom: 1px solid var(--border);
+    }
+    .kb-doc-row:last-child { border-bottom: none; }
+    .kb-doc-main { min-width: 0; }
+    .kb-doc-title { font-size: 13px; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .kb-doc-meta { font-size: 11px; color: var(--muted); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .kb-doc-acts { display: flex; gap: 6px; flex-shrink: 0; }
+    .kb-empty { padding: 16px 12px; font-size: 12.5px; color: var(--muted); line-height: 1.7; }
+    .kb-details {
+      margin-top: 14px; border: 1px solid var(--border); border-radius: 10px;
+      padding: 10px 12px; background: var(--bg-soft);
+    }
+    .kb-details summary { cursor: pointer; font-size: 12.5px; font-weight: 600; color: var(--accent); }
+    .kb-textarea { resize: vertical; min-height: 110px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+    .kb-file-input { font-size: 12px; color: var(--text-2); }
+    .kb-row-btns { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
   </style>
 `;

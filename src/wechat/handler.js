@@ -957,7 +957,7 @@ async function processWechatMessage(env, creds, rawMsg) {
       await sendReply(
         `🟢 Cloudflare-Chat 微信 ClawBot 助手 (v${APP_VERSION})\n`
         + `────────────\n`
-        + `🤖 当前模式：${useAgentNow ? 'Agent 智能体（18 项工具 + 记忆 + 知识库）' : '普通对话模式'}\n`
+        + `🤖 当前模式：${useAgentNow ? 'Agent 智能体（20 项工具 + 记忆 + 知识库检索）' : '普通对话模式'}\n`
         + `🎯 可用模型列表：\n${listLines}\n\n`
         + `💡 微信快捷口令（无需敲斜杠，直接发中文即可）：\n`
         + `• 发「模型 序号」（如：模型 2）—— 切换模型\n`
@@ -1041,7 +1041,7 @@ async function processWechatMessage(env, creds, rawMsg) {
       let text = '📚 知识库总览（三端实时自动同步）\n────────────\n';
       text += `🧠 长期记忆：共 ${mems.length} 条（发「记忆」查看，「忘掉 关键词」删除）\n\n`;
       text += await toolListDocs(env);
-      text += '\n\n💡 快捷操作：\n• 直接在微信发送文件（.docx/.xlsx/.pptx/.pdf/.md/.txt/.csv/代码）即可【自动整理入库】\n• 发「整理知识库 标题」可将刚聊的内容自动整理入库\n• 发「读取文档 标题」查看内容 | 发「删除文档 标题」删除';
+      text += '\n\n💡 快捷操作：\n• 找具体内容：直接问「在知识库里找 …」，会自动分块检索并标注出自哪篇文档的哪一段\n• 直接在微信发送文件（.docx/.xlsx/.pptx/.pdf/.md/.txt/.csv/代码）即可【自动整理入库】\n• 发「整理知识库 标题」可将刚聊的内容自动整理入库\n• 发「读取文档 标题」查看内容 | 发「删除文档 标题」删除';
       await sendReply(text, true);
       return { processed: true };
     }
@@ -1106,7 +1106,7 @@ async function processWechatMessage(env, creds, rawMsg) {
       await agentSetMode(env, chatId, !cur);
       await sendReply(
         !cur
-          ? '🤖 Agent 智能体模式已开启\n\n我会自主规划并调用 18 项工具（🔍 联网搜索、📄 网页抓取、🌐 维基百科、🐙 GitHub、📑 arXiv、📰 HN 热榜、💱 汇率/币价、🛰️ DNS、🧮 计算、🧰 工具箱、🌤 天气、🕐 时间），并支持 🧠 长期记忆与 📚 知识库文档读写。'
+          ? '🤖 Agent 智能体模式已开启\n\n我会自主规划并调用 20 项工具（🔍 联网搜索、📄 网页抓取、🌐 维基百科、🐙 GitHub、📑 arXiv、📰 HN 热榜、💱 汇率/币价、🛰️ DNS、🧮 计算、🧰 工具箱、🌤 天气、🕐 时间、📚 知识库分块检索），并支持 🧠 长期记忆与 📚 知识库文档读写。'
           : '💬 已切换为普通对话模式\n\n单轮直接问答，不调用工具、不使用长期记忆。如需切回请再发「模式」或 /agent。',
         true
       );

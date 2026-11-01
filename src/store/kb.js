@@ -11,6 +11,7 @@ import { storePut } from './r2.js';
 //   kb/mem/<chatId>/*.md    知识库镜像：每条记忆一个 Markdown 文件（frontmatter + 正文），供控制台浏览
 //   kb/docs/<标题>.md       知识库文档：save_doc 工具写入的长篇 Markdown（全局共享）
 //   kb/docs/registry.json   文档注册表：标题/来源/大小/时间的索引（去重与列表的唯一依据，损坏自动重建）
+//   kb/docs/_index.json     分块检索索引：每篇的 [偏移, 长度, 词向量]（v7.5.0；缺失或过期自动重建）
 //   tg_hist_<chatId>         Telegram 对话历史（根目录，保持原样）
 //   tg_user_<chatId>         用户模型选择（根目录，保持原样）
 //   agent_mode_<chatId>      Agent 开关（根目录，保持原样）

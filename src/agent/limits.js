@@ -30,6 +30,8 @@ function describeToolCall(name, args) {
     case 'remember': return '🧠 正在记住…';
     case 'forget_memory': return '🗑️ 正在清理记忆：' + (args.keyword || '');
     case 'save_doc': return '💾 正在保存文档：' + (args.title || '');
+    case 'kb_search': return '📚 正在检索知识库：' + (args.query || '');
+    case 'kb_ingest': return '📥 正在把网页存入知识库：' + (args.url || '');
     case 'list_docs': return '📚 正在查看知识库文档…';
     case 'read_doc': return '📖 正在读取文档：' + (args.query || '') + offNote;
     case 'delete_doc': return '🗑️ 正在删除文档：' + (args.query || '');

@@ -9,6 +9,7 @@ import { readErrorBody } from './src/agent/stability.js';
 import { handleWebAgent } from './src/web-agent.js';
 import { handleTgWebhook } from './src/telegram/handler.js';
 import { handleWxWebhook, handleWxApi, handleWxScheduled, maybeWakeWxDaemon } from './src/wechat/handler.js';
+import { handleKbApi } from './src/kb/api.js';
 import { ICON_B64, getIconBytes } from './src/pwa/icons.js';
 import { MANIFEST_JSON } from './src/pwa/manifest.js';
 import { SW_JS } from './src/pwa/service-worker.js';
@@ -62,6 +63,12 @@ async function routeRequest(request, env, ctx) {
 
     if (url.pathname.startsWith('/api/wx/')) {
       return await handleWxApi(request, env, url, ctx);
+    }
+
+    // 知识库管理 API（v7.5.0）：网页端知识库面板的列表 / 检索 / 阅读 / 上传 / 删除 / 重建索引。
+    // 鉴权在模块内部完成：读取需任一密钥（未配置则开放），写入必须 KB_ADMIN_SECRET 或 WX_ADMIN_SECRET。
+    if (url.pathname.startsWith('/api/kb/')) {
+      return await handleKbApi(request, env, url);
     }
 
     if (request.method === 'POST' && url.pathname === '/api/chat') {

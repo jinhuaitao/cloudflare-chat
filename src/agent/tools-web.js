@@ -395,6 +395,7 @@ export {
   parseDuckDuckGo,
   parseDuckDuckGoLite,
   htmlToStructuredText,
+  getOrFetchPageText,
   toolWebSearch,
   toolWebFetch,
 };

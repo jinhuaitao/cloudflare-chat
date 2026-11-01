@@ -1,11 +1,18 @@
 // Agent 工具：知识库文档的保存 / 列表 / 读取（支持分页 offset） / 多关键词分词检索 / 删除
 // v7.1.0 性能优化：新增文档正文 L1 内存缓存（支持长文档 0ms 翻页与多轮全文检索加速）+ 标题/词频加权相关性算法
+// v7.5.0 知识库 3.0：写入/删除同步维护分块索引，read_doc 优先走 kb_search 的块级定位，
+//        并新增 kb_search（分块检索）与 kb_ingest（网页正文入库）两个工具。
 
 import { mapSetBounded, mapGetBounded } from '../utils.js';
 import { storePutChecked } from '../store/r2.js';
 import { kbSafeChatId } from '../store/kb.js';
 import { KB_DOCS_PREFIX, kbDocSlug, kbNormSource, kbDocTitleOf, kbGetRegistry,
   kbSaveRegistry, kbFindRegEntry, kbFmtSize, kbFmtDate } from './registry.js';
+import { kbUpdateDocIndex, kbRemoveDocIndex } from './index.js';
+import { kbSearch, kbFormatHits, kbStats } from './search.js';
+import { kbConfig } from './config.js';
+import { isBlockedFetchHost } from '../net/ssrf.js';
+import { getOrFetchPageText } from '../agent/tools-web.js';
 
 // v7.1.0：知识库文档正文 L1 内存缓存（最多缓存 80 篇，TTL 120 秒），写入或删除时自动失效/更新
 const kbDocTextCache = new Map();
@@ -55,7 +62,8 @@ async function toolSaveDoc(env, chatId, args) {
   if (!title) return '标题为空，未保存';
   if (!content.trim()) return '内容为空，未保存';
   if (!env.R2) return 'R2 未绑定，知识库文档无法保存。请先按 README 第二步绑定 R2 存储桶后再试；本次内容未保存。';
-  if (content.length > 100000) content = content.slice(0, 100000) + '\n\n> （内容过长，仅保存前 10 万字符）';
+  const maxDocChars = kbConfig(env).maxDocChars;
+  if (content.length > maxDocChars) content = content.slice(0, maxDocChars) + '\n\n> （内容过长，仅保存前 ' + Math.round(maxDocChars / 10000) + ' 万字符）';
   const file = kbDocSlug(title) + '.md';
   const key = KB_DOCS_PREFIX + file;
   const reg = await kbGetRegistry(env);
@@ -88,19 +96,33 @@ async function toolSaveDoc(env, chatId, args) {
   if (idx >= 0) reg[idx] = entry; else reg.push(entry);
   const okReg = await kbSaveRegistry(env, reg);
   if (!okReg) return '文档正文已写入 R2（' + key + '），但注册表更新失败，文档可能暂不出现在列表中；请稍后重新保存一次以修复注册表，本次内容未丢失。';
+  // v7.5.0：同步维护分块索引。失败不影响文档本身——检索层发现索引与文档集合不一致会自动全量重建。
+  let indexNote = '';
+  try {
+    const okIdx = await kbUpdateDocIndex(env, file, title, body);
+    if (!okIdx) indexNote = '，索引稍后自动重建';
+  } catch (e) { indexNote = '，索引稍后自动重建'; }
   let verNote = existed ? '，已覆盖旧版本' : '，新建';
   if (existed && prevEntry && prevEntry.title !== title) {
     verNote += '（注意：新标题清洗后与旧文档《' + prevEntry.title + '》同名，旧内容已被覆盖）';
   }
-  return '已保存为知识库文档：' + key + '（' + content.length + ' 字符' + verNote + '）';
+  return '已保存为知识库文档：' + key + '（' + content.length + ' 字符' + verNote + indexNote + '）';
 }
 
 async function toolListDocs(env) {
   if (!env.R2) return 'R2 未绑定，无法读取知识库文档';
   const reg = await kbGetRegistry(env);
   if (!reg.length) return '知识库文档为空（kb/docs/ 下暂无文档，可用 save_doc 保存）';
-  return '知识库文档（共' + reg.length + '篇）：\n' +
-    reg.map((e, i) => (i + 1) + '. ' + (e.title || e.file) + '（' + kbFmtSize(e.size) + '，' + kbFmtDate(e.updated_at) + '）').join('\n');
+  let st = null;
+  try { st = await kbStats(env); } catch (e) { st = null; }
+  const scale = st
+    ? '（共' + reg.length + '篇 / ' + st.chunks + ' 个检索块 / 约 ' + Math.max(1, Math.round(st.chars / 1000)) + ' 千字）'
+    : '（共' + reg.length + '篇）';
+  const shown = reg.slice(0, 60);
+  const lines = shown.map((e, i) => (i + 1) + '. ' + (e.title || e.file) + '（' + kbFmtSize(e.size) + '，' + kbFmtDate(e.updated_at) + '）');
+  return '知识库文档' + scale + '：\n' + lines.join('\n')
+    + (reg.length > shown.length ? '\n…（其余 ' + (reg.length - shown.length) + ' 篇未列出）' : '')
+    + '\n\n提示：找具体内容请直接用 kb_search 检索（返回相关原文片段与偏移），比逐篇 read_doc 更快。';
 }
 
 async function toolReadDoc(env, args) {
@@ -130,7 +152,13 @@ async function toolReadDoc(env, args) {
     }
     return '【知识库文档《' + (hit.title || hit.file) + '》】\n' + slice + note;
   }
-  // 标题无命中 → 全文多关键词相关性检索（最多查 30 篇，返回 Top 3 命中片段）
+  // 标题无命中 → 走分块索引检索（v7.5.0）：直接定位到最相关的原文片段与偏移
+  let indexed = null;
+  try { indexed = await kbSearch(env, query, { topK: 3, perDoc: 1 }); } catch (e) { indexed = null; }
+  if (indexed && indexed.hits && indexed.hits.length) {
+    return '未找到标题为「' + query + '」的文档，但在正文中检索到相关内容：\n\n' + kbFormatHits(indexed);
+  }
+  // 索引不可用（尚未建立 / 全库过大被跳过）→ 退回旧的全库正文扫描兜底
   const snippet = await kbSearchDocBody(env, reg.slice(0, 30), query);
   if (snippet) return snippet;
   return '未找到标题或正文包含"' + query + '"的文档。现有文档：\n' +
@@ -258,8 +286,45 @@ async function toolDeleteDoc(env, args) {
   kbDocTextCache.delete(key);
   kbDocTextExp.delete(key);
   const okReg = await kbSaveRegistry(env, reg.filter(e => e !== hit));
+  // v7.5.0：同步摘除该篇的分块索引，避免删完还能被检索命中
+  try { await kbRemoveDocIndex(env, hit.file); } catch (e) {}
   if (!okReg) return '文档文件已删除，但注册表更新失败，列表可能仍显示旧条目；下次读取会自动重建注册表。《' + (hit.title || hit.file) + '》';
   return '已删除知识库文档《' + (hit.title || hit.file) + '》';
+}
+
+// v7.5.0 新增：分块检索工具 —— 知识库的"搜索引擎"入口
+async function toolKbSearch(env, args) {
+  args = args || {};
+  const query = String(args.query || '').trim();
+  if (!query) return '关键词为空，未检索知识库';
+  if (!env.R2) return 'R2 未绑定，无法检索知识库';
+  const topK = Math.max(1, Math.min(10, parseInt(args.top_k, 10) || 6));
+  const res = await kbSearch(env, query, { topK, doc: args.doc });
+  if (!res.hits || !res.hits.length) {
+    const st = res.stats;
+    return '知识库中没有检索到与「' + query + '」相关的内容'
+      + (st && st.docs ? '（全库 ' + st.docs + ' 篇 / ' + st.chunks + ' 块）' : '')
+      + '。可换更具体的关键词，或先用 list_docs 查看现有文档标题。';
+  }
+  return kbFormatHits(res);
+}
+
+// v7.5.0 新增：网页正文入库 —— 抓取 URL 正文并保存为知识库文档（自动去重 + 自动建索引）
+async function toolKbIngest(env, chatId, args) {
+  args = args || {};
+  const url = String(args.url || '').trim();
+  if (!/^https?:\/\//i.test(url)) return 'URL 非法，仅支持 http/https';
+  if (!env.R2) return 'R2 未绑定，无法写入知识库';
+  let host = '';
+  try { host = new URL(url).hostname; } catch (e) { return 'URL 非法，仅支持 http/https'; }
+  if (isBlockedFetchHost(host)) return '该地址禁止抓取（内网 / 本机 / 云元数据地址）';
+  const page = await getOrFetchPageText(url, 20000);
+  if (!page || page.err) return '网页抓取失败：' + ((page && page.err) || '未知错误');
+  const text = String(page.text || '').trim();
+  if (text.length < 60) return '该网页没有可提取的正文内容，未入库';
+  const title = String(args.title || '').replace(/[\r\n]+/g, ' ').trim().slice(0, 80) || (host + ' 网页摘录');
+  const maxChars = kbConfig(env).maxDocChars;
+  return await toolSaveDoc(env, chatId, { title, content: text.slice(0, maxChars), source: url });
 }
 
 export {
@@ -269,4 +334,6 @@ export {
   toolReadDoc,
   kbSearchDocBody,
   toolDeleteDoc,
+  toolKbSearch,
+  toolKbIngest,
 };
