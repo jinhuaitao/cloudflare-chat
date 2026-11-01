@@ -1,6 +1,7 @@
 // 知识库文档注册表：kb/docs/registry.json 的读写与自愈重建（_worker.js 原第 786-904 行）
 
 import { KB_PREFIX } from '../store/kb.js';
+import { mapLimit } from '../utils.js';
 
 // ==================== 知识库文档（v6.8.0 重构，v6.9.5 缓存加速）：注册表方案 ====================
 // kb/docs/registry.json 是文档的唯一注册表：[{file, title, source, size, updated_at}]。
@@ -16,6 +17,9 @@ const KB_REG_CACHE_TTL_MS = 30 * 1000;
 let cachedRegistry = null;
 let cachedRegistryBucket = null;
 let cachedRegistryExp = 0;
+// 注册表版本号：每次成功写入 +1，供正文检索缓存判断结果是否过期
+let kbRegVersion = 0;
+function kbRegistryVersion() { return kbRegVersion; }
 
 // 文件名由标题清洗得到（去掉 / \ : * ? " < > | # 与控制字符，中文保留；
 // 空格直接去掉——避免"甲骨文云 ARM"与"甲骨文云ARM"生成两个文件），超长截断；
@@ -65,26 +69,28 @@ async function kbListDocObjects(env) {
   } catch (e) {}
   return objs;
 }
-// 从现有文件重建注册表（读每篇前 4096 字节的 frontmatter），并写回
+// 从现有文件重建注册表（读每篇前 4096 字节的 frontmatter），并写回。
+// v7.7.0：并发读取（上限 8），文档多时重建耗时从 N × RTT 降到约 N/8 × RTT。
 async function kbRebuildRegistry(env) {
-  const reg = [];
-  if (!env.R2) return reg;
+  if (!env.R2) return [];
   const objs = await kbListDocObjects(env);
-  for (const o of objs) {
+  const reg = await mapLimit(objs, 8, async (o) => {
     let fm = {};
     try {
       // v6.8.4：frontmatter 含长标题/长 source 时 1200 字节可能截断，放大到 4096
-      const r = await env.R2.get(o.key, { range: { offset: 0, length: 4096 } });
-      if (r) fm = kbParseFrontmatter(await r.text());
+      if (o.size > 0) {
+        const r = await env.R2.get(o.key, { range: { offset: 0, length: 4096 } });
+        if (r) fm = kbParseFrontmatter(await r.text());
+      }
     } catch (e) {}
-    reg.push({
+    return {
       file: String(o.key).slice(KB_DOCS_PREFIX.length),
       title: fm.title || kbDocTitleOf(o.key),
       source: fm.source || '',
       size: o.size || 0,
       updated_at: fm.saved_at || (o.uploaded ? new Date(o.uploaded).toISOString() : '')
-    });
-  }
+    };
+  });
   await kbSaveRegistry(env, reg);
   return reg.slice();
 }
@@ -119,6 +125,7 @@ async function kbSaveRegistry(env, reg) {
     cachedRegistry = list;
     cachedRegistryBucket = env.R2;
     cachedRegistryExp = Date.now() + KB_REG_CACHE_TTL_MS;
+    kbRegVersion += 1;
     return true;
   } catch (e) {
     cachedRegistry = null;
@@ -127,17 +134,34 @@ async function kbSaveRegistry(env, reg) {
   }
 }
 // 注册表内模糊查找：标题精确相等 > 标题包含 > 文件名包含（大小写不敏感）
+// v7.7.0：单遍扫描（旧版最多扫 4 遍），slug 归一化只在常规匹配全部落空时才计算。
 function kbFindRegEntry(reg, query) {
   const q = String(query || '').trim().toLowerCase();
-  if (!q || !reg || !reg.length) return null;
+  if (!q || !Array.isArray(reg) || !reg.length) return null;
+  let exact = null;
+  let contains = null;
+  let fileHit = null;
+  for (const e of reg) {
+    if (!e) continue;
+    const title = String(e.title || '').toLowerCase();
+    if (!exact && title === q) exact = e;
+    if (!contains && title.indexOf(q) !== -1) contains = e;
+    if (!fileHit && String(e.file || '').toLowerCase().indexOf(q) !== -1) fileHit = e;
+    if (exact) break;
+  }
+  if (exact || contains) return exact || contains;
   // v6.8.4：查询也做 slug 归一化（去空格/特殊字符），"甲骨文云 ARM" 能命中 "甲骨文云ARM"
   let qSlug = '';
   try { qSlug = kbDocSlug(query).toLowerCase(); } catch (e) {}
-  return reg.find(e => String(e.title || '').toLowerCase() === q)
-    || reg.find(e => String(e.title || '').toLowerCase().indexOf(q) !== -1)
-    || (qSlug && reg.find(e => { try { return kbDocSlug(e.title || e.file).toLowerCase().indexOf(qSlug) !== -1; } catch (ee) { return false; } }))
-    || reg.find(e => String(e.file || '').toLowerCase().indexOf(q) !== -1)
-    || null;
+  if (qSlug) {
+    for (const e of reg) {
+      if (!e) continue;
+      try {
+        if (kbDocSlug(e.title || e.file).toLowerCase().indexOf(qSlug) !== -1) return e;
+      } catch (ee) {}
+    }
+  }
+  return fileHit;
 }
 function kbFmtSize(b) {
   b = b || 0;
@@ -159,6 +183,7 @@ export {
   kbGetRegistry,
   kbSaveRegistry,
   kbFindRegEntry,
+  kbRegistryVersion,
   kbFmtSize,
   kbFmtDate,
 };

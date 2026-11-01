@@ -126,9 +126,11 @@ async function agentSaveMemory(env, chatId, fact) {
   if (!env.R2) {
     return '已暂存于内存（R2 未绑定，Worker 重启后会丢失；按 README 第二步绑定 R2 后可永久记住）' + replNote + '：' + fact;
   }
-  const okMd = await storePutChecked(env, kbMemDir(chatId) + m.file, kbMemMarkdown(chatId, fact, m.ts));
-  const okIdx = await storePutChecked(env, agentMemKey(chatId), JSON.stringify(arr));
-  if (!okMd || !okIdx) return '记忆写入 R2 失败，已暂存于内存' + replNote + '；请检查 R2 绑定与权限后重试：' + fact;
+  // v7.7.0：md 镜像与 JSON 索引互不依赖，并行写入省掉一次往返；任一失败都如实告知
+  const [okMd, okIdx] = await Promise.all([
+    storePutChecked(env, kbMemDir(chatId) + m.file, kbMemMarkdown(chatId, fact, m.ts)),
+    storePutChecked(env, agentMemKey(chatId), JSON.stringify(arr)),
+  ]);  if (!okMd || !okIdx) return '记忆写入 R2 失败，已暂存于内存' + replNote + '；请检查 R2 绑定与权限后重试：' + fact;
   // 索引落盘成功后才清理被覆盖条目的 md 镜像
   if (replacedFiles.length) await kbDeleteKeys(env, replacedFiles);
   if (replaced) return '已自动更新记忆：旧《' + oldFact + '》→ 新《' + fact + '》（共' + arr.length + '条）';

@@ -15,7 +15,7 @@
 // 6) 中英双语快捷口令（菜单/帮助、模型/模型 序号、智能体/模式、画 <描述>、清空、记忆、忘掉、知识库、状态）+ 网页端会话同步与实时收发诊断日志。
 
 import { APP_VERSION, CORS_HEADERS } from '../constants.js';
-import { mapSetBounded, mapGetBounded, parseCommaSeparated, safeEqual } from '../utils.js';
+import { mapSetBounded, mapGetBounded, mapLimit, parseCommaSeparated, safeEqual } from '../utils.js';
 import { storeGet, storePut, storePutChecked, storeDelete } from '../store/r2.js';
 import { getChannelConfig, resolveModelKey, buildAIRequest } from '../channel.js';
 import { tgTrimHistory, tgGetHistory, tgSaveHistory, tgClearHistory } from '../tg-history.js';
@@ -24,7 +24,8 @@ import { agentGetMode, agentSetMode } from '../agent/mode.js';
 import { agentLoadResumeState, agentClearResumeState, tgAgentResumeKey } from '../agent/resume.js';
 import { tgAgentChat, tgAgentResume } from '../agent/loop.js';
 import { readErrorBody } from '../agent/stability.js';
-import { toolSaveDoc, toolListDocs, toolReadDoc, toolDeleteDoc, kbSearchDocBody } from '../kb/doc-tools.js';
+import { toolSaveDoc, toolListDocs, toolReadDoc, toolDeleteDoc, kbSearchDocBody,
+  kbReadDocTextCached } from '../kb/doc-tools.js';
 import { kbGetRegistry, KB_DOCS_PREFIX } from '../kb/registry.js';
 import {
   DEFAULT_ILINK_BASE_URL,
@@ -696,29 +697,24 @@ async function autoOrganizeAndSaveKbDoc(env, chatId, activeModelId, docTitle, ra
 }
 
 // 读取全部知识库文档列表与正文（供网页端自动同步展示）
+// v7.7.0：复用 Agent 的 L1 正文缓存，并按 6 路并发读取（旧版逐篇串行 get，30 篇要等 30 个往返）
 async function loadAllKbDocsForSync(env) {
   if (!env || !env.R2) return [];
   try {
     const reg = await kbGetRegistry(env);
     if (!Array.isArray(reg) || !reg.length) return [];
-    const docs = [];
-    for (const entry of reg.slice(0, 30)) {
-      let text = '';
-      try {
-        const obj = await env.R2.get(KB_DOCS_PREFIX + entry.file);
-        if (obj) text = await obj.text();
-      } catch (e) {}
+    return await mapLimit(reg.slice(0, 30), 6, async (entry) => {
+      const text = (await kbReadDocTextCached(env, KB_DOCS_PREFIX + entry.file)) || '';
       const cleanBody = text.replace(/^---[\s\S]*?---\s*/, '').trim();
-      docs.push({
+      return {
         file: entry.file,
         title: entry.title || entry.file,
         size: entry.size || cleanBody.length,
         updatedAt: entry.updated_at || '',
         source: entry.source || '',
         content: cleanBody.slice(0, 25000),
-      });
-    }
-    return docs;
+      };
+    });
   } catch (e) {
     return [];
   }
