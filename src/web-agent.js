@@ -39,10 +39,8 @@ async function handleWebAgent(env, body) {
       }, 15000);
       const webOpts = {
         maxRuntimeMs: webBudgetMs,
-        // Web 端查询优先知识库：文档列表注入系统提示词（loop.js 读取此标记）
-        kbFirst: true,
         // v6.9.3：Web 端对知识库只读——写入（remember / save_doc / delete_doc）
-        // 仅 Telegram 端开放，Web 访客无法污染全局知识库
+        // 仅 Telegram / 微信端开放，Web 访客无法污染全局知识库
         kbReadOnly: true,
         onDelta: async (text, kind) => {
           if (kind === 'reasoning') send({ choices: [{ delta: { reasoning_content: text } }] });

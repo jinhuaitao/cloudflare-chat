@@ -142,7 +142,8 @@ async function tryJinaFallback(targetUrl, signal) {
 function sliceWebPageText(text, offset, pageSize) {
   const totalLen = text.length;
   if (offset >= totalLen) {
-    return '偏移量 offset=' + offset + ' 已超出页面正文总长度（' + totalLen + ' 字符）';
+    // 判为失败：越界的 offset 按成功返回会被同轮记忆化，模型再翻也拿不到内容
+    return '抓取失败：偏移量 offset=' + offset + ' 已超出页面正文总长度（' + totalLen + ' 字符），请改用更小的 offset。';
   }
   const slice = text.slice(offset, offset + pageSize);
   const nextOffset = offset + slice.length;
@@ -175,7 +176,7 @@ async function fetchAndParseWebPage(url, customTimeoutMs) {
       }
       break;
     }
-    if (res && res.status >= 300 && res.status < 400) return { err: '重定向次数过多（超过 5 跳），已停止抓取' };
+    if (res && res.status >= 300 && res.status < 400) return { err: '抓取失败：重定向次数过多（超过 5 跳），已停止抓取' };
     if (!res) return { err: '抓取失败' };
 
     let text = '';
@@ -199,7 +200,7 @@ async function fetchAndParseWebPage(url, customTimeoutMs) {
       }
     }
 
-    if (!text) return { err: '页面无有效文本内容' };
+    if (!text) return { err: '抓取失败：页面无有效文本内容' };
     return { text };
   } catch (e) {
     return { err: '抓取失败: ' + (e.name === 'AbortError' ? '超时' : e.message) };
@@ -269,6 +270,7 @@ async function toolWebSearch(query, count, deepRead) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 11000);
   let hedgeTimer = null;
+  const searchStartedAt = Date.now();
   try {
     const epHtml = 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(query);
     const epLite = 'https://lite.duckduckgo.com/lite/?q=' + encodeURIComponent(query);
@@ -305,14 +307,18 @@ async function toolWebSearch(query, count, deepRead) {
     });
 
     // v7.2.0 一站式预读（Auto-Prefetch Top 2）：并发抓取前 2 条非屏蔽 URL 的正文前 1100 字并预热 L1 缓存
-    if (wantDeep && out.length > 0) {
+    // v7.6.0：预读超时先扣掉搜索已花掉的时间，整次调用仍控制在 11 秒内
+    //（旧版搜索接近超时后仍会给预读 4.2 秒，工具实际耗时可能拖到 15 秒以上）
+    const previewRemainMs = 11000 - (Date.now() - searchStartedAt) - 400;
+    if (wantDeep && out.length > 0 && previewRemainMs >= 1200) {
+      const previewTimeout = Math.min(4200, previewRemainMs);
       const topTargets = out.slice(0, 2).filter(r => {
         try { return !isBlockedFetchHost(new URL(r.url).hostname); } catch (e) { return false; }
       });
       if (topTargets.length) {
         const previews = await Promise.all(topTargets.map(async (item, idx) => {
           try {
-            const pRes = await getOrFetchPageText(item.url, 4200);
+            const pRes = await getOrFetchPageText(item.url, previewTimeout);
             if (pRes && pRes.text && pRes.text.length >= 60) {
               return `【结果 ${idx + 1} 正文速览（已缓存，如需阅读全文可对 ${item.url} 调用 web_fetch 并传 offset=1100）】\n`
                 + pRes.text.slice(0, 1100) + (pRes.text.length > 1100 ? '…' : '');
@@ -349,13 +355,16 @@ async function toolWebFetch(url, offset) {
     const batch = urlList.slice(0, 3);
     const perUrlLimit = Math.floor(5400 / batch.length);
     const results = await Promise.all(batch.map(async (u, i) => {
-      if (!/^https?:\/\//i.test(u)) return `【网页 ${i + 1}：${u}】URL 非法`;
+      // v7.6.0：每条失败都以「抓取失败：」开头 —— 全部失败时聚合结果才能被
+      // isToolFailureResult 识别（旧版形如「【网页 1：…】…」会被判为成功）
+      const label = '网页 ' + (i + 1) + '（' + u + '）';
+      if (!/^https?:\/\//i.test(u)) return '抓取失败：' + label + ' URL 非法，仅支持 http/https';
       let host = '';
-      try { host = new URL(u).hostname; } catch (e) { return `【网页 ${i + 1}：${u}】URL 非法`; }
-      if (isBlockedFetchHost(host)) return `【网页 ${i + 1}：${u}】该地址禁止抓取`;
+      try { host = new URL(u).hostname; } catch (e) { return '抓取失败：' + label + ' URL 非法，仅支持 http/https'; }
+      if (isBlockedFetchHost(host)) return '抓取失败：' + label + ' 该地址禁止抓取（内网 / 本机 / 云元数据地址）';
       const r = await getOrFetchPageText(u, 14000);
-      if (r.err) return `【网页 ${i + 1}：${u}】${r.err}`;
-      return `【网页 ${i + 1}：${u}（共 ${r.text.length} 字符）】\n` + r.text.slice(0, perUrlLimit) + (r.text.length > perUrlLimit ? '…' : '');
+      if (r.err) return '抓取失败：' + label + ' ' + r.err;
+      return '【' + label + '，共 ' + r.text.length + ' 字符】\n' + r.text.slice(0, perUrlLimit) + (r.text.length > perUrlLimit ? '…' : '');
     }));
     return results.join('\n\n---\n\n');
   }

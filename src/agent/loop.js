@@ -1,5 +1,13 @@
 // Telegram / 微信 / Web 三端共用 Agent 主循环：自主规划 → 工具调用 → 汇总作答
 //
+// v7.6.0 性能与可靠性升级：
+// 1) 工具参数先修复再执行：被 max_tokens 截断的 JSON 由 parseToolArguments 确定性补齐；
+//    修不好直接回灌"参数解析失败"并跳过执行，不再拿空参数白跑一次；
+// 2) 截断可见：上游 finish_reason=length 时在最终答案后补一句"回复继续可接着写"，
+//    流式场景用增量补发，网页端也能看到；
+// 3) 断点续做保存裁剪后的本轮起点，恢复后不会把历史工具轮次误当成本轮轨迹；
+// 4) 上下文裁剪新增硬预算压缩，保证真正送上游的请求不超预算（详见 stability.js）。
+//
 // v7.5.0 内核加固（在 v7.2.0 性能优化基础上的可靠性升级）：
 // 1) 并发闸门：单步内模型可能一次吐 6~8 个 tool_calls，旧版 Promise.all 会同时打出同样多
 //    的外部请求；现在按 AGENT_TOOL_CONCURRENCY（默认 4）限流，结果顺序不变；
@@ -13,7 +21,8 @@
 
 import { buildAIRequest } from '../channel.js';
 import { parseDSMLToolCalls, stripDSMLBlocks } from './dsml.js';
-import { truncateToolResult, readErrorBody, toolCallSignature, trimAgentMessages } from './stability.js';
+import { truncateToolResult, readErrorBody, parseToolArguments, toolCallSignature,
+  trimAgentMessages, trimAgentMessagesEx } from './stability.js';
 import { agentLimits, describeToolCall } from './limits.js';
 import { agentSaveResumeState } from './resume.js';
 import { readUpstreamMessage } from './upstream.js';
@@ -25,8 +34,20 @@ import { mapLimit } from '../utils.js';
 
 const WRITE_TOOLS_SET = new Set(['remember', 'forget_memory', 'save_doc', 'delete_doc']);
 
+const TRUNC_NOTE = '\n\n> ⚠️ 输出达到模型单次长度上限被截断，回复「继续」可以让我接着写完。';
+
 // 兼容旧导出名：失败判定已收敛到 tools.js（前缀表 + 兜底正则），此处仅做转发
 const isToolResultFailure = isToolFailureResult;
+
+// 最终答案收尾：流式已把正文逐字推完时，截断提示要用增量补发，否则网页端只看得到半截
+async function finalizeAnswer(text, finishReason, streamed, onDelta) {
+  const t = String(text || '').trim();
+  if (finishReason !== 'length') return { text: t, streamed: !!streamed };
+  if (streamed && typeof onDelta === 'function') {
+    try { await onDelta(TRUNC_NOTE, 'content'); } catch (e) {}
+  }
+  return { text: t + TRUNC_NOTE, streamed: !!streamed };
+}
 
 // 收尾作答：不再提供 tools，强制模型把已有结果收成最终答案。
 async function agentWrapUp(env, targetModelId, messages, loopStartIdx, ctxBudget, deadline, onDelta, reserveMs) {
@@ -54,8 +75,10 @@ async function agentWrapUp(env, targetModelId, messages, loopStartIdx, ctxBudget
   catch (e) { return null; }
   const clean = stripDSMLBlocks(msg.content || '').trim();
   if (!clean) return null;
-  if (msg.forwarded && clean === String(msg.content || '').trim()) return { text: clean, streamed: true };
-  return { text: clean, streamed: false };
+  if (msg.forwarded && clean === String(msg.content || '').trim()) {
+    return await finalizeAnswer(clean, msg.finishReason, true, onDelta);
+  }
+  return await finalizeAnswer(clean, msg.finishReason, false, onDelta);
 }
 
 function tgAgentDeadline(env, opts) {
@@ -166,12 +189,15 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
 
   const persistState = async () => {
     if (!resumeKey) return false;
+    // 用裁剪后的数组 + 修正后的本轮起点存档：旧版存的是未裁剪数组的起点，
+    // 恢复后起点会错位，把历史工具轮次误当成本轮轨迹（还会让裁剪产生孤儿 tool 消息）
+    const trimmed = trimAgentMessagesEx(messages, loopStartIdx, ctxBudget);
     return await agentSaveResumeState(env, chatId, {
       v: 2, savedAt: Date.now(), chatId, targetModelId, allowTools,
       kbReadOnly: !!kbReadOnly,
       hasKbDocs: hasKbDocs,
-      messages: trimAgentMessages(messages, loopStartIdx, ctxBudget),
-      loopStartIdx: loopStartIdx,
+      messages: trimmed.messages,
+      loopStartIdx: trimmed.loopStartIdx,
       origUserText: origUserText || ''
     });
   };
@@ -320,7 +346,16 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
     }
 
     const assistantMsg = { role: 'assistant', content: assistantText };
-    if (toolCalls.length) assistantMsg.tool_calls = toolCalls;
+    if (toolCalls.length) {
+      // 回灌给上游的 assistant.tool_calls 必须是合法 JSON：原始串可能被 max_tokens
+      // 截断，严格校验的上游会直接 400。统一换成修复后的参数（修不好就是 {}），
+      // 真正的失败原因由随后的 tool 消息告诉模型。
+      assistantMsg.tool_calls = toolCalls.map((tc) => {
+        const fn = (tc && tc.function) || {};
+        const parsed = parseToolArguments(fn.arguments);
+        return { ...tc, function: { ...fn, arguments: JSON.stringify(parsed.args || {}) } };
+      });
+    }
     const reasoning = msg.reasoning || '';
     if (reasoning) assistantMsg.reasoning_content = reasoning;
     messages.push(assistantMsg);
@@ -331,23 +366,26 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
         await rollbackStreamed(msg.forwarded);
         const text = assistantText.indexOf('DSML') !== -1
           ? '（工具调用格式解析失败，已隐藏原始标记，请换个问法重试或切换模型）'
-          : (reasoning ? '（模型思考后没有给出文字答复，请换个问法重试）' : '（模型返回了空内容，请换个问法重试）');
+          : (msg.finishReason === 'length'
+            ? '（模型输出达到单次长度上限，未产出正文；请把问题拆小后重试，或调大 MAX_TOKENS）'
+            : (reasoning ? '（模型思考后没有给出文字答复，请换个问法重试）' : '（模型返回了空内容，请换个问法重试）'));
         return { text: text, usedTools: step > 0 };
       }
       if (msg.forwarded && clean === assistantText.trim()) {
-        return { text: clean, usedTools: step > 0, streamed: true };
+        const fin = await finalizeAnswer(clean, msg.finishReason, true, onDelta);
+        return { text: fin.text, usedTools: step > 0, streamed: true };
       }
       await rollbackStreamed(msg.forwarded);
-      return { text: clean, usedTools: step > 0 };
+      const fin2 = await finalizeAnswer(clean, msg.finishReason, false, onDelta);
+      return { text: fin2.text, usedTools: step > 0 };
     }
 
     await rollbackStreamed(msg.forwarded);
 
     const descs = toolCalls.map(tc => {
       const fn = (tc && tc.function) || {};
-      let a = {};
-      try { a = JSON.parse(fn.arguments || '{}'); } catch (e) {}
-      return describeToolCall(fn.name || 'unknown', a);
+      const parsed = parseToolArguments(fn.arguments);
+      return describeToolCall(fn.name || 'unknown', parsed.args || {});
     });
     fireProgress(stepLabel + '\n' + descs.join('\n'), true);
 
@@ -357,9 +395,19 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
 
     const toolResults = await mapLimit(toolCalls, limits.toolConcurrency, async (tc) => {
       const fn = (tc && tc.function) || {};
-      let args = {};
-      try { args = JSON.parse(fn.arguments || '{}'); } catch (e) {}
       if (!fn.name) return { tc, result: '工具调用缺少名称，已跳过', failed: true, ms: 0 };
+      // 参数先修复再执行：被截断的 JSON 修不好时直接判失败并告诉模型怎么改，
+      // 避免拿 {} 去跑一次必然失败的工具，白烧一步与一份上下文
+      const parsed = parseToolArguments(fn.arguments);
+      if (parsed.error) {
+        return {
+          tc,
+          result: '工具调用参数解析失败：' + parsed.error + '。本次调用已跳过，请补齐被截断的引号/括号后重新输出完整 JSON 参数再试。',
+          failed: true,
+          ms: 0
+        };
+      }
+      const args = parsed.args || {};
       const sig = toolCallSignature(tc);
       const isReadOnlyTool = !WRITE_TOOLS_SET.has(fn.name);
       // 同轮记忆化短路：本轮前面步骤已经成功调用过一模一样的只读工具，0ms 返回提示，不再重复请求或撑大上下文

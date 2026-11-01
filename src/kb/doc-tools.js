@@ -118,7 +118,7 @@ async function toolReadDoc(env, args) {
     if (fullText === null) return '文档读取失败：' + (hit.title || hit.file);
     const totalLen = fullText.length;
     if (offset >= totalLen) {
-      return '【知识库文档《' + (hit.title || hit.file) + '》】偏移量 offset=' + offset + ' 已超出文档总长度（' + totalLen + ' 字符）。';
+      return '文档读取失败：偏移量 offset=' + offset + ' 已超出文档总长度（' + totalLen + ' 字符），请改用更小的 offset；或传 offset=0 从头读。';
     }
     const slice = fullText.slice(offset, offset + MAX);
     const nextOffset = offset + slice.length;

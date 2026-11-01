@@ -1,34 +1,41 @@
-// 上游流式读取：把 SSE 还原成与非流式相同的 message 形状（v7.1.0 增强：流式实时拦截 DSML 工具调用标记）
+// 上游流式读取：把 SSE 还原成与非流式相同的 message 形状
+// （v7.1.0 流式实时拦截 DSML 工具调用标记；v7.6.0 读取链路降耗）
 
 // ==================== 上游流式读取（Agent 真流式） ====================
 // 把上游的 SSE 流还原成与「非流式」完全相同的 message 形状：
-//   { content, reasoning, toolCalls, forwarded, imageUrl }
+//   { content, reasoning, toolCalls, forwarded, imageUrl, finishReason }
 // 这样 Agent 循环里的 tool_calls 判定、DSML 兜底、熔断、工具执行等逻辑一行都不用改，
 // 变的只是"怎么拿到 msg"。同时把正文 / 推理增量实时回调出去，实现逐字输出。
 //
-// v7.1.0 性能优化与闪烁消除：
-// 当使用 DeepSeek 等输出 <｜DSML｜tool_calls> 文本标记的通道时，一旦检测到流中出现 DSML 起始标签，
-// 立即将 sawToolCalls 置为 true 并停止向前端透传后续 XML 原始字符，消除网页端看到整段 XML 刷屏再被撤回的闪烁。
+// v7.6.0：
+// 1) 只有确认不是 SSE 时才缓存原文（旧版对每个流式响应都留一份最多 4MB 的 raw，
+//    纯属内存与拷贝浪费），非 SSE 兜底解析不受影响；
+// 2) onDelta 改为串行排队、不阻塞读取：旧版每个 token 都 await 一次前端回调，
+//    前端稍慢就会拖慢上游读取；顺序仍然严格保持，收尾时统一等待队列排空；
+// 3) 捕获 finish_reason：length 说明输出被 max_tokens 截断，交给循环补「继续」提示。
 async function readUpstreamMessage(resp, onDelta) {
   const reader = resp.body.getReader();
   const decoder = new TextDecoder('utf-8');
-  let raw = '';          // 完整原文，供非 SSE 兜底解析
+  let raw = '';          // 仅在确认非 SSE 时累积，供 JSON 兜底解析
   let buffer = '';       // 行缓冲
   let content = '';
   let reasoning = '';
   let forwarded = false;
+  let finishReason = '';
   const toolMap = new Map(); // 按 index 合并流式 tool_calls 分片
   let sawSSE = false;
   let sawToolCalls = false;  // 一旦出现工具调用（含 DSML 标记），这一步的后续正文不再外发
+  let emitChain = Promise.resolve();
 
-  const emit = async (text, kind) => {
-    if (!text || typeof onDelta !== 'function') return;
-    try { await onDelta(text, kind); } catch (e) {}
+  const emit = (text, kind) => {
+    if (!text) return;
     if (kind === 'content') forwarded = true;
+    if (typeof onDelta !== 'function') return;
+    emitChain = emitChain.then(() => onDelta(text, kind)).catch(() => {});
   };
 
   // 返回 true 表示遇到 [DONE]，可以停止读取
-  const consumeLine = async (line) => {
+  const consumeLine = (line) => {
     line = line.trim();
     if (!line || line.charAt(0) === ':') return false;
     if (line.indexOf('data:') !== 0) return false;
@@ -44,9 +51,10 @@ async function readUpstreamMessage(resp, onDelta) {
     }
     const choice = ev && ev.choices && ev.choices[0];
     if (!choice) return false;
+    if (choice.finish_reason) finishReason = String(choice.finish_reason);
     const d = choice.delta || choice.message || {};
     const rc = d.reasoning_content || d.reasoning || '';
-    if (rc) { reasoning += rc; await emit(rc, 'reasoning'); }
+    if (rc) { reasoning += rc; emit(rc, 'reasoning'); }
     if (Array.isArray(d.tool_calls) && d.tool_calls.length) {
       sawToolCalls = true;
       for (const tc of d.tool_calls) {
@@ -65,11 +73,11 @@ async function readUpstreamMessage(resp, onDelta) {
     }
     if (d.content) {
       content += d.content;
-      // v7.1.0：一旦流式正文中开始出现 <｜DSML｜ 标记，立即阻断后续内容向前端透传
+      // 一旦流式正文中开始出现 <｜DSML｜ 标记，立即阻断后续内容向前端透传
       if (!sawToolCalls && content.indexOf('DSML') !== -1 && /<\s*[|｜]\s*DSML/i.test(content)) {
         sawToolCalls = true;
       }
-      if (!sawToolCalls) await emit(d.content, 'content');
+      if (!sawToolCalls) emit(d.content, 'content');
     }
     return false;
   };
@@ -78,26 +86,29 @@ async function readUpstreamMessage(resp, onDelta) {
     const { done, value } = await reader.read();
     if (done) break;
     const chunk = decoder.decode(value, { stream: true });
-    raw += chunk;
-    if (raw.length > 4000000) { try { await reader.cancel(); } catch (e) {} break; }
     buffer += chunk;
     const lines = buffer.split('\n');
     buffer = lines.pop();
     let stop = false;
     for (const line of lines) {
-      if (await consumeLine(line)) { stop = true; break; }
+      if (consumeLine(line)) { stop = true; break; }
+    }
+    if (!sawSSE) {
+      raw += chunk;
+      if (raw.length > 4000000) { try { await reader.cancel(); } catch (e) {} break; }
     }
     if (stop) { try { await reader.cancel(); } catch (e) {} break; }
   }
   if (buffer.trim()) {
-    try { await consumeLine(buffer); } catch (e) { if (e && e.name === 'UpstreamSSEError') throw e; }
+    try { consumeLine(buffer); } catch (e) { if (e && e.name === 'UpstreamSSEError') throw e; }
   }
+  try { await emitChain; } catch (e) {}
 
   if (!sawSSE) {
     try {
       const j = JSON.parse(raw);
       if (j && j.data && j.data[0] && (j.data[0].url || j.data[0].b64_json)) {
-        return { imageUrl: j.data[0].url || ('data:image/png;base64,' + j.data[0].b64_json), content: '', reasoning: '', toolCalls: [], forwarded: false };
+        return { imageUrl: j.data[0].url || ('data:image/png;base64,' + j.data[0].b64_json), content: '', reasoning: '', toolCalls: [], forwarded: false, finishReason: '' };
       }
       const ch = j && j.choices && j.choices[0];
       const m = ch && (ch.message || ch.delta);
@@ -106,14 +117,15 @@ async function readUpstreamMessage(resp, onDelta) {
           content: m.content || '',
           reasoning: m.reasoning_content || m.reasoning || '',
           toolCalls: m.tool_calls || [],
-          forwarded: false
+          forwarded: false,
+          finishReason: (ch && ch.finish_reason) || ''
         };
       }
     } catch (e) {}
   }
 
   const toolCalls = Array.from(toolMap.keys()).sort((a, b) => a - b).map(k => toolMap.get(k));
-  return { content, reasoning, toolCalls, forwarded };
+  return { content, reasoning, toolCalls, forwarded, finishReason };
 }
 
 export {
