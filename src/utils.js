@@ -41,6 +41,32 @@ function parseCommaSeparated(str) {
   return str.split(',').map(s => s.trim()).filter(Boolean);
 }
 
+// v7.5.0 并发闸门：按固定并发上限执行异步任务，结果顺序与输入严格一致。
+// Agent 单步里模型可能一次吐出 6~8 个 tool_calls，直接 Promise.all 会同时打出
+// 同样多的外部请求（R2 / 搜索 / 抓取），既容易触发对端限流，也会在 Workers
+// 单 isolate 里抢占 CPU 预算。用闸门把并发压到可配置上限，整体耗时几乎不变。
+async function mapLimit(items, limit, fn) {
+  const list = Array.isArray(items) ? items : [];
+  const n = list.length;
+  const out = new Array(n);
+  if (!n) return out;
+  let max = parseInt(limit, 10);
+  if (!(max > 0)) max = 4;
+  if (max > n) max = n;
+  let cursor = 0;
+  const worker = async () => {
+    while (true) {
+      const i = cursor++;
+      if (i >= n) return;
+      out[i] = await fn(list[i], i);
+    }
+  };
+  const workers = [];
+  for (let k = 0; k < max; k++) workers.push(worker());
+  await Promise.all(workers);
+  return out;
+}
+
 // v6.9.5 加固：定长比较，消除长度不一致时提前返回导致的口令长度侧信道泄露
 function safeEqual(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
@@ -60,6 +86,7 @@ export {
   DEFAULT_CACHE_TTL_MS,
   mapSetBounded,
   mapGetBounded,
+  mapLimit,
   parseCommaSeparated,
   safeEqual,
 };

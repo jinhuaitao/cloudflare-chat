@@ -1,4 +1,4 @@
-// Agent 工具定义与分发（v7.2.0 高效精简 Schema + 批量执行 + 动态按需裁剪）
+// Agent 工具定义与分发（v7.5.0：统一失败判定 + 预算感知超时 + 工具箱扩展）
 
 import { toolWebSearch, toolWebFetch } from './tools-web.js';
 import {
@@ -7,6 +7,43 @@ import {
 } from './tools-local.js';
 import { agentSaveMemory, agentForgetMemory } from './memory.js';
 import { toolSaveDoc, toolListDocs, toolReadDoc, toolDeleteDoc } from '../kb/doc-tools.js';
+
+// ==================== 工具失败判定（唯一入口） ====================
+// v7.5.0：旧版把这个巨型正则内联在 loop.js 里，两个问题：
+//  1) 新增工具时极易漏加前缀，失败被当成成功 → 模型拿着"失败"文本继续编；
+//  2) 只认前缀，形如 "请给出…" / "文档读取失败" 这类同样代表失败的文案被判成成功。
+// 现在集中在这里，前缀表 + 兜底正则，供循环熔断与同轮去重共用。
+const TOOL_FAILURE_PREFIXES = [
+  '搜索失败', '搜索请求失败', '抓取失败', 'URL 非法', '该地址禁止抓取', '不支持抓取',
+  '计算失败', '计算结果非法', '表达式为空', '表达式含非法字符',
+  '时区无效', '日期格式无效',
+  '天气查询失败', '找不到城市', '城市名为空',
+  '汇率查询失败',
+  '维基百科查询失败', '维基百科未找到', '维基百科查询关键词为空',
+  'GitHub 查询失败', 'GitHub 未找到',
+  'arXiv 查询失败', 'arXiv 未找到',
+  'Hacker News 查询失败',
+  '网络诊断失败', '网络诊断拒绝', 'IP 归属查询失败',
+  '单位换算失败', '关键词为空', '标题为空', '内容为空',
+  '工具执行失败', '未知工具', 'R2 未绑定', '知识库文档写入', '记忆写入',
+  '文档读取失败', '删除失败', '请给出要读取的文档标题', '请给出要删除的文档标题',
+  '未找到标题或正文包含', '未找到标题包含',
+  'JSON 解析失败', 'JSON 取值失败', '正则编译失败', '正则过长',
+  '请提供 pattern', '请提供 path',
+];
+
+function isToolFailureResult(result) {
+  const s = String(result == null ? '' : result).trim();
+  if (!s) return true;
+  for (const p of TOOL_FAILURE_PREFIXES) {
+    if (s.indexOf(p) === 0) return true;
+  }
+  // 搜索类工具用「搜索「xxx」无结果」表达失败
+  if (/^搜索「[^」]*」无结果/.test(s)) return true;
+  // 形如 "工具 web_fetch 执行超时（30 秒），已跳过"
+  if (/^工具\s+\S+\s+执行超时/.test(s)) return true;
+  return false;
+}
 
 // ==================== Agent 工具定义 ====================
 // v7.2.0 性能优化：
@@ -157,19 +194,22 @@ function getAgentTools(kbReadOnly, opts) {
       type: 'function',
       function: {
         name: 'toolkit',
-        description: '确定性工具箱：unit_convert（长度/重量含斤两/温度C-F-K/面积含亩坪/体积/速度/存储容量/油耗MPG与L100km）| hash（SHA-256/512/1）| base64_encode/decode | url_encode/decode | uuid | text_stats（字数/字节/Token统计）。',
+        description: '确定性工具箱：unit_convert（长度/重量含斤两/温度C-F-K/面积含亩坪/体积/速度/存储容量/油耗MPG与L100km）| hash（SHA-256/512/1）| base64_encode/decode | url_encode/decode | uuid | text_stats（字数/字节/Token统计）| json_format（格式化校验）| json_query（按 a.b[0].c 路径取值）| regex_test（正则匹配与分组）。',
         parameters: {
           type: 'object',
           properties: {
             action: {
               type: 'string',
-              description: 'unit_convert | hash | base64_encode | base64_decode | url_encode | url_decode | uuid | text_stats'
+              description: 'unit_convert | hash | base64_encode | base64_decode | url_encode | url_decode | uuid | text_stats | json_format | json_query | regex_test'
             },
-            input: { type: 'string', description: '输入文本' },
+            input: { type: 'string', description: '输入文本（json_* 传 JSON 字符串；regex_test 传被匹配文本）' },
             value: { type: 'number', description: '数值（unit_convert 数值或 uuid 个数）' },
             from_unit: { type: 'string', description: '源单位（如 km, lb, f, mpg, gib, 亩, 斤）' },
             to_unit: { type: 'string', description: '目标单位（如 mi, kg, c, l100km, gb, m2）' },
-            algorithm: { type: 'string', description: '可选：SHA-256(默认)/SHA-384/SHA-512/SHA-1' }
+            algorithm: { type: 'string', description: '可选：SHA-256(默认)/SHA-384/SHA-512/SHA-1' },
+            path: { type: 'string', description: '可选：json_query 的取值路径，如 data.items[0].name' },
+            pattern: { type: 'string', description: '可选：regex_test 的正则表达式' },
+            flags: { type: 'string', description: '可选：regex_test 的修饰符，如 g / i / gi / m' }
           },
           required: ['action']
         }
@@ -298,13 +338,21 @@ function getAgentTools(kbReadOnly, opts) {
   return filtered;
 }
 
-async function execAgentTool(name, args, env, chatId, kbReadOnly) {
+async function execAgentTool(name, args, env, chatId, kbReadOnly, opts) {
   args = args || {};
+  opts = opts || {};
   if (kbReadOnly && (name === 'remember' || name === 'forget_memory' || name === 'save_doc' || name === 'delete_doc')) {
     return '工具 ' + name + ' 在本端不可用：知识库为只读，写入与删除（记忆 / 文档保存与删除）仅 Telegram 或微信 ClawBot 机器人端支持。请如实告知用户，并引导其通过 Telegram 或微信 ClawBot 机器人完成该操作；不要声称已完成。';
   }
-  let toolTimeoutMs = parseInt(env.AGENT_TOOL_TIMEOUT_MS || '30000', 10);
-  if (!(toolTimeoutMs > 0)) toolTimeoutMs = 30000;
+  // v7.5.0：超时取「工具上限」与「本轮剩余预算」的较小值。
+  // 旧版固定 30 秒，任务快到期时仍会为一个工具再等 30 秒，导致 wrapUp 完全没时间收尾，
+  // 用户只能拿到「任务超时」而看不到任何结果。
+  let toolTimeoutMs = parseInt(opts.timeoutMs, 10);
+  if (!(toolTimeoutMs > 0)) {
+    toolTimeoutMs = parseInt(env.AGENT_TOOL_TIMEOUT_MS || '30000', 10);
+    if (!(toolTimeoutMs > 0)) toolTimeoutMs = 30000;
+  }
+  if (toolTimeoutMs < 800) toolTimeoutMs = 800;
   let timer;
   try {
     const run = (async () => {
@@ -317,7 +365,8 @@ async function execAgentTool(name, args, env, chatId, kbReadOnly) {
         case 'hn_top': return await toolHnTop(args);
         case 'exchange_rate': return await toolExchangeRate(args);
         case 'net_lookup': return await toolNetLookup(args);
-        case 'calculate': return toolCalculate(args.expression);
+        // 兼容模型把 expression 写成 expr / query 的情况，避免因参数名不一致直接判失败
+        case 'calculate': return toolCalculate(args.expression || args.expr || args.query);
         case 'toolkit': return await toolToolkit(args);
         case 'get_time': return toolGetTime(args.timezone, args);
         case 'get_weather': return await toolGetWeather(args.city);
@@ -351,6 +400,8 @@ async function execAgentTool(name, args, env, chatId, kbReadOnly) {
 }
 
 export {
+  TOOL_FAILURE_PREFIXES,
+  isToolFailureResult,
   getAgentTools,
   execAgentTool,
 };

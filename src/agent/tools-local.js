@@ -713,7 +713,7 @@ async function toolNetLookup(args) {
   }
 }
 
-// ==================== 新增免密钥工具 5：全能确定性工具箱（单位换算 / 哈希摘要 / 编解码 / 文本统计 / UUID） ====================
+// ==================== 新增免密钥工具 5：全能确定性工具箱（单位换算 / 哈希摘要 / 编解码 / 文本统计 / UUID / JSON / 正则） ====================
 const UNIT_TABLE = {
   mm: { cat: 'len', k: 0.001 }, cm: { cat: 'len', k: 0.01 }, m: { cat: 'len', k: 1 }, km: { cat: 'len', k: 1000 },
   in: { cat: 'len', k: 0.0254 }, inch: { cat: 'len', k: 0.0254 }, ft: { cat: 'len', k: 0.3048 }, foot: { cat: 'len', k: 0.3048 },
@@ -755,6 +755,47 @@ function convertUnits(val, fromRaw, toRaw) {
   const res = (val * uf.k) / ut.k;
   const formatted = Math.abs(res) >= 1e-4 && Math.abs(res) < 1e12 ? Number(res.toFixed(6)) : res;
   return `单位换算结果：${val} ${fromRaw} = ${formatted} ${toRaw}`;
+}
+
+// JSON 路径取值：支持 a.b[0].c / a.b.0.c 两种写法
+function jsonQueryPath(root, path) {
+  const raw = String(path || '').trim();
+  if (!raw || raw === '.' || raw === '$') return root;
+  const segs = raw
+    .replace(/^\$\.?/, '')
+    .replace(/\[(\d+)\]/g, '.$1')
+    .split('.')
+    .map(s => s.trim())
+    .filter(Boolean);
+  let cur = root;
+  const walked = [];
+  for (const seg of segs) {
+    walked.push(seg);
+    if (cur === null || cur === undefined) {
+      return { error: '路径 ' + walked.join('.') + ' 处已无值（' + seg + ' 之前为 ' + String(cur) + '）' };
+    }
+    if (Array.isArray(cur)) {
+      const idx = parseInt(seg, 10);
+      if (!(idx >= 0) || idx >= cur.length) return { error: '数组下标越界：' + walked.join('.') };
+      cur = cur[idx];
+    } else if (typeof cur === 'object') {
+      if (!Object.prototype.hasOwnProperty.call(cur, seg)) {
+        return { error: '键不存在：' + walked.join('.') + '（当前可用键：' + Object.keys(cur).slice(0, 20).join(', ') + '）' };
+      }
+      cur = cur[seg];
+    } else {
+      return { error: '无法继续下钻：' + walked.join('.') + '（' + seg + ' 的父级是 ' + typeof cur + '）' };
+    }
+  }
+  return { value: cur };
+}
+
+function safeJsonStringify(v) {
+  try {
+    return JSON.stringify(v, null, 2);
+  } catch (e) {
+    return String(v);
+  }
 }
 
 async function toolToolkit(args) {
@@ -806,8 +847,69 @@ async function toolToolkit(args) {
         const estTokens = Math.ceil(cjk * 1.3 + enWords * 1.3 + (chars - cjk - enWords) * 0.4);
         return `【文本精确统计】\n总字符数（含空白）：${chars} | 不含空白：${noSpace}\n中文字数：${cjk} | 英文/数字词数：${enWords}\n行数：${lines} | UTF-8 字节数：${utf8Bytes} Bytes\n预估 Token 数：约 ${estTokens} tokens`;
       }
+      // v7.5.0 新增：JSON 格式化与校验（开发排查高频需求，纯确定性、零网络）
+      case 'json_format': {
+        if (!input.trim()) return '内容为空';
+        let parsed;
+        try { parsed = JSON.parse(input); }
+        catch (e) { return 'JSON 解析失败: ' + e.message; }
+        const pretty = safeJsonStringify(parsed);
+        const kind = Array.isArray(parsed) ? '数组（' + parsed.length + ' 项）' : (parsed && typeof parsed === 'object' ? '对象（' + Object.keys(parsed).length + ' 个键）' : typeof parsed);
+        const body = pretty.length > 6000 ? pretty.slice(0, 6000) + '\n…（格式化结果过长，已截断）' : pretty;
+        return 'JSON 合法（' + kind + '），格式化结果：\n```json\n' + body + '\n```';
+      }
+      case 'json_query': {
+        if (!input.trim()) return '内容为空';
+        let parsed;
+        try { parsed = JSON.parse(input); }
+        catch (e) { return 'JSON 解析失败: ' + e.message; }
+        const path = String(args.path || '').trim();
+        if (!path) return '请提供 path（如 data.items[0].name）';
+        const r = jsonQueryPath(parsed, path);
+        if (r.error) return 'JSON 取值失败: ' + r.error;
+        const v = r.value;
+        if (v === null) return '路径 ' + path + ' 的值为 null';
+        if (typeof v === 'object') {
+          const s = safeJsonStringify(v);
+          return '路径 ' + path + ' 的值：\n```json\n' + (s.length > 6000 ? s.slice(0, 6000) + '\n…（已截断）' : s) + '\n```';
+        }
+        return '路径 ' + path + ' 的值：' + String(v) + '（类型：' + typeof v + '）';
+      }
+      case 'regex_test': {
+        const pattern = String(args.pattern || '').trim();
+        if (!pattern) return '请提供 pattern（正则表达式）';
+        if (pattern.length > 500) return '正则过长（上限 500 字符）';
+        const flags = String(args.flags || '').replace(/[^gimsuy]/g, '');
+        let re;
+        try { re = new RegExp(pattern, flags); }
+        catch (e) { return '正则编译失败: ' + e.message; }
+        const src = input;
+        const matches = [];
+        if (flags.indexOf('g') !== -1) {
+          let m;
+          let guard = 0;
+          while ((m = re.exec(src)) && guard < 50) {
+            matches.push(m);
+            if (m[0] === '') re.lastIndex++;
+            guard++;
+          }
+        } else {
+          const m = re.exec(src);
+          if (m) matches.push(m);
+        }
+        if (!matches.length) return '未匹配到任何内容（正则：/' + pattern + '/' + flags + '）';
+        const lines = matches.slice(0, 20).map((m, i) => {
+          let line = (i + 1) + '. 命中「' + String(m[0]).slice(0, 200) + '」@' + m.index;
+          const groups = m.slice(1);
+          if (groups.length) {
+            line += '\n   分组：' + groups.map((g, gi) => '#' + (gi + 1) + '=' + (g === undefined ? '(未参与)' : String(g).slice(0, 80))).join(' | ');
+          }
+          return line;
+        });
+        return '匹配到 ' + matches.length + ' 处（正则：/' + pattern + '/' + flags + '）：\n' + lines.join('\n');
+      }
       default:
-        return '工具执行失败: 未知的 toolkit action（支持 unit_convert / hash / base64_encode / base64_decode / url_encode / url_decode / uuid / text_stats）';
+        return '工具执行失败: 未知的 toolkit action（支持 unit_convert / hash / base64_encode / base64_decode / url_encode / url_decode / uuid / text_stats / json_format / json_query / regex_test）';
     }
   } catch (e) {
     return '工具执行失败: ' + e.message;
@@ -825,4 +927,6 @@ export {
   toolHnTop,
   toolNetLookup,
   toolToolkit,
+  jsonQueryPath,
+  convertUnits,
 };

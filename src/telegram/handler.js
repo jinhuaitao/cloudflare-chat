@@ -664,7 +664,10 @@ export async function handleTgWebhook(request, env) {
                   allowTools: allowTools,
                   messages: resumeState.messages,
                   loopStartIdx: resumeState.loopStartIdx,
-                  origUserText: resumeState.origUserText || ''
+                  origUserText: resumeState.origUserText || '',
+                  // v7.5.0：续做时恢复原轮的只读权限位与知识库可用性，避免恢复后工具集与首次不一致
+                  kbReadOnly: !!resumeState.kbReadOnly,
+                  hasKbDocs: resumeState.hasKbDocs
                 }, onProgress, agentOpts);
               }
               return tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTools, onProgress, agentOpts);

@@ -56,6 +56,16 @@ async function handleWebAgent(env, body) {
         if (r.fallback) r = await tgAgentChat(env, noOpTgApi, webChatId, targetModelId, history, false, onProgress, webOpts);
         if (r.error) {
           send({ agent_error: r.error });
+        } else if (r.paused && r.text) {
+          // v7.5.0：网页端没有「继续」指令，把机器人端的断点续做提示换成网页端可执行的说法，
+          // 否则用户会照着"发送「继续」"在输入框里发一句"继续"，却什么都不会发生。
+          const t = String(r.text)
+            .replace(/⏸️ 任务较长，已暂停并保存进度，发送「继续」让我接着做。/, '⏸️ 这一步比较费时，已到网页端单轮时间上限。以下是已经查到的部分：')
+            .replace(/⏸️ 推理步数已用尽，进度已保存，发送「继续」让我接着做。/, '⏸️ 推理步数已用尽。以下是已经查到的部分：');
+          for (let i = 0; i < t.length; i += 2000) {
+            send({ choices: [{ delta: { content: t.slice(i, i + 2000) } }] });
+          }
+          send({ choices: [{ delta: { content: '\n\n> 网页端不支持断点续做，可以把问题拆小一些，或补充更具体的范围后重问。' } }] });
         } else if (r.streamed) {
           // 正文已经在流式过程中逐字推完了，这里什么都不用补，直接收尾
         } else if (r.text) {

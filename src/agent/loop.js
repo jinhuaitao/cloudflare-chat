@@ -1,10 +1,15 @@
-// Telegram & Web Agent 主循环：自主规划 → 工具调用 → 汇总作答
-// v7.2.0 性能与工作效率升级：
-// 1) 启动时并发读取长期记忆与知识库注册表（Promise.all），当只读端知识库为空时动态精简无需挂载的 KB 工具 Schema；
-// 2) 非阻塞异步进度推送（fireProgress）：Telegram editMessageText 不再阻塞上游大模型 fetch 或工具并发执行，每步节省 300~800ms；
-// 3) 同轮工具调用记忆化去重（turnToolMemo）：同一轮任务中对相同只读工具+相同参数的重复调用 0ms 短路返回，杜绝重复网络请求与上下文膨胀；
-// 4) 连续重复调用熔断从 3 次缩短为 2 次，并立即触发 agentWrapUp 收束生成最终回答，消除无效空转步数；
-// 5) 上游请求遭遇 429/502/503/504 或瞬时网络抖动时自动退避重试，并在多 Key 通道中自动切换备用 Key。
+// Telegram / 微信 / Web 三端共用 Agent 主循环：自主规划 → 工具调用 → 汇总作答
+//
+// v7.5.0 内核加固（在 v7.2.0 性能优化基础上的可靠性升级）：
+// 1) 并发闸门：单步内模型可能一次吐 6~8 个 tool_calls，旧版 Promise.all 会同时打出同样多
+//    的外部请求；现在按 AGENT_TOOL_CONCURRENCY（默认 4）限流，结果顺序不变；
+// 2) 预算感知的工具超时：单工具超时 = min(AGENT_TOOL_TIMEOUT_MS, 本轮剩余 - 收尾预留)，
+//    剩余不足时直接跳过并如实告知，把最后的时间留给收尾作答，避免"任务超时且零结果"；
+// 3) 步数感知：剩余步数 ≤2 时向系统提示注入收束指令，显著降低"最后一步还在查资料"；
+// 4) 空转熔断双保险：连续 2 步同签名（原有）+ 单轮内同签名累计 3 次（新增，抓 A→B→A→B）；
+// 5) 失败提示去重：工具连续全失败只提醒一次，不再每步重复污染上下文；
+// 6) 断点续做保留只读权限位：恢复后不会突然多出写入工具；
+// 7) 进度文案带步数与耗时，长任务可感知。
 
 import { buildAIRequest } from '../channel.js';
 import { parseDSMLToolCalls, stripDSMLBlocks } from './dsml.js';
@@ -12,22 +17,21 @@ import { truncateToolResult, readErrorBody, toolCallSignature, trimAgentMessages
 import { agentLimits, describeToolCall } from './limits.js';
 import { agentSaveResumeState } from './resume.js';
 import { readUpstreamMessage } from './upstream.js';
-import { getAgentTools, execAgentTool } from './tools.js';
+import { getAgentTools, execAgentTool, isToolFailureResult } from './tools.js';
 import { agentGetMemories } from './memory.js';
 import { buildAgentSystemPrompt } from './prompt.js';
 import { kbGetRegistry } from '../kb/registry.js';
+import { mapLimit } from '../utils.js';
 
 const WRITE_TOOLS_SET = new Set(['remember', 'forget_memory', 'save_doc', 'delete_doc']);
 
-// 工具结果是否算失败。只认工具层自己的固定前缀
-function isToolResultFailure(result) {
-  const s = String(result == null ? '' : result);
-  return /^(搜索失败|搜索请求失败|搜索「[^」]*」无结果|抓取失败|URL 非法|该地址禁止抓取|不支持抓取|计算失败|计算结果非法|时区无效|天气查询失败|找不到城市|汇率查询失败|维基百科查询失败|维基百科未找到|维基百科查询关键词为空|GitHub 查询失败|GitHub 未找到|arXiv 查询失败|arXiv 未找到|Hacker News 查询失败|网络诊断失败|网络诊断拒绝|IP 归属查询失败|单位换算失败|关键词为空|工具执行失败|工具 [^ ]+ 执行超时|未知工具|R2 未绑定|知识库文档写入|记忆写入|内容为空|标题为空|城市名为空|表达式为空|表达式含非法字符)/.test(s);
-}
+// 兼容旧导出名：失败判定已收敛到 tools.js（前缀表 + 兜底正则），此处仅做转发
+const isToolResultFailure = isToolFailureResult;
 
-// 步数用尽或检测到重复空转后的无工具收尾：不再提供 tools，强制模型把已有结果收成最终答案。
-async function agentWrapUp(env, targetModelId, messages, loopStartIdx, ctxBudget, deadline, onDelta) {
-  if (Date.now() > deadline - 8000) return null;
+// 收尾作答：不再提供 tools，强制模型把已有结果收成最终答案。
+async function agentWrapUp(env, targetModelId, messages, loopStartIdx, ctxBudget, deadline, onDelta, reserveMs) {
+  const reserve = reserveMs > 0 ? reserveMs : 8000;
+  if (Date.now() > deadline - reserve * 0.5) return null;
   const sendMessages = trimAgentMessages(messages, loopStartIdx, ctxBudget).concat([{
     role: 'user',
     content: '【系统提示】工具调用阶段已结束，不能再调用任何工具。请仅根据上面已经拿到的工具结果，直接给出最终答案：先给结论，再说明依据；没查到的部分明确说"未查到"，不要编造，也不要再输出调用计划或工具名。'
@@ -55,7 +59,8 @@ async function agentWrapUp(env, targetModelId, messages, loopStartIdx, ctxBudget
 }
 
 function tgAgentDeadline(env, opts) {
-  let timeoutMs = agentLimits(env).timeoutMs;
+  const limits = agentLimits(env);
+  let timeoutMs = limits.timeoutMs;
   if (opts && opts.maxRuntimeMs > 0 && opts.maxRuntimeMs < timeoutMs) timeoutMs = opts.maxRuntimeMs;
   return Date.now() + timeoutMs;
 }
@@ -70,6 +75,30 @@ function extractMsgPlainText(content) {
       .join('\n');
   }
   return String(content || '');
+}
+
+// 剩余步数 ≤2 时把收束指令并入本轮 system 提示（不改动原始 messages，
+// 也不插在 tool 消息后面，避免个别上游对消息序列校验过严）
+function withStepBudgetHint(sendMessages, step, maxSteps) {
+  if (!Array.isArray(sendMessages) || !sendMessages.length) return sendMessages;
+  const remainAfter = maxSteps - step - 1;
+  if (!(remainAfter <= 2)) return sendMessages;
+  if (sendMessages[0].role !== 'system') return sendMessages;
+  let tail;
+  if (remainAfter <= 0) {
+    tail = '这是本轮最后一步：只做最关键的一次调用（或直接作答），拿到结果必须立刻给出最终答案。';
+  } else if (remainAfter === 1) {
+    tail = '之后只剩 1 次工具机会：只补最关键的缺口，拿到结果立刻作答。';
+  } else {
+    tail = '之后只剩 2 次工具机会：请优先补齐最关键的缺口，不要发散；信息已够就直接给出最终答案。';
+  }
+  const out = sendMessages.slice();
+  out[0] = {
+    role: 'system',
+    content: String(sendMessages[0].content || '')
+      + '\n\n【本轮进度】已进入第 ' + (step + 1) + '/' + maxSteps + ' 步。' + tail
+  };
+  return out;
 }
 
 async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTools, onProgress, opts) {
@@ -90,23 +119,34 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
   const origUserText = (opts && opts.origUserText) !== undefined ? opts.origUserText : query;
   return await tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline,
     (opts && opts.resumeKey) || null, false, undefined,
-    (opts && opts.onDelta) || null, (opts && opts.onReset) || null, kbReadOnly, origUserText);
+    (opts && opts.onDelta) || null, (opts && opts.onReset) || null, kbReadOnly, origUserText,
+    hasKbDocs);
 }
 
-// 「继续」入口：messages 里已包含 system + 历史，直接接着跑（仅 Telegram）
+// 「继续」入口：messages 里已包含 system + 历史，直接接着跑（仅 Telegram / 微信）
 async function tgAgentResume(env, tgApi, chatId, saved, onProgress, opts) {
   const allowTools = !!saved.allowTools;
-  const tools = allowTools ? getAgentTools() : null;
+  const kbReadOnly = !!saved.kbReadOnly;
+  const tools = allowTools ? getAgentTools(kbReadOnly, { hasKbDocs: saved.hasKbDocs }) : null;
   const deadline = tgAgentDeadline(env, opts);
   const baseLoopStartIdx = (typeof saved.loopStartIdx === 'number' && saved.loopStartIdx >= 0) ? saved.loopStartIdx : undefined;
   return await tgAgentRunLoop(env, tgApi, chatId, saved.targetModelId, saved.messages, tools, allowTools, onProgress, deadline,
     (opts && opts.resumeKey) || null, true, baseLoopStartIdx,
-    (opts && opts.onDelta) || null, (opts && opts.onReset) || null, false, saved.origUserText || '');
+    (opts && opts.onDelta) || null, (opts && opts.onReset) || null, kbReadOnly, saved.origUserText || '',
+    saved.hasKbDocs);
 }
 
-async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume, baseLoopStartIdx, onDelta, onReset, kbReadOnly, origUserText) {
-  const maxSteps = agentLimits(env).maxSteps;
+async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume, baseLoopStartIdx, onDelta, onReset, kbReadOnly, origUserText, hasKbDocs) {
+  const limits = agentLimits(env);
+  const maxSteps = limits.maxSteps;
+  const ctxBudget = limits.ctxBudget;
   const useUpstreamStream = env.AGENT_STREAM_UPSTREAM !== '0';
+  const loopStartedAt = Date.now();
+  // 收尾预留不能吃掉整个预算：单轮预算很小时（如用户把 TG_WEBHOOK_BUDGET_MS 调到 10 秒）
+  // 固定预留 8 秒会导致第一步就被判定超时。按总预算的 30% 封顶，且至少保留 1.5 秒硬线。
+  const totalBudgetMs = Math.max(0, deadline - loopStartedAt);
+  const wrapReserveMs = Math.max(1500, Math.min(limits.wrapReserveMs, Math.floor(totalBudgetMs * 0.3)));
+
   const rollbackStreamed = async (forwarded) => {
     if (!forwarded || typeof onReset !== 'function') return;
     try { await onReset(); } catch (e) {}
@@ -123,19 +163,22 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
   const loopStartIdx = (typeof baseLoopStartIdx === 'number' && baseLoopStartIdx >= 0)
     ? Math.min(baseLoopStartIdx, messages.length)
     : messages.length;
-  let ctxBudget = parseInt(env.AGENT_CONTEXT_BUDGET || '24000', 10);
-  if (!(ctxBudget > 0)) ctxBudget = 24000;
+
+  const persistState = async () => {
+    if (!resumeKey) return false;
+    return await agentSaveResumeState(env, chatId, {
+      v: 2, savedAt: Date.now(), chatId, targetModelId, allowTools,
+      kbReadOnly: !!kbReadOnly,
+      hasKbDocs: hasKbDocs,
+      messages: trimAgentMessages(messages, loopStartIdx, ctxBudget),
+      loopStartIdx: loopStartIdx,
+      origUserText: origUserText || ''
+    });
+  };
+
   const pauseForResume = async () => {
     const t = stripDSMLBlocks(lastAssistantText());
-    let saved = false;
-    if (resumeKey) {
-      saved = await agentSaveResumeState(env, chatId, {
-        v: 1, savedAt: Date.now(), chatId, targetModelId, allowTools,
-        messages: trimAgentMessages(messages, loopStartIdx, ctxBudget),
-        loopStartIdx: loopStartIdx,
-        origUserText: origUserText || ''
-      });
-    }
+    const saved = await persistState();
     if (saved) {
       return { text: '⏸️ 任务较长，已暂停并保存进度，发送「继续」让我接着做。' + (t ? '\n\n已产出：\n' + t : ''), usedTools: true, paused: true };
     }
@@ -147,15 +190,25 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
   }, 20000);
   try {
   const callSigHistory = [];
+  const sigCount = new Map();   // sig -> 本轮累计出现次数
   const turnToolMemo = new Map(); // sig -> { step, preview } 同轮只读工具记忆化去重
   let toolFailStreak = 0;
+  let failStreakNotified = false;
+
   for (let step = 0; step < maxSteps; step++) {
-    if (Date.now() > deadline) return await pauseForResume();
-    const stepLabel = '🤖 Agent 思考中' + (isResume ? '（继续）' : '') + '（第 ' + (step + 1) + ' 步）…';
+    const nowMs = Date.now();
+    // 硬线：连收尾都来不及；软线：后续步骤要给 wrapUp 留出时间（第一步不受软线限制）
+    if (nowMs > deadline - 1500 || (step > 0 && nowMs > deadline - wrapReserveMs)) {
+      return await pauseForResume();
+    }
+    const elapsedSec = Math.max(1, Math.round((Date.now() - loopStartedAt) / 1000));
+    const stepLabel = '🤖 Agent 思考中' + (isResume ? '（继续）' : '')
+      + '（第 ' + (step + 1) + '/' + maxSteps + ' 步 · ' + elapsedSec + 's）…';
     fireProgress(stepLabel, false);
     try { tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {}); } catch (e) {}
 
-    const sendMessages = trimAgentMessages(messages, loopStartIdx, ctxBudget);
+    const sendMessages = withStepBudgetHint(
+      trimAgentMessages(messages, loopStartIdx, ctxBudget), step, maxSteps);
     const cfg = buildAIRequest(env, targetModelId, sendMessages, useUpstreamStream, tools);
     if (cfg.error) return { error: cfg.error };
 
@@ -249,16 +302,18 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       }
     }
 
-    // v7.2.0：单步内如果模型输出了完全重复的 tool_call，自动去重合并（保留首个 id，其余直接复用结果）
     const stepSig = toolCalls.map(toolCallSignature).sort().join(';;');
     callSigHistory.push(stepSig);
+    if (toolCalls.length) sigCount.set(stepSig, (sigCount.get(stepSig) || 0) + 1);
 
-    // v7.2.0 快速收敛：连续 2 步发起一模一样的工具调用组合时，不再浪费第 3 步，直接进入 wrapUp 生成最终回答
-    if (callSigHistory.length >= 2 &&
-        callSigHistory[callSigHistory.length - 1] === stepSig &&
-        callSigHistory[callSigHistory.length - 2] === stepSig) {
+    // 空转熔断：连续 2 步完全相同的调用组合（原有）+ 本轮累计 3 次（新增，抓 A→B→A→B 式绕圈）
+    const consecutiveDup = callSigHistory.length >= 2
+      && callSigHistory[callSigHistory.length - 1] === stepSig
+      && callSigHistory[callSigHistory.length - 2] === stepSig;
+    const accumulatedDup = toolCalls.length > 0 && (sigCount.get(stepSig) || 0) >= 3;
+    if (consecutiveDup || accumulatedDup) {
       await rollbackStreamed(msg.forwarded);
-      const wrapEarly = await agentWrapUp(env, targetModelId, messages, loopStartIdx, ctxBudget, deadline, onDelta);
+      const wrapEarly = await agentWrapUp(env, targetModelId, messages, loopStartIdx, ctxBudget, deadline, onDelta, wrapReserveMs);
       if (wrapEarly && wrapEarly.text) return { text: wrapEarly.text, usedTools: true, streamed: !!wrapEarly.streamed };
       const prefix = stripDSMLBlocks(assistantText).trim();
       return { text: (prefix ? prefix + '\n\n' : '') + '（检测到重复调用同一工具，已停止以避免空转；请换个问法或补充信息后重试）', usedTools: true };
@@ -296,7 +351,11 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
     });
     fireProgress(stepLabel + '\n' + descs.join('\n'), true);
 
-    const toolResults = await Promise.all(toolCalls.map(async (tc) => {
+    // 预算感知：把本轮剩余时间折进单工具超时，最后时刻不再为一个工具空等
+    const remainBeforeTools = deadline - Date.now();
+    const toolTimeoutCap = Math.max(800, Math.min(limits.toolTimeoutMs, remainBeforeTools - 1500));
+
+    const toolResults = await mapLimit(toolCalls, limits.toolConcurrency, async (tc) => {
       const fn = (tc && tc.function) || {};
       let args = {};
       try { args = JSON.parse(fn.arguments || '{}'); } catch (e) {}
@@ -313,10 +372,13 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
           ms: 0
         };
       }
+      if (remainBeforeTools < 2000) {
+        return { tc, result: '剩余时间不足，已跳过本次工具调用；请直接基于已有信息作答', failed: true, ms: 0 };
+      }
       const t0 = Date.now();
-      const result = await execAgentTool(fn.name, args, env, chatId, kbReadOnly);
+      const result = await execAgentTool(fn.name, args, env, chatId, kbReadOnly, { timeoutMs: toolTimeoutCap });
       const ms = Math.max(1, Date.now() - t0);
-      const failed = isToolResultFailure(result);
+      const failed = isToolFailureResult(result);
       const truncated = truncateToolResult(result, 4000);
       if (isReadOnlyTool && !failed) {
         turnToolMemo.set(sig, {
@@ -325,7 +387,8 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
         });
       }
       return { tc, result: truncated, failed, ms };
-    }));
+    });
+
     let stepFailed = 0;
     for (const tr of toolResults) {
       const fn = (tr.tc && tr.tc.function) || {};
@@ -338,30 +401,31 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       if (tr.failed) stepFailed += 1;
     }
     if (toolResults.length && stepFailed === toolResults.length) toolFailStreak += 1;
-    else toolFailStreak = 0;
-    if (toolFailStreak >= 2) {
+    else { toolFailStreak = 0; failStreakNotified = false; }
+
+    // 连续两轮全失败才提醒，且整轮只提醒一次（旧版每步都插一条，白烧上下文）
+    if (toolFailStreak >= 2 && !failStreakNotified) {
+      failStreakNotified = true;
+      const failedNames = toolResults
+        .filter(tr => tr.failed)
+        .map(tr => (tr.tc && tr.tc.function && tr.tc.function.name) || 'tool')
+        .filter((v, i, a) => a.indexOf(v) === i)
+        .join('、');
       messages.push({
         role: 'user',
-        content: '【系统提示】最近的工具调用连续失败。请换关键词、换工具或换思路；若已无法取得更多信息，请基于已有结果直接给出最终答案，并明确说明哪些信息没查到。不要再用相同参数重复调用。'
+        content: '【系统提示】最近两轮工具调用全部失败（' + failedNames + '）。请换关键词、换工具或换思路；若已无法取得更多信息，请基于已有结果直接给出最终答案，并明确说明哪些信息没查到。不要再用相同参数重复调用。'
       });
     }
   }
   } finally {
     clearInterval(heartbeat);
   }
-  const wrapUp = await agentWrapUp(env, targetModelId, messages, loopStartIdx, ctxBudget, deadline, onDelta);
+
+  const wrapUp = await agentWrapUp(env, targetModelId, messages, loopStartIdx, ctxBudget, deadline, onDelta, wrapReserveMs);
   if (wrapUp && wrapUp.text) return { text: wrapUp.text, usedTools: true, streamed: !!wrapUp.streamed };
   const t = stripDSMLBlocks(lastAssistantText());
-  if (resumeKey) {
-    const saved = await agentSaveResumeState(env, chatId, {
-      v: 1, savedAt: Date.now(), chatId, targetModelId, allowTools,
-      messages: trimAgentMessages(messages, loopStartIdx, ctxBudget),
-      loopStartIdx: loopStartIdx,
-      origUserText: origUserText || ''
-    });
-    if (saved) {
-      return { text: '⏸️ 推理步数已用尽，进度已保存，发送「继续」让我接着做。' + (t ? '\n\n已产出：\n' + t : ''), usedTools: true, paused: true };
-    }
+  if (await persistState()) {
+    return { text: '⏸️ 推理步数已用尽，进度已保存，发送「继续」让我接着做。' + (t ? '\n\n已产出：\n' + t : ''), usedTools: true, paused: true };
   }
   return { text: t || '（思考步数已用尽，请换个问法重试）', usedTools: true };
 }
