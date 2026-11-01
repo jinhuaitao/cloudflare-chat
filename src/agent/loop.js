@@ -16,14 +16,13 @@ import { getAgentTools, execAgentTool } from './tools.js';
 import { agentGetMemories } from './memory.js';
 import { buildAgentSystemPrompt } from './prompt.js';
 import { kbGetRegistry } from '../kb/registry.js';
-import { kbPreRetrieve } from '../kb/search.js';
 
-const WRITE_TOOLS_SET = new Set(['remember', 'forget_memory', 'save_doc', 'delete_doc', 'kb_ingest']);
+const WRITE_TOOLS_SET = new Set(['remember', 'forget_memory', 'save_doc', 'delete_doc']);
 
 // 工具结果是否算失败。只认工具层自己的固定前缀
 function isToolResultFailure(result) {
   const s = String(result == null ? '' : result);
-  return /^(搜索失败|搜索请求失败|搜索「[^」]*」无结果|抓取失败|网页抓取失败|URL 非法|该地址禁止抓取|不支持抓取|计算失败|计算结果非法|时区无效|天气查询失败|找不到城市|汇率查询失败|维基百科查询失败|维基百科未找到|维基百科查询关键词为空|GitHub 查询失败|GitHub 未找到|arXiv 查询失败|arXiv 未找到|Hacker News 查询失败|网络诊断失败|网络诊断拒绝|IP 归属查询失败|单位换算失败|关键词为空|工具执行失败|工具 [^ ]+ 执行超时|未知工具|R2 未绑定|知识库文档写入|知识库中没有检索到|该网页没有可提取|记忆写入|内容为空|标题为空|城市名为空|表达式为空|表达式含非法字符)/.test(s);
+  return /^(搜索失败|搜索请求失败|搜索「[^」]*」无结果|抓取失败|URL 非法|该地址禁止抓取|不支持抓取|计算失败|计算结果非法|时区无效|天气查询失败|找不到城市|汇率查询失败|维基百科查询失败|维基百科未找到|维基百科查询关键词为空|GitHub 查询失败|GitHub 未找到|arXiv 查询失败|arXiv 未找到|Hacker News 查询失败|网络诊断失败|网络诊断拒绝|IP 归属查询失败|单位换算失败|关键词为空|工具执行失败|工具 [^ ]+ 执行超时|未知工具|R2 未绑定|知识库文档写入|记忆写入|内容为空|标题为空|城市名为空|表达式为空|表达式含非法字符)/.test(s);
 }
 
 // 步数用尽或检测到重复空转后的无工具收尾：不再提供 tools，强制模型把已有结果收成最终答案。
@@ -76,15 +75,13 @@ function extractMsgPlainText(content) {
 async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTools, onProgress, opts) {
   const query = history.length ? extractMsgPlainText(history[history.length - 1].content) : '';
   const kbReadOnly = !!(opts && opts.kbReadOnly);
-  // 并发加载长期记忆、知识库注册表，并（v7.5.0）在回答前自动做一次知识库预检索：
-  // 命中时把最相关原文片段直接注入系统提示词，模型第一步就有据可依，省掉一次工具往返。
-  const [memories, kbDocs, kbContext] = await Promise.all([
+  // 并发加载长期记忆与知识库文档注册表
+  const [memories, kbDocs] = await Promise.all([
     kbReadOnly ? Promise.resolve([]) : agentGetMemories(env, chatId),
-    kbGetRegistry(env).catch(() => null),
-    allowTools ? kbPreRetrieve(env, query).catch(() => '') : Promise.resolve('')
+    kbGetRegistry(env).catch(() => null)
   ]);
   const hasKbDocs = Array.isArray(kbDocs) ? kbDocs.length > 0 : undefined;
-  const systemPrompt = buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly, kbContext);
+  const systemPrompt = buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly);
   const tools = allowTools ? getAgentTools(kbReadOnly, { hasKbDocs }) : null;
   const messages = [{ role: 'system', content: systemPrompt }];
   for (const m of history) messages.push({ role: m.role, content: m.content });

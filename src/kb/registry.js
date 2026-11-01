@@ -11,9 +11,6 @@ import { KB_PREFIX } from '../store/kb.js';
 // 避免 Web 端每轮对话及同轮多次工具调用反复读取 R2。
 const KB_DOCS_PREFIX = KB_PREFIX + 'docs/';
 const KB_REGISTRY_KEY = KB_DOCS_PREFIX + 'registry.json';
-// v7.5.0：分块检索索引（kb/docs/_index.json）与注册表同级存放，
-// 但两者都不是"文档"，扫描/重建时必须显式排除，否则会被当成一篇空文档。
-const KB_INDEX_KEY = KB_DOCS_PREFIX + '_index.json';
 const KB_REG_CACHE_TTL_MS = 30 * 1000;
 
 let cachedRegistry = null;
@@ -61,7 +58,7 @@ async function kbListDocObjects(env) {
     do {
       const listed = await env.R2.list({ prefix: KB_DOCS_PREFIX, limit: 1000, cursor: cursor });
       for (const o of (listed.objects || [])) {
-        if (o.key !== KB_REGISTRY_KEY && o.key !== KB_INDEX_KEY) objs.push(o);
+        if (o.key !== KB_REGISTRY_KEY) objs.push(o);
       }
       cursor = listed.truncated ? listed.cursor : undefined;
     } while (cursor);
@@ -153,7 +150,6 @@ function kbFmtDate(d) {
 export {
   KB_DOCS_PREFIX,
   KB_REGISTRY_KEY,
-  KB_INDEX_KEY,
   kbDocSlug,
   kbNormSource,
   kbDocTitleOf,

@@ -13,8 +13,8 @@ function memoryTokens(s) {
   return out;
 }
 
-// 构建 Agent 系统提示词（v7.5.0：新增知识库自动检索上下文注入与 kb_search 检索优先准则）。
-function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly, kbContext) {
+// 构建 Agent 系统提示词（v7.2.0 强调并行调用与一步到位批量参数，减少不必要的多轮往返）。
+function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly) {
   const now = new Date();
   let timeStr = '';
   try {
@@ -22,27 +22,21 @@ function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly, kbContext) 
   } catch (e) { timeStr = now.toISOString(); }
   const kbList = Array.isArray(kbDocs) ? kbDocs.filter(e => e && (e.title || e.file)) : [];
   const hasKb = kbList.length > 0;
-  const kbCtx = String(kbContext || '').trim();
-  const hasKbCtx = kbCtx.length > 0;
   let p = '你是 Cloudflare-Chat 智能助手，一个具备高效自主规划、并行工具调用和知识库检索能力的 AI Agent。\n';
   p += '当前时间：' + timeStr + '（北京时间）。\n\n';
   const kbToolClause = hasKb
-    ? (hasKbCtx
-      ? '知识库：下方【知识库自动检索结果】已给出与本次提问最相关的原文片段，直接据此作答并注明"据知识库文档《xxx》"；片段不足时用 kb_search 换关键词再检索，需要完整上下文时用 read_doc 传文档标题与 offset 精读'
-      : '问题涉及知识库 → 首选 kb_search 做分块检索（返回最相关原文片段与字符偏移，一步拿到证据）；需要整篇上下文时 read_doc 传标题与 offset 精读；标题对不上时 read_doc 会自动搜正文。引用时注明"据知识库文档《xxx》"')
+    ? '问题涉及知识库文档 → 直接 read_doc 读相关文档（标题列表已在下方【知识库文档列表】给出，无需先 list_docs；超长文档可传 offset 零延迟翻页；标题对不上时 read_doc 会自动用多关键词搜全库正文），内容优先引用并注明"据知识库文档《xxx》"'
     : (kbReadOnly && Array.isArray(kbDocs)
       ? ''
-      : '用户问题可能涉及知识库主题 → 先 kb_search 检索，无命中再 list_docs 看标题；引用时注明"据知识库文档《xxx》"');
+      : '用户问题可能涉及知识库文档主题 → 先 list_docs 看标题，有相关再 read_doc 细读（支持 offset 分页续读与多关键词搜正文），文档内容优先引用并注明"据知识库文档《xxx》"');
   const commonToolsGuide = '需要实时信息/新闻 → web_search（已默认开启 deep_read 自动预读前2条正文速览，通常搜完1步即可直接作答，仅当速览不够时才对特定链接调 web_fetch）；读网页正文 → web_fetch（支持逗号分隔最多3个URL一次并发抓取）；查百科概念/人物 → wiki_lookup；查 GitHub 仓库/Release/README → github_lookup；查前沿学术论文 → arxiv_search；看 Hacker News 热榜或技术讨论 → hn_top；查法币汇率或加密货币行情 → exchange_rate（支持逗号分隔多币种如 "USD,JPY,BTC" 一次换算）；查域名 DNS 或公网 IP 归属 → net_lookup；数学/科学计算 → calculate（支持用分号 ; 分隔多条表达式一次算完）；单位换算、SHA哈希、Base64/URL编解码、UUID、字数与Token统计 → toolkit；查天气 → get_weather（支持逗号分隔多城市如 "北京,上海,东京" 一次查完）；查时间或推算日期差/加减天数 → get_time' + (kbToolClause ? '；' + kbToolClause : '');
   p += '【高效工作准则】\n'
     + (hasKb
-      ? (hasKbCtx
-        ? '1. 意图判断：纯闲聊、简单问候——直接回答；其余问题先看下方【知识库自动检索结果】：与提问相关 → 直接以其中的原文为依据作答，不必再调工具；明显不相关 → 按稳定知识直接回答或改用联网工具。工具是稀缺资源，能不用就不用。\n'
-        : '1. 意图判断：纯闲聊、简单问候——直接回答；其余问题先对照下方【知识库文档列表】：可能相关 → 先用 kb_search 定位原文再作答；无关且属于稳定知识 → 直接回答。工具是稀缺资源，能不用就不用。\n')
+      ? '1. 意图判断：纯闲聊、简单问候——直接回答；其余问题先对照下方【知识库文档列表】：与某篇文档相关 → 必须 read_doc 读原文后以其内容作答；无关且属于稳定知识 → 直接回答。工具是稀缺资源，能不用就不用。\n'
       : '1. 意图判断：闲聊、简单问答、你知识范围内的稳定知识——直接回答，绝不调用工具。工具是稀缺资源，能不用就不用。\n')
     + (kbReadOnly
-      ? '2. 工具选择：' + commonToolsGuide + '。注意：知识库在本端只读，没有"记住 / 忘掉记忆 / 保存文档 / 删除文档 / 网页入库"类工具；用户提出这类请求时，如实说明该操作仅在 Telegram 或微信 ClawBot 机器人端支持，绝不假装已记住或已保存。\n'
-      : '2. 工具选择：' + commonToolsGuide + '；用户明确告知的长期事实 → remember（同主题改口直接记新值，旧记忆自动覆盖）；用户明确要求忘掉记忆 → forget_memory；用户明确要求把长内容存成文档 → save_doc；用户明确要求把某个网页/链接存进知识库 → kb_ingest；用户明确要求删除文档 → delete_doc。\n')
+      ? '2. 工具选择：' + commonToolsGuide + '。注意：知识库在本端只读，没有"记住 / 忘掉记忆 / 保存文档 / 删除文档"类工具；用户提出这类请求时，如实说明该操作仅在 Telegram 或微信 ClawBot 机器人端支持，绝不假装已记住或已保存。\n'
+      : '2. 工具选择：' + commonToolsGuide + '；用户明确告知的长期事实 → remember（同主题改口直接记新值，旧记忆自动覆盖）；用户明确要求忘掉记忆 → forget_memory；用户明确要求把长内容存成文档 → save_doc；用户明确要求删除文档 → delete_doc。\n')
     + '3. 一步到位与并行优先：凡是无前后依赖的多个查询（如同时查多个工具、多城市天气、多币种汇率、多条数学算式、多篇网页），必须在同一轮步数内【并行发起多个 tool_calls】或【使用逗号/分号批量参数一次调用】，尽量在 1~2 步内拿到全部信息并给出最终回答。\n'
     + '4. 诚实与精炼：工具没给的信息绝不编造；搜索返回的正文速览已足够回答时，直接总结作答，不要再重复抓取同一链接。\n'
     + '5. 语言与含糊处理：默认用中文回答（用户用其他语言时跟随）；问题缺少关键参数（如查天气未给城市）时一句话追问，不要盲猜。\n'
@@ -63,12 +57,9 @@ function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly, kbContext) 
       budget -= line.length;
     }
     p += '【知识库文档列表】（共' + kbList.length + '篇' + (shown.length < kbList.length ? '，列出前' + shown.length + '篇，其余可 list_docs 查看' : '') + '）\n'
-      + (hasKbCtx
-        ? '下方【知识库自动检索结果】已按相关度给出本次提问的原文片段，优先据此作答并注明"据知识库文档《标题》"；列表仅用于判断还有哪些文档可查。知识库内容优先于训练知识与网络搜索，两者冲突时以知识库为准（用户明确要求最新信息时除外）。\n'
-        : '回答问题前先核对此列表：问题与任一文档相关 → 先用 kb_search 定位原文（或 read_doc 精读），以其内容为准作答，并注明"据知识库文档《标题》"；知识库内容优先于你的训练知识和网络搜索，两者冲突时以知识库为准（用户明确要求最新信息时除外）。列表中没有相关文档时才走常规流程（稳定知识直接答，需要实时信息再调用对应工具）。\n')
+      + '回答问题前先核对此列表：问题与任一文档相关 → 必须 read_doc 读原文后以其内容为准作答，并注明"据知识库文档《标题》"；知识库内容优先于你的训练知识和网络搜索，两者冲突时以知识库为准（用户明确要求最新信息时除外）。列表中没有相关文档时才走常规流程（稳定知识直接答，需要实时信息再调用对应工具）。\n'
       + shown.join('\n') + '\n\n';
   }
-  if (hasKbCtx) p += kbCtx + '\n';
   if (memories.length) {
     const qTokens = memoryTokens(query);
     const scored = memories.map((m) => {
@@ -95,10 +86,7 @@ function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly, kbContext) 
     + (kbReadOnly
       ? '- 知识库只读：本端没有记忆与文档的写入/删除工具，"记住某事 / 忘掉某事 / 保存文档 / 删除文档"的请求一律如实引导用户通过 Telegram 或微信 ClawBot 机器人完成；没有工具成功返回，就绝不声称"已记住/已保存/已删除"。\n'
       : '- remember 只用于用户明确要求记住的长期事实，forget_memory 只用于用户明确要求删除的记忆。\n'
-        + '- save_doc / kb_ingest 是写入知识库文档的唯一途径（kb_ingest 内部同样落到 save_doc）：只有它们返回成功，才可以告诉用户"已保存/已入库"；没有调用成功就不许声称。长文档用 save_doc，不要用 remember 硬塞。\n')
-    + (hasKbCtx
-      ? '- 【知识库自动检索结果】是系统在知识库原文中定位到的片段：可直接引用并注明"据知识库文档《标题》"，不要说成来自网络搜索；片段与问题无关时忽略它，按正常流程回答。\n'
-      : '')
+        + '- save_doc 是唯一能写知识库文档的途径：只有它返回成功，才可以告诉用户"已保存/已生成文档"；没有调用成功就不许声称。长文档用 save_doc，不要用 remember 硬塞。\n')
     + (hasKb
       ? '- 知识库优先：read_doc 读到的文档内容优先于通用知识和网络搜索结果，两者冲突时以知识库为准（用户明确要求最新信息时除外）；引用时注明"据知识库文档《标题》"。\n'
       : '- 知识库优先：read_doc 读到的文档内容优先于通用知识和训练记忆引用，引用时注明"据知识库文档《标题》"。\n')

@@ -6,7 +6,7 @@ import {
   toolGithubLookup, toolArxivSearch, toolHnTop, toolNetLookup, toolToolkit
 } from './tools-local.js';
 import { agentSaveMemory, agentForgetMemory } from './memory.js';
-import { toolSaveDoc, toolListDocs, toolReadDoc, toolDeleteDoc, toolKbSearch, toolKbIngest } from '../kb/doc-tools.js';
+import { toolSaveDoc, toolListDocs, toolReadDoc, toolDeleteDoc } from '../kb/doc-tools.js';
 
 // ==================== Agent 工具定义 ====================
 // v7.2.0 性能优化：
@@ -252,40 +252,9 @@ function getAgentTools(kbReadOnly, opts) {
     {
       type: 'function',
       function: {
-        name: 'kb_search',
-        description: '知识库检索（分块定位，首选）：按相关度返回最相关的原文片段、所在文档标题与字符偏移，一步拿到证据，比逐篇 read_doc 更快。找知识库里的具体内容时优先用它。',
-        parameters: {
-          type: 'object',
-          properties: {
-            query: { type: 'string', description: '检索词（可多关键词，用空格分隔）' },
-            top_k: { type: 'integer', description: '可选：返回片段数 1-10，默认 6' },
-            doc: { type: 'string', description: '可选：只在标题包含该词的文档内检索' }
-          },
-          required: ['query']
-        }
-      }
-    },
-    {
-      type: 'function',
-      function: {
         name: 'list_docs',
-        description: '列出知识库所有文档标题（含规模统计）。仅需了解"有哪些文档"时用；找具体内容请用 kb_search。',
+        description: '列出知识库所有文档标题。',
         parameters: { type: 'object', properties: {} }
-      }
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'kb_ingest',
-        description: '把网页正文抓取并保存为知识库文档（自动去重、自动建索引）。仅在用户明确要求把某个链接/网页存入知识库时调用。',
-        parameters: {
-          type: 'object',
-          properties: {
-            url: { type: 'string', description: '要入库的 http(s) 链接' },
-            title: { type: 'string', description: '可选：文档标题（默认取域名）' }
-          },
-          required: ['url']
-        }
       }
     },
     {
@@ -320,18 +289,18 @@ function getAgentTools(kbReadOnly, opts) {
   ];
   let filtered = tools;
   if (kbReadOnly) {
-    const writes = ['remember', 'forget_memory', 'save_doc', 'delete_doc', 'kb_ingest'];
+    const writes = ['remember', 'forget_memory', 'save_doc', 'delete_doc'];
     filtered = filtered.filter(t => writes.indexOf(t.function.name) === -1);
   }
   if (opts && opts.hasKbDocs === false) {
-    filtered = filtered.filter(t => t.function.name !== 'list_docs' && t.function.name !== 'read_doc' && t.function.name !== 'kb_search');
+    filtered = filtered.filter(t => t.function.name !== 'list_docs' && t.function.name !== 'read_doc');
   }
   return filtered;
 }
 
 async function execAgentTool(name, args, env, chatId, kbReadOnly) {
   args = args || {};
-  if (kbReadOnly && (name === 'remember' || name === 'forget_memory' || name === 'save_doc' || name === 'delete_doc' || name === 'kb_ingest')) {
+  if (kbReadOnly && (name === 'remember' || name === 'forget_memory' || name === 'save_doc' || name === 'delete_doc')) {
     return '工具 ' + name + ' 在本端不可用：知识库为只读，写入与删除（记忆 / 文档保存与删除）仅 Telegram 或微信 ClawBot 机器人端支持。请如实告知用户，并引导其通过 Telegram 或微信 ClawBot 机器人完成该操作；不要声称已完成。';
   }
   let toolTimeoutMs = parseInt(env.AGENT_TOOL_TIMEOUT_MS || '30000', 10);
@@ -363,8 +332,6 @@ async function execAgentTool(name, args, env, chatId, kbReadOnly) {
             : '未找到包含「' + kw + '」的长期记忆';
         }
         case 'save_doc': return await toolSaveDoc(env, chatId, args);
-        case 'kb_search': return await toolKbSearch(env, args);
-        case 'kb_ingest': return await toolKbIngest(env, chatId, args);
         case 'list_docs': return await toolListDocs(env);
         case 'read_doc': return await toolReadDoc(env, args);
         case 'delete_doc': return await toolDeleteDoc(env, args);
