@@ -1,11 +1,11 @@
 {
   "name": "cloudflare-chat",
-  "version": "7.9.0",
+  "version": "7.9.1",
   "private": true,
   "type": "module",
   "description": "Cloudflare Worker 上的多通道 AI 对话前端 + Telegram & 微信 ClawBot (iLink) 机器人（支持 18 项零密钥 Agent 工具 + R2 知识库）",
   "scripts": {
-    "test": "node --test test/agent.test.mjs test/loop.test.mjs test/upstream.test.mjs test/kb.test.mjs test/perf.test.mjs test/history.test.mjs",
+    "test": "node --test test/agent.test.mjs test/loop.test.mjs test/upstream.test.mjs test/kb.test.mjs test/perf.test.mjs test/history.test.mjs test/weather.test.mjs",
     "deploy": "wrangler deploy"
   },
   "devDependencies": {

@@ -241,7 +241,7 @@ const TOOL_DEFS = [
     type: 'function',
     function: {
       name: 'get_weather',
-      description: '城市当前天气与未来三天预报，逗号分隔可多城市并发。',
+      description: '城市当前天气与未来三天预报，逗号分隔可多城市并发。返回值已是排好版的卡片，原样呈现，不要重排或改写。',
       parameters: {
         type: 'object',
         properties: {

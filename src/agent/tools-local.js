@@ -309,6 +309,173 @@ async function fetchText(url, timeoutMs, headers) {
   } finally { clearTimeout(timer); }
 }
 
+// ==================== 天气卡片（v7.9.1 固定排版） ====================
+// 目标：天气类回答有统一、好看的固定版式，三个端（Web / Telegram / 微信）都能正常显示。
+// 因此只用「纯文本 + emoji + 分隔线」，不用 Markdown 表格与 `**`（微信端会原样显示符号），
+// 也不用空格对齐（各端字体宽度不同，对不齐反而更乱）。
+const WMO_META = {
+  0: { day: '☀️', night: '🌙', text: '晴' },
+  1: { day: '🌤️', night: '🌙', text: '大致晴' },
+  2: { day: '⛅', night: '☁️', text: '多云' },
+  3: { day: '☁️', night: '☁️', text: '阴' },
+  45: { day: '🌫️', night: '🌫️', text: '雾' },
+  48: { day: '🌫️', night: '🌫️', text: '雾凇' },
+  51: { day: '🌦️', night: '🌦️', text: '毛毛雨' },
+  53: { day: '🌦️', night: '🌦️', text: '毛毛雨' },
+  55: { day: '🌧️', night: '🌧️', text: '小雨' },
+  56: { day: '🌧️', night: '🌧️', text: '冻毛毛雨' },
+  57: { day: '🌧️', night: '🌧️', text: '强冻毛毛雨' },
+  61: { day: '🌦️', night: '🌦️', text: '小雨' },
+  63: { day: '🌧️', night: '🌧️', text: '中雨' },
+  65: { day: '🌧️', night: '🌧️', text: '大雨' },
+  66: { day: '🌧️', night: '🌧️', text: '冻雨' },
+  67: { day: '🌧️', night: '🌧️', text: '强冻雨' },
+  71: { day: '🌨️', night: '🌨️', text: '小雪' },
+  73: { day: '🌨️', night: '🌨️', text: '中雪' },
+  75: { day: '❄️', night: '❄️', text: '大雪' },
+  77: { day: '🌨️', night: '🌨️', text: '雪粒' },
+  80: { day: '🌦️', night: '🌦️', text: '小阵雨' },
+  81: { day: '🌧️', night: '🌧️', text: '阵雨' },
+  82: { day: '⛈️', night: '⛈️', text: '强阵雨' },
+  85: { day: '🌨️', night: '🌨️', text: '小阵雪' },
+  86: { day: '🌨️', night: '🌨️', text: '大阵雪' },
+  95: { day: '⛈️', night: '⛈️', text: '雷阵雨' },
+  96: { day: '⛈️', night: '⛈️', text: '雷阵雨伴冰雹' },
+  99: { day: '⛈️', night: '⛈️', text: '强雷暴伴冰雹' },
+};
+
+const WIND_DIR_NAMES = ['北', '东北', '东', '东南', '南', '西南', '西', '西北'];
+const WEEKDAY_NAMES = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+const WEATHER_RULE = '━━━━━━━━━━━━━━';
+// 降雪类天气码：降水图标与出行提示要换成雪的口径（「带伞」在雪天不通）
+const SNOW_CODES = new Set([71, 73, 75, 77, 85, 86]);
+
+function isSnowCode(code) {
+  return SNOW_CODES.has(code);
+}
+
+function weatherIcon(code, isDay) {
+  const m = WMO_META[code];
+  if (!m) return '🌡️';
+  return isDay === 0 ? m.night : m.day;
+}
+
+function weatherText(code) {
+  const m = WMO_META[code];
+  return m ? m.text : '未知天气';
+}
+
+function windDirName(deg) {
+  if (typeof deg !== 'number' || !isFinite(deg)) return '';
+  const idx = Math.round((((deg % 360) + 360) % 360) / 45) % 8;
+  return WIND_DIR_NAMES[idx] + '风';
+}
+
+// 日期标签：今天 / 明天 / 后天 + MM/DD + 星期
+function dayLabel(dateStr, idx) {
+  const s = String(dateStr || '');
+  const prefix = idx === 0 ? '今天' : (idx === 1 ? '明天' : (idx === 2 ? '后天' : ''));
+  let md = s.slice(5).replace('-', '/');
+  let wd = '';
+  const t = Date.parse(s + 'T00:00:00Z');
+  if (isFinite(t)) wd = WEEKDAY_NAMES[new Date(t).getUTCDay()] || '';
+  return [prefix, md, wd].filter(Boolean).join(' ');
+}
+
+// 依据当前与当日预报生成 1~2 条生活提示，避免空泛
+function weatherTips(cur, daily) {
+  const tips = [];
+  const hi = daily.temperature_2m_max ? daily.temperature_2m_max[0] : undefined;
+  const lo = daily.temperature_2m_min ? daily.temperature_2m_min[0] : undefined;
+  const pop = daily.precipitation_probability_max ? daily.precipitation_probability_max[0] : undefined;
+  const uv = daily.uv_index_max ? daily.uv_index_max[0] : undefined;
+  const now = cur.temperature_2m;
+  const snow = isSnowCode(cur.weather_code) ||
+    isSnowCode(daily.weather_code ? daily.weather_code[0] : undefined);
+
+  if (typeof pop === 'number' && pop >= 50) {
+    tips.push('降水概率 ' + Math.round(pop) + '%，' + (snow ? '出门注意保暖防滑' : '出门记得带伞'));
+  }
+  if (typeof hi === 'number' && typeof lo === 'number' && hi - lo >= 8) {
+    tips.push('昼夜温差 ' + Math.round(hi - lo) + '°，早晚添件外套');
+  }
+  if (typeof uv === 'number' && uv >= 6) tips.push('紫外线较强（UV ' + Math.round(uv) + '），注意防晒');
+  if (typeof now === 'number') {
+    if (now >= 32) tips.push('高温天气，注意补水防暑');
+    else if (now <= 0) tips.push('气温偏低，注意保暖防滑');
+  }
+  if (!tips.length) tips.push('天气平稳，出行无碍');
+  return tips.slice(0, 2);
+}
+
+// 生成固定版式的天气卡片
+function buildWeatherCard(loc, w) {
+  const c = (w && w.current) || {};
+  const d = (w && w.daily) || {};
+  const isDay = typeof c.is_day === 'number' ? c.is_day : 1;
+  const place = String(loc.name || '') + (loc.country ? ' · ' + loc.country : '');
+  const lines = [];
+
+  lines.push(weatherIcon(c.weather_code, isDay) + ' ' + place);
+  const upd = String(c.time || '').replace('T', ' ').slice(0, 16);
+  if (upd) lines.push('🕐 ' + upd + ' 更新');
+  lines.push(WEATHER_RULE);
+
+  // 当前实况：三个字段都缺时整行省略，避免出现「现在 未知天气」这种怪句子
+  const nowBits = [];
+  if (typeof c.temperature_2m === 'number') nowBits.push(Math.round(c.temperature_2m) + '°C');
+  if (c.weather_code !== undefined && c.weather_code !== null) nowBits.push(weatherText(c.weather_code));
+  if (typeof c.apparent_temperature === 'number') nowBits.push('体感 ' + Math.round(c.apparent_temperature) + '°C');
+  if (nowBits.length) lines.push('🌡️ 现在 ' + nowBits.join('　'));
+
+  const detail = [];
+  if (typeof c.relative_humidity_2m === 'number') detail.push('💧 湿度 ' + Math.round(c.relative_humidity_2m) + '%');
+  if (typeof c.wind_speed_10m === 'number') {
+    const wd = windDirName(c.wind_direction_10m);
+    detail.push('🌬️ ' + (wd ? wd + ' ' : '风速 ') + Math.round(c.wind_speed_10m) + ' km/h');
+  }
+  if (typeof c.precipitation === 'number' && c.precipitation > 0) {
+    detail.push((isSnowCode(c.weather_code) ? '❄️ 降水 ' : '🌧️ 降水 ') + c.precipitation + ' mm');
+  }
+  if (detail.length) lines.push(detail.join('　'));
+
+  // 紫外线 + 日出日落：合在一行，信息密度高又不挤
+  const astro = [];
+  const uvToday = d.uv_index_max ? d.uv_index_max[0] : undefined;
+  if (typeof uvToday === 'number') {
+    const lvl = uvToday < 3 ? '弱' : (uvToday < 6 ? '中等' : (uvToday < 8 ? '强' : (uvToday < 11 ? '很强' : '极强')));
+    astro.push('☀️ 紫外线 ' + Math.round(uvToday) + '（' + lvl + '）');
+  }
+  if (Array.isArray(d.sunrise) && d.sunrise[0]) astro.push('🌅 日出 ' + String(d.sunrise[0]).slice(11, 16));
+  if (Array.isArray(d.sunset) && d.sunset[0]) astro.push('🌇 日落 ' + String(d.sunset[0]).slice(11, 16));
+  if (astro.length) lines.push(astro.join('　'));
+
+  // 未来三天
+  if (Array.isArray(d.time) && d.time.length) {
+    lines.push('');
+    lines.push('📅 未来三天');
+    d.time.slice(0, 3).forEach((dt, i) => {
+      const code = d.weather_code ? d.weather_code[i] : undefined;
+      const lo = d.temperature_2m_min ? d.temperature_2m_min[i] : undefined;
+      const hi = d.temperature_2m_max ? d.temperature_2m_max[i] : undefined;
+      const pop = d.precipitation_probability_max ? d.precipitation_probability_max[i] : undefined;
+      let row = weatherIcon(code, 1) + ' ' + dayLabel(dt, i) + '　' + weatherText(code);
+      if (typeof lo === 'number' && typeof hi === 'number') {
+        row += '　' + Math.round(lo) + '° ~ ' + Math.round(hi) + '°';
+      }
+      if (typeof pop === 'number') row += '　降水 ' + Math.round(pop) + '%';
+      lines.push(row);
+    });
+  }
+
+  const tips = weatherTips(c, d);
+  if (tips.length) {
+    lines.push('');
+    lines.push('💡 ' + tips.join('；'));
+  }
+  return lines.join('\n');
+}
+
 async function querySingleCityWeather(city) {
   city = String(city || '').trim();
   if (!city) return '城市名为空';
@@ -325,13 +492,10 @@ async function querySingleCityWeather(city) {
       mapSetBounded(geoCoordCache, normKey, loc, 300);
     }
     const w = await fetchJson('https://api.open-meteo.com/v1/forecast?latitude=' + loc.latitude + '&longitude=' + loc.longitude +
-      '&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m' +
-      '&daily=temperature_2m_max,temperature_2m_min,weather_code&timezone=auto&forecast_days=3');
-    const wm = { 0: '晴', 1: '大致晴', 2: '多云', 3: '阴', 45: '雾', 48: '雾凇', 51: '毛毛雨', 53: '毛毛雨', 55: '毛毛雨', 61: '小雨', 63: '中雨', 65: '大雨', 71: '小雪', 73: '中雪', 75: '大雪', 80: '阵雨', 81: '阵雨', 82: '暴雨', 95: '雷阵雨' };
-    const c = w.current, d = w.daily;
-    let t = loc.name + '（' + (loc.country || '') + '）当前：' + (wm[c.weather_code] || '未知') +
-      '，' + c.temperature_2m + '°C，体感' + c.apparent_temperature + '°C，湿度' + c.relative_humidity_2m + '%，风速' + c.wind_speed_10m + 'km/h\n';
-    t += '未来三天预报：' + d.time.map((dt, i) => dt.slice(5) + ' ' + (wm[d.weather_code[i]] || '') + ' ' + d.temperature_2m_min[i] + '~' + d.temperature_2m_max[i] + '°C').join('；');
+      '&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,wind_direction_10m,is_day,precipitation' +
+      '&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,precipitation_probability_max,uv_index_max' +
+      '&timezone=auto&forecast_days=3');
+    const t = buildWeatherCard(loc, w);
     setCachedApi(cacheKey, t, 5 * 60 * 1000);
     return t;
   } catch (e) { return '天气查询失败: ' + e.message; }
@@ -929,4 +1093,11 @@ export {
   toolToolkit,
   jsonQueryPath,
   convertUnits,
+  buildWeatherCard,
+  weatherIcon,
+  weatherText,
+  windDirName,
+  dayLabel,
+  weatherTips,
+  isSnowCode,
 };

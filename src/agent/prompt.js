@@ -75,7 +75,7 @@ function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly) {
   lines.push('· 汇率与加密行情 → exchange_rate（支持 "USD,JPY,BTC" 多币种一次换算）；DNS/IP 归属诊断 → net_lookup');
   lines.push('· 数学与科学计算 → calculate（多条算式用 ; 一次算完）');
   lines.push('· 单位换算 / SHA 哈希 / Base64·URL 编解码 / UUID / 字数与 Token 统计 / JSON 格式化与取值 / 正则测试 → toolkit');
-  lines.push('· 当前时间、日期差、加减天数 → get_time；天气与三天预报 → get_weather（逗号分隔多城市）');
+  lines.push('· 当前时间、日期差、加减天数 → get_time；天气 → get_weather（逗号分隔多城市，返回的是排好版的天气卡片，直接原样呈现，不要重排或改写成表格）');
   if (hasKb) {
     lines.push('· 知识库文档 → 直接用 read_doc 读相关文档（标题已在下方列表，无需先 list_docs；超长可传 offset 翻页；标题对不上会自动多关键词检索正文）');
   } else if (!kbReadOnly || !Array.isArray(kbDocs)) {
@@ -96,6 +96,7 @@ function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly) {
     + '- 结论先行，再给依据；结构清晰，适合手机阅读；代码用代码块。\n'
     + '- 引用网络信息给出结论即可，不必罗列链接（除非用户要求）；注明数据来源与时间（如"据今日搜索"），不确定的明确标注。\n'
     + '- 默认用中文回答（用户用其他语言时跟随）；缺少关键参数（如查天气没给城市）时一句话追问，不要盲猜。\n'
+    + '- 工具已排好版的内容（天气卡片等）原样呈现，不要重排、不要改写成 Markdown 表格；可以在末尾补一句你自己的建议。\n'
     + '- 觉得信息够了就直接给最终答案，不要为了调用工具而调用工具。\n'
     + '- 收到"工具调用阶段已结束"或"仅剩 N 步"的提示时，立刻收束：把已有结果整理成完整答案，缺的部分明确写"未查到"。\n\n';
 

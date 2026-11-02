@@ -18,6 +18,10 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
+// 7.9.1：天气播报固定版式（版式由工具侧生成、模型只负责原样转述，避免每轮措辞漂移；
+//        卡片含地点/更新时间/分隔线、实况三行（温度体感、湿度风向降水、紫外线日出日落）、
+//        未来三天每日一行（日期标签+星期+天气+温区+降水概率）、最多两条生活提示；
+//        纯文本 + emoji + 制表符缩进，不用 Markdown 表格与粗体，兼容微信纯文本渲染）。
 // 7.9.0：Agent 输入边界与容错（外部历史清洗防 prompt 注入 / 非法序列 / 超量、
 //        上游空响应自动重试一次、tool_call id 缺失自动补齐、分页工具感知输出预算、
 //        批量抓取 + offset 明确拒绝、暂停/超时附已查到的信息摘要、
@@ -32,7 +36,7 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 //        断点起点修正、流式读取不阻塞、抓取失败语义统一）。
 // 7.5.0：Agent 内核加固（工具并发闸门、预算感知超时、步数感知收束、双保险空转熔断、
 //        历史轮次压缩）+ 工具箱新增 JSON/正则动作 + 全量回归测试。
-const APP_VERSION = '7.9.0';
+const APP_VERSION = '7.9.1';
 const PNG_HEADERS = {
   'Content-Type': 'image/png',
   'Cache-Control': 'public, max-age=86400',
