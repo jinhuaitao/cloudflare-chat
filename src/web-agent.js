@@ -37,16 +37,35 @@ async function handleWebAgent(env, body) {
       const ka = setInterval(() => {
         try { controller.enqueue(encoder.encode(': keep-alive ' + Date.now() + '\n\n')); } catch (e) {}
       }, 15000);
+      // v7.8.0：正文增量批量下发。
+      // 旧版每个 token 都单独 enqueue 一个 SSE 事件，2000 字回答就是 2000 个包 + 2000 次
+      // JSON.stringify / UTF-8 编码 / 浏览器解析，手机端会明显掉帧。
+      // 现在按「160 字符 或 60ms」聚合，首字仍然立即发出，后续合批推送，前端观感不变但开销降一个量级。
+      let bufContent = '';
+      let bufReasoning = '';
+      let lastFlushAt = 0;
+      let sentAnyDelta = false;
+      const flushDelta = (force) => {
+        if (!bufContent && !bufReasoning) return;
+        const now = Date.now();
+        const size = bufContent.length + bufReasoning.length;
+        if (!force && sentAnyDelta && size < 160 && now - lastFlushAt < 60) return;
+        if (bufReasoning) { send({ choices: [{ delta: { reasoning_content: bufReasoning } }] }); bufReasoning = ''; }
+        if (bufContent) { send({ choices: [{ delta: { content: bufContent } }] }); bufContent = ''; }
+        lastFlushAt = now;
+        sentAnyDelta = true;
+      };
       const webOpts = {
         maxRuntimeMs: webBudgetMs,
         // v6.9.3：Web 端对知识库只读——写入（remember / save_doc / delete_doc）
         // 仅 Telegram / 微信端开放，Web 访客无法污染全局知识库
         kbReadOnly: true,
         onDelta: async (text, kind) => {
-          if (kind === 'reasoning') send({ choices: [{ delta: { reasoning_content: text } }] });
-          else send({ choices: [{ delta: { content: text } }] });
+          if (kind === 'reasoning') bufReasoning += text;
+          else bufContent += text;
+          flushDelta(false);
         },
-        onReset: async () => { send({ agent_reset: true }); }
+        onReset: async () => { bufContent = ''; bufReasoning = ''; send({ agent_reset: true }); }
       };
       try {
         const onProgress = async (text) => { send({ agent_progress: String(text).slice(0, 500) }); };
@@ -78,6 +97,8 @@ async function handleWebAgent(env, body) {
         send({ agent_error: '⚠️ Agent 执行出错：' + (e && e.message ? e.message : String(e)) });
       } finally {
         clearInterval(ka);
+        // 把最后不足一批的残留推完，否则回答结尾会少几个字
+        try { flushDelta(true); } catch (e) {}
       }
       done();
     }

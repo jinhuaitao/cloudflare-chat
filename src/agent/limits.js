@@ -68,7 +68,18 @@ function describeToolCall(name, args) {
   }
 }
 
+// 单步工具输出的字符上限分摊（v7.8.0）
+// 模型一步可能吐出 6~8 个 tool_calls，若每个都按 4000 字符回灌，一步就把上下文顶满，
+// 下一步必然触发全量压缩：前缀缓存失效 + 早期结果被折叠成摘要，等于白跑一步。
+// 这里先扣掉 system 提示与历史对话的固定开销，再把剩余预算按工具数均分。
+function toolResultCap(ctxBudget, toolCount) {
+  const budget = Math.max(1600, (ctxBudget > 0 ? ctxBudget : 24000) - 8000);
+  const n = Math.max(1, toolCount | 0);
+  return Math.max(800, Math.min(4000, Math.floor(budget / n)));
+}
+
 export {
   agentLimits,
   describeToolCall,
+  toolResultCap,
 };

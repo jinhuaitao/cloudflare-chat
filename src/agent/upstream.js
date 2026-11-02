@@ -25,6 +25,7 @@ async function readUpstreamMessage(resp, onDelta) {
   const toolMap = new Map(); // 按 index 合并流式 tool_calls 分片
   let sawSSE = false;
   let sawToolCalls = false;  // 一旦出现工具调用（含 DSML 标记），这一步的后续正文不再外发
+  let dsmlScanFrom = 0;      // DSML 标记的增量扫描位置（旧版每个分片都重扫全文，长回复是 O(n²)）
   let emitChain = Promise.resolve();
 
   const emit = (text, kind) => {
@@ -73,9 +74,13 @@ async function readUpstreamMessage(resp, onDelta) {
     }
     if (d.content) {
       content += d.content;
-      // 一旦流式正文中开始出现 <｜DSML｜ 标记，立即阻断后续内容向前端透传
-      if (!sawToolCalls && content.indexOf('DSML') !== -1 && /<\s*[|｜]\s*DSML/i.test(content)) {
-        sawToolCalls = true;
+      // 一旦流式正文中开始出现 <｜DSML｜ 标记，立即阻断后续内容向前端透传。
+      // 只扫「新增片段 + 20 字符重叠窗口」：标记可能被切在两个分片之间，
+      // 但窗口足够覆盖，无需每次重扫整段累积正文。
+      if (!sawToolCalls) {
+        const from = dsmlScanFrom > 20 ? dsmlScanFrom - 20 : 0;
+        if (/<\s*[|｜]\s*DSML/i.test(content.slice(from))) sawToolCalls = true;
+        dsmlScanFrom = content.length;
       }
       if (!sawToolCalls) emit(d.content, 'content');
     }
