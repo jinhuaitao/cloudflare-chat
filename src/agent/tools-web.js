@@ -344,16 +344,18 @@ async function toolWebSearch(query, count, deepRead) {
   }
 }
 
-async function toolWebFetch(url, offset) {
+async function toolWebFetch(url, offset, maxChars) {
   const rawInput = String(url || '').trim();
   if (!rawInput) return 'URL 非法，仅支持 http/https';
   offset = Math.max(0, parseInt(offset, 10) || 0);
+  // v7.9.0：单次切片长度由调用方预算决定，尾部提示的 nextOffset 才和实际内容对得上
+  const pageCap = Math.max(600, Math.min(6000, (maxChars > 0 ? maxChars : 6000)));
 
   // v7.2.0：支持一次传入最多 3 个 URL（逗号或换行分隔）并发批量抓取，大幅减少对比阅读步数
   const urlList = rawInput.split(/[\r\n,，]+/).map(s => s.trim()).filter(Boolean);
   if (urlList.length > 1 && offset === 0) {
     const batch = urlList.slice(0, 3);
-    const perUrlLimit = Math.floor(5400 / batch.length);
+    const perUrlLimit = Math.max(400, Math.floor(Math.min(pageCap, 5400) / batch.length));
     const results = await Promise.all(batch.map(async (u, i) => {
       // v7.6.0：每条失败都以「抓取失败：」开头 —— 全部失败时聚合结果才能被
       // isToolFailureResult 识别（旧版形如「【网页 1：…】…」会被判为成功）
@@ -369,9 +371,14 @@ async function toolWebFetch(url, offset) {
     return results.join('\n\n---\n\n');
   }
 
+  // 批量 + offset 是有歧义的组合：旧版会静默只抓第一个 URL，模型以为翻了 3 篇的页
+  if (urlList.length > 1 && offset > 0) {
+    return '抓取失败：批量抓取（' + urlList.length + ' 个 URL）不支持 offset 翻页，请一次只传 1 个 URL 再传 offset。本次未抓取。';
+  }
+
   const singleUrl = urlList[0];
   if (!/^https?:\/\//i.test(singleUrl)) return 'URL 非法，仅支持 http/https';
-  const PAGE_SIZE = 6000;
+  const PAGE_SIZE = pageCap;
 
   let fetchHost = '';
   try { fetchHost = new URL(singleUrl).hostname; } catch (e) { return 'URL 非法，仅支持 http/https'; }

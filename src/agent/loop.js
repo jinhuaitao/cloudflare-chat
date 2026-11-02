@@ -44,6 +44,7 @@ import { agentGetMemories } from './memory.js';
 import { buildAgentSystemPrompt } from './prompt.js';
 import { kbGetRegistry } from '../kb/registry.js';
 import { mapLimit } from '../utils.js';
+import { sanitizeHistory, lastUserText } from './history.js';
 
 const WRITE_TOOLS_SET = new Set(['remember', 'forget_memory', 'save_doc', 'delete_doc']);
 
@@ -79,7 +80,9 @@ async function agentWrapUp(env, targetModelId, messages, loopStartIdx, ctxBudget
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + cfg.currentApiKey, 'Content-Type': 'application/json' },
       body: JSON.stringify(cfg.payload),
-      signal: AbortSignal.timeout(Math.max(8000, Math.min(60000, remainMs)))
+      // v7.9.0：与主循环一致，贴合 deadline。旧版下限 8 秒，剩余 3 秒时仍会等 8 秒，
+      // 用户拿到的是"超时"而不是已经整理好的部分答案
+      signal: AbortSignal.timeout(Math.max(3000, Math.min(60000, remainMs - 300)))
     });
   } catch (e) { return null; }
   if (!resp.ok) { try { await resp.body.cancel(); } catch (e) {} return null; }
@@ -141,7 +144,14 @@ function withTimeout(promise, ms, fallback) {
 }
 
 async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTools, onProgress, opts) {
-  const query = history.length ? extractMsgPlainText(history[history.length - 1].content) : '';
+  // v7.9.0：外部历史先清洗再进上下文。
+  // Web 端的 messages 完全由浏览器提供，旧版原样拼进去 —— 客户端可以塞一条 role=system
+  // 直接改写 Agent 规则（prompt 注入），也可以塞非法 role 或把 assistant 放最前导致上游 400。
+  const safeHistory = sanitizeHistory(history);
+  if (!safeHistory.length) {
+    return { error: '没有可用的提问内容：消息列表为空或缺少 user 消息。请先输入你的问题。' };
+  }
+  const query = lastUserText(safeHistory);
   const kbReadOnly = !!(opts && opts.kbReadOnly);
   // 并发加载长期记忆与知识库文档注册表（各带兜底超时：R2 抖动不该拖住首字）
   const r2BudgetMs = Math.max(500, Math.min(3000, (opts && opts.r2BudgetMs) || 1500));
@@ -153,7 +163,7 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
   const systemPrompt = buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly);
   const tools = allowTools ? getAgentTools(kbReadOnly, { hasKbDocs }) : null;
   const messages = [{ role: 'system', content: systemPrompt }];
-  for (const m of history) messages.push({ role: m.role, content: m.content });
+  for (const m of safeHistory) messages.push(m);
 
   const deadline = tgAgentDeadline(env, opts);
   const origUserText = (opts && opts.origUserText) !== undefined ? opts.origUserText : query;
@@ -177,6 +187,9 @@ async function tgAgentResume(env, tgApi, chatId, saved, onProgress, opts) {
 }
 
 async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume, baseLoopStartIdx, onDelta, onReset, kbReadOnly, origUserText, hasKbDocs) {
+  // 不原地修改调用方数组：断点存档的 messages 被 push 后就被污染了，
+  // 同一份存档再跑一次（如 fallback 重试）会带着上一轮的 assistant/tool 消息，序列直接错乱
+  messages = Array.isArray(messages) ? messages.slice() : [];
   const limits = agentLimits(env);
   const maxSteps = limits.maxSteps;
   const ctxBudget = limits.ctxBudget;
@@ -231,13 +244,36 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
     });
   };
 
+  // v7.9.0：暂停 / 超时时，如果模型还没来及写总结，用户就只看到一句"任务较长"，
+  // 前面辛苦查到的信息全丢了。这里把最后几条工具结果压成摘要附上。
+  const toolDigest = (maxLines) => {
+    const limit = maxLines > 0 ? maxLines : 4;
+    const lines = [];
+    for (let i = messages.length - 1; i >= 0 && lines.length < limit; i--) {
+      const m = messages[i];
+      if (!m || m.role !== 'tool') continue;
+      const one = String(m.content || '').replace(/\s+/g, ' ').trim();
+      if (!one) continue;
+      lines.unshift('· ' + (m.name || 'tool') + '：' + (one.length > 90 ? one.slice(0, 90) + '…' : one));
+    }
+    return lines.length ? '已查到的信息：\n' + lines.join('\n') : '';
+  };
+
   const pauseForResume = async () => {
     const t = stripDSMLBlocks(lastAssistantText());
+    const digest = t ? '' : toolDigest(4);
     const saved = await persistState();
     if (saved) {
-      return { text: '⏸️ 任务较长，已暂停并保存进度，发送「继续」让我接着做。' + (t ? '\n\n已产出：\n' + t : ''), usedTools: true, paused: true };
+      return {
+        text: '⏸️ 任务较长，已暂停并保存进度，发送「继续」让我接着做。'
+          + (t ? '\n\n已产出：\n' + t : (digest ? '\n\n' + digest : '')),
+        usedTools: true, paused: true
+      };
     }
-    return { text: '（本次任务超时，已停止）' + (t ? '\n\n' + t : ''), usedTools: true };
+    return {
+      text: '（本次任务超时，已停止）' + (t ? '\n\n' + t : (digest ? '\n\n' + digest : '')),
+      usedTools: true
+    };
   };
 
   const heartbeat = setInterval(() => {
@@ -290,86 +326,104 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
     if (cfg.error) return { error: cfg.error };
 
     const keyPool = Array.isArray(cfg.channelKeys) && cfg.channelKeys.length > 0 ? cfg.channelKeys : [cfg.currentApiKey];
-    let resp = null;
-    let lastFetchErr = null;
-    const maxAttempts = (Date.now() < deadline - 12000) ? 2 : 1;
+    // v7.9.0：上游偶发返回空响应（流式场景尤其常见，SSE 只发了一个 [DONE]）。
+    // 旧版直接判定"AI 没有返回有效内容"把整轮判死，用户只能重新提问。
+    // 现在只要还有充裕时间就原地重试一次，不消耗推理步数。
+    let msg = null;
+    let emptyRounds = 0;
+    while (true) {
+      let resp = null;
+      let lastFetchErr = null;
+      const maxAttempts = (Date.now() < deadline - 12000) ? 2 : 1;
 
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const activeKey = attempt === 0
-        ? cfg.currentApiKey
-        : keyPool[(keyPool.indexOf(cfg.currentApiKey) + attempt) % keyPool.length];
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        const activeKey = attempt === 0
+          ? cfg.currentApiKey
+          : keyPool[(keyPool.indexOf(cfg.currentApiKey) + attempt) % keyPool.length];
+        try {
+          const remainMs = Math.max(0, deadline - Date.now());
+          // 贴合 deadline：旧版下限写死 15 秒，剩余预算只有 5 秒时仍会等满 15 秒，
+          // 收尾时间被吃光，用户只能看到"超时且无结果"
+          const fetchTimeoutMs = Math.max(3000, Math.min(180000, remainMs - 300));
+          resp = await fetch(cfg.apiUrl, {
+            method: 'POST',
+            headers: { 'Authorization': 'Bearer ' + activeKey, 'Content-Type': 'application/json' },
+            body: JSON.stringify(cfg.payload),
+            signal: AbortSignal.timeout(fetchTimeoutMs)
+          });
+          lastFetchErr = null;
+          if (resp.ok) break;
+          const isTransient = resp.status === 429 || resp.status === 502 || resp.status === 503 || resp.status === 504;
+          if (isTransient && attempt + 1 < maxAttempts && Date.now() < deadline - 10000) {
+            try { if (resp.body) await resp.body.cancel(); } catch (e) {}
+            await new Promise(r => setTimeout(r, 900 * (attempt + 1)));
+            continue;
+          }
+          break;
+        } catch (e) {
+          lastFetchErr = e;
+          const nm = e && e.name ? String(e.name) : '';
+          const emsg = String((e && e.message) || '');
+          const aborted = nm === 'AbortError' || nm === 'TimeoutError' || /abort/i.test(emsg);
+          if (aborted) break;
+          if (attempt + 1 < maxAttempts && Date.now() < deadline - 10000) {
+            await new Promise(r => setTimeout(r, 800));
+            continue;
+          }
+        }
+      }
+
+      if (lastFetchErr) {
+        const nm = lastFetchErr && lastFetchErr.name ? String(lastFetchErr.name) : '';
+        const emsg = String((lastFetchErr && lastFetchErr.message) || '');
+        const aborted = nm === 'AbortError' || nm === 'TimeoutError' || /abort/i.test(emsg);
+        if (aborted && Date.now() >= deadline - 2000) return await pauseForResume();
+        if (aborted) return { error: '上游响应超时，请重试或换个问法' };
+        return { error: '网络错误：' + (emsg || String(lastFetchErr)) };
+      }
+
+      if (!resp.ok) {
+        const t = await readErrorBody(resp, 2048);
+        if (allowTools && step === 0 &&
+            ((resp.status >= 400 && resp.status < 500 && resp.status !== 401 && resp.status !== 429) || /tool|function|unsupported|vision|image/i.test(t))) {
+          return { fallback: true };
+        }
+        return { error: 'API 报错 (' + resp.status + ')：' + String(t).slice(0, 500) };
+      }
+
       try {
-        const remainMs = Math.max(0, deadline - Date.now());
-        // 贴合 deadline：旧版下限写死 15 秒，剩余预算只有 5 秒时仍会等满 15 秒，
-        // 收尾时间被吃光，用户只能看到"超时且无结果"
-        const fetchTimeoutMs = Math.max(3000, Math.min(180000, remainMs - 300));
-        resp = await fetch(cfg.apiUrl, {
-          method: 'POST',
-          headers: { 'Authorization': 'Bearer ' + activeKey, 'Content-Type': 'application/json' },
-          body: JSON.stringify(cfg.payload),
-          signal: AbortSignal.timeout(fetchTimeoutMs)
-        });
-        lastFetchErr = null;
-        if (resp.ok) break;
-        const isTransient = resp.status === 429 || resp.status === 502 || resp.status === 503 || resp.status === 504;
-        if (isTransient && attempt + 1 < maxAttempts && Date.now() < deadline - 10000) {
-          try { if (resp.body) await resp.body.cancel(); } catch (e) {}
-          await new Promise(r => setTimeout(r, 900 * (attempt + 1)));
-          continue;
-        }
-        break;
+        msg = await readUpstreamMessage(resp, onDelta);
       } catch (e) {
-        lastFetchErr = e;
         const nm = e && e.name ? String(e.name) : '';
-        const msg = String((e && e.message) || '');
-        const aborted = nm === 'AbortError' || nm === 'TimeoutError' || /abort/i.test(msg);
-        if (aborted) break;
-        if (attempt + 1 < maxAttempts && Date.now() < deadline - 10000) {
-          await new Promise(r => setTimeout(r, 800));
-          continue;
+        const emsg = String((e && e.message) || '');
+        const aborted = nm === 'AbortError' || nm === 'TimeoutError' || /abort/i.test(emsg);
+        if (aborted) {
+          await rollbackStreamed(true);
+          if (Date.now() >= deadline - 2000) return await pauseForResume();
+          return { error: '上游响应超时，请重试或换个问法' };
         }
+        if (nm === 'UpstreamSSEError') return { error: '上游返回错误：' + emsg };
+        return { error: '网络错误：' + (emsg || String(e)) };
       }
-    }
 
-    if (lastFetchErr) {
-      const nm = lastFetchErr && lastFetchErr.name ? String(lastFetchErr.name) : '';
-      const msg = String((lastFetchErr && lastFetchErr.message) || '');
-      const aborted = nm === 'AbortError' || nm === 'TimeoutError' || /abort/i.test(msg);
-      if (aborted && Date.now() >= deadline - 2000) return await pauseForResume();
-      if (aborted) return { error: '上游响应超时，请重试或换个问法' };
-      return { error: '网络错误：' + (msg || String(lastFetchErr)) };
-    }
-
-    if (!resp.ok) {
-      const t = await readErrorBody(resp, 2048);
-      if (allowTools && step === 0 &&
-          ((resp.status >= 400 && resp.status < 500 && resp.status !== 401 && resp.status !== 429) || /tool|function|unsupported|vision|image/i.test(t))) {
-        return { fallback: true };
+      if (msg.imageUrl) {
+        return { text: '[🖼️ 点击查看生成的图片](' + msg.imageUrl + ')', usedTools: false, isImage: true };
       }
-      return { error: 'API 报错 (' + resp.status + ')：' + String(t).slice(0, 500) };
+      if (msg.content || msg.toolCalls.length || msg.reasoning) break;
+
+      // 空响应：给上游一次重来的机会（抖动很常见，没必要让用户重发问题）
+      emptyRounds += 1;
+      if (emptyRounds >= 2 || Date.now() > deadline - 20000) break;
+      fireProgress(stepLabel + '\n（上游返回空响应，正在重试…）', true);
+      await new Promise(r => setTimeout(r, 350));
     }
 
-    let msg;
-    try {
-      msg = await readUpstreamMessage(resp, onDelta);
-    } catch (e) {
-      const nm = e && e.name ? String(e.name) : '';
-      const emsg = String((e && e.message) || '');
-      const aborted = nm === 'AbortError' || nm === 'TimeoutError' || /abort/i.test(emsg);
-      if (aborted) {
-        await rollbackStreamed(true);
-        if (Date.now() >= deadline - 2000) return await pauseForResume();
-        return { error: '上游响应超时，请重试或换个问法' };
-      }
-      if (nm === 'UpstreamSSEError') return { error: '上游返回错误：' + emsg };
-      return { error: '网络错误：' + (emsg || String(e)) };
-    }
-
-    if (msg.imageUrl) {
-      return { text: '[🖼️ 点击查看生成的图片](' + msg.imageUrl + ')', usedTools: false, isImage: true };
-    }
     if (!msg.content && !msg.toolCalls.length && !msg.reasoning) {
-      return { error: 'AI 没有返回有效内容' };
+      return {
+        error: emptyRounds > 1
+          ? 'AI 连续两次没有返回有效内容。请换个问法，或用 /model 切换模型后重试。'
+          : 'AI 没有返回有效内容，请重试。'
+      };
     }
 
     let toolCalls = msg.toolCalls || [];
@@ -402,15 +456,29 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       return { text: (prefix ? prefix + '\n\n' : '') + '（检测到重复调用同一工具，已停止以避免空转；请换个问法或补充信息后重试）', usedTools: true };
     }
 
+    // 给 tool_calls 补上稳定 id：个别上游（以及被截断的流式分片）会漏掉 id，
+    // 此时 tool 消息的 tool_call_id 就是 undefined，严格校验的上游会直接 400。
+    // 注意这里只补 id，不动 arguments —— 原始串要留给执行阶段判断"参数是否损坏"，
+    // 提前规范化会把损坏信息抹掉，工具就会拿着 {} 白跑一次。
+    if (toolCalls.length) {
+      toolCalls = toolCalls.map((tc, i) => {
+        const fn = (tc && tc.function) || {};
+        return {
+          id: (tc && tc.id) ? String(tc.id) : ('call_s' + step + '_' + i),
+          type: 'function',
+          function: { name: fn.name || '', arguments: fn.arguments }
+        };
+      });
+    }
     const assistantMsg = { role: 'assistant', content: assistantText };
     if (toolCalls.length) {
       // 回灌给上游的 assistant.tool_calls 必须是合法 JSON：原始串可能被 max_tokens
       // 截断，严格校验的上游会直接 400。统一换成修复后的参数（修不好就是 {}），
       // 真正的失败原因由随后的 tool 消息告诉模型。
       assistantMsg.tool_calls = toolCalls.map((tc) => {
-        const fn = (tc && tc.function) || {};
+        const fn = tc.function || {};
         const parsed = parseToolArguments(fn.arguments);
-        return { ...tc, function: { ...fn, arguments: JSON.stringify(parsed.args || {}) } };
+        return { id: tc.id, type: 'function', function: { name: fn.name, arguments: JSON.stringify(parsed.args || {}) } };
       });
     }
     // v7.8.0：思维链默认不回灌上下文。
@@ -487,7 +555,8 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
         return { tc, result: '剩余时间不足，已跳过本次工具调用；请直接基于已有信息作答', failed: true, ms: 0 };
       }
       const t0 = Date.now();
-      const result = await execAgentTool(fn.name, args, env, chatId, kbReadOnly, { timeoutMs: toolTimeoutCap });
+      const result = await execAgentTool(fn.name, args, env, chatId, kbReadOnly,
+        { timeoutMs: toolTimeoutCap, maxChars: Math.max(600, perToolCap - 160) });
       const ms = Math.max(1, Date.now() - t0);
       const failed = isToolFailureResult(result);
       const truncated = truncateToolResult(result, perToolCap);
@@ -538,10 +607,11 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
   const wrapUp = await agentWrapUp(env, targetModelId, messages, loopStartIdx, ctxBudget, deadline, onDelta, wrapReserveMs);
   if (wrapUp && wrapUp.text) return { text: wrapUp.text, usedTools: true, streamed: !!wrapUp.streamed };
   const t = stripDSMLBlocks(lastAssistantText());
+  const tail = t ? '\n\n已产出：\n' + t : (toolDigest(4) ? '\n\n' + toolDigest(4) : '');
   if (await persistState()) {
-    return { text: '⏸️ 推理步数已用尽，进度已保存，发送「继续」让我接着做。' + (t ? '\n\n已产出：\n' + t : ''), usedTools: true, paused: true };
+    return { text: '⏸️ 推理步数已用尽，进度已保存，发送「继续」让我接着做。' + tail, usedTools: true, paused: true };
   }
-  return { text: t || '（思考步数已用尽，请换个问法重试）', usedTools: true };
+  return { text: (t || '（思考步数已用尽，请换个问法重试）') + (t ? '' : tail), usedTools: true };
 }
 
 export {

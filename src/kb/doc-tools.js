@@ -170,7 +170,7 @@ async function toolListDocs(env) {
     shown.map((e, i) => (i + 1) + '. ' + (e.title || e.file) + '（' + kbFmtSize(e.size) + '，' + kbFmtDate(e.updated_at) + '）').join('\n');
 }
 
-async function toolReadDoc(env, args) {
+async function toolReadDoc(env, args, maxChars) {
   args = args || {};
   const query = String(args.query || '').trim();
   if (!query) return '请给出要读取的文档标题关键词';
@@ -178,7 +178,11 @@ async function toolReadDoc(env, args) {
   const reg = await kbGetRegistry(env);
   if (!reg.length) return '知识库文档为空（kb/docs/ 下暂无文档）';
   const offset = Math.max(0, parseInt(args.offset, 10) || 0);
-  const MAX = 8000;
+  // v7.9.0：切片长度由调用方预算决定。
+  // 旧版固定返回 8000 字符，随后被 Agent 循环按预算截断成 4000 ——
+  // 但尾部的"请传 offset=8000"是按 8000 算的，模型照着翻页就会跳过中间 4000 字。
+  // 现在由工具自己按预算切片，nextOffset 始终与实际返回的内容对齐。
+  const MAX = Math.max(600, Math.min(8000, (maxChars > 0 ? maxChars : 8000)));
   const hit = kbFindRegEntry(reg, query);
   if (hit) {
     // 注册表带字符数时先判越界：不用为了一个非法 offset 把整篇文档读进内存
@@ -361,8 +365,11 @@ async function toolDeleteDoc(env, args) {
   if (!reg.length) return '知识库文档为空，无需删除';
   const hit = kbFindRegEntry(reg, query);
   if (!hit) {
-    return '未找到标题包含"' + query + '"的文档。现有文档：\n' +
-      reg.map(e => '- ' + (e.title || e.file)).join('\n');
+    // v7.9.0：与 list_docs 一致，最多列 60 篇。旧版全量列出，几百篇时直接撑爆工具结果
+    const shown = reg.slice(0, 60);
+    const more = shown.length < reg.length ? '（共 ' + reg.length + ' 篇，仅列前 60 篇）' : '';
+    return '未找到标题包含"' + query + '"的文档' + more + '。现有文档：\n' +
+      shown.map(e => '- ' + (e.title || e.file)).join('\n');
   }
   const key = KB_DOCS_PREFIX + hit.file;
   try { await env.R2.delete(key); } catch (e) { return '删除失败：' + (hit.title || hit.file); }

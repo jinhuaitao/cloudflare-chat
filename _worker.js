@@ -82,7 +82,10 @@ async function routeRequest(request, env, ctx) {
           return new Response(JSON.stringify({ error: "无效的请求格式" }), { status: 400, headers: CORS_HEADERS });
         }
 
-        const aiConfig = buildAIRequest(env, body.model, body.messages, body.agent !== true);
+        // v7.9.0：messages 缺失时不要直接把 undefined 传下去 —— buildAIRequest 内部会读
+        // messagesArray.length，抛 TypeError 后被顶层 catch 变成含义不明的 500
+        const safeMessages = Array.isArray(body.messages) ? body.messages : [];
+        const aiConfig = buildAIRequest(env, body.model, safeMessages, body.agent !== true);
         if (aiConfig.error) {
           return new Response(JSON.stringify({ error: aiConfig.error }), { status: 500, headers: CORS_HEADERS });
         }

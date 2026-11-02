@@ -373,12 +373,15 @@ async function execAgentTool(name, args, env, chatId, kbReadOnly, opts) {
     if (!(toolTimeoutMs > 0)) toolTimeoutMs = 30000;
   }
   if (toolTimeoutMs < 800) toolTimeoutMs = 800;
+  // v7.9.0：分页类工具（read_doc / web_fetch）需要知道自己这次能输出多少字符，
+  // 否则它按 8000 切片、循环再按预算截到 4000，尾部给出的 nextOffset 就对不上实际内容
+  const maxChars = parseInt(opts.maxChars, 10) > 0 ? parseInt(opts.maxChars, 10) : 0;
   let timer;
   try {
     const run = (async () => {
       switch (name) {
         case 'web_search': return await toolWebSearch(args.query, args.count, args.deep_read);
-        case 'web_fetch': return await toolWebFetch(args.url, args.offset);
+        case 'web_fetch': return await toolWebFetch(args.url, args.offset, maxChars);
         case 'wiki_lookup': return await toolWikiLookup(args.query, args.lang);
         case 'github_lookup': return await toolGithubLookup(args);
         case 'arxiv_search': return await toolArxivSearch(args);
@@ -402,7 +405,7 @@ async function execAgentTool(name, args, env, chatId, kbReadOnly, opts) {
         }
         case 'save_doc': return await toolSaveDoc(env, chatId, args);
         case 'list_docs': return await toolListDocs(env);
-        case 'read_doc': return await toolReadDoc(env, args);
+        case 'read_doc': return await toolReadDoc(env, args, maxChars);
         case 'delete_doc': return await toolDeleteDoc(env, args);
         default: return '未知工具: ' + name;
       }
