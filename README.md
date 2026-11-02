@@ -1,4 +1,4 @@
-# ⚡ Cloudflare-Chat `v7.9.0`
+# ⚡ Cloudflare-Chat `v7.9.1`
 
 > **基于 Cloudflare Workers + R2 的零依赖多通道 AI 对话前端 + 全能 Telegram 机器人 + 微信 ClawBot (iLink) 官方通道**  
 > `🌐 流式 Web + PWA` · `🤖 Telegram 私聊/群聊` · `🟢 微信 ClawBot 安全绑定` · `🧠 18 项零密钥 Agent 工具` · `📚 R2 知识库` · `🔄 多 Key 轮询容灾`
@@ -95,6 +95,7 @@
 
 | 变量名 | 级别 | 默认值 | 说明 |
 | :--- | :---: | :---: | :--- |
+| `BRAVE_API_KEY` | 🟢 可选 | — | Brave 官方搜索 API Key（[免费申请](https://brave.com/search/api/)）。填了 `web_search` 优先走官方 API，结果最稳；不填则使用零密钥的 DuckDuckGo / Brave / Bing 多后端回退 |
 | `AGENT_MAX_STEPS` | 🟢 可选 | `6` | 单轮任务最大工具推理步数（上限 `12` 步，耗尽后自动汇总收尾） |
 | `AGENT_TIMEOUT_MS` | 🟢 可选 | `240000` | Agent 单轮任务全局超时上限（毫秒，默认 4 分钟） |
 | `WEB_AGENT_TIMEOUT_MS` | 🟢 可选 | `90000` | Web 网页端 Agent 单轮超时预算（毫秒，默认 90 秒，范围 `10000`~`240000`） |
@@ -133,11 +134,27 @@
 
 | 分类 | 内置工具 | 能力摘要（全部免额外 API Key） | 可用范围 |
 | :--- | :--- | :--- | :---: |
-| 🔍 **联网与抓取** | `web_search` · `web_fetch` | DuckDuckGo 双端搜索（自动并发预读前 2 条网页正文）；结构化抓取网页（支持 3 URL 并发、`offset` 0ms 翻页与 Jina 回退） | 🌐 Web + 🤖 TG + 🟢 微信 |
+| 🔍 **联网与抓取** | `web_search` · `web_fetch` | 多后端搜索（DuckDuckGo → Brave → Bing 自动回退，反爬时明确报错而非「无结果」，并预读前 2 条正文）；结构化抓取网页（3 URL 并发、`offset` 0ms 翻页、Jina 阅读器与 Wayback 快照回退） | 🌐 Web + 🤖 TG + 🟢 微信 |
 | 🌐 **百科与社区** | `wiki_lookup` · `github_lookup` · `arxiv_search` · `hn_top` | 中英维基百科词条；GitHub 仓库 Star/Release/README 检索；arXiv 论文检索；Hacker News 实时热榜与高赞讨论 | 🌐 Web + 🤖 TG + 🟢 微信 |
 | 🧮 **计算与工具** | `calculate` · `toolkit` · `get_time` · `get_weather` · `exchange_rate` · `net_lookup` | 科学计算器（支持 `;` 批量计算）；单位换算/SHA哈希/Base64·URL编解码/UUID/Token 统计/**JSON 格式化与路径取值**/**正则测试**；时区与日期差推算；多城市天气预报；160+ 法币与加密货币汇率；DoH DNS 与 IP 归属诊断 | 🌐 Web + 🤖 TG + 🟢 微信 |
 | 📖 **知识库检索** | `list_docs` · `read_doc` | 列出知识库文档清单；按标题或多关键词加权检索文档正文（L1 内存缓存支持 `offset` 0ms 翻页） | 🌐 Web + 🤖 TG + 🟢 微信 |
 | 💾 **记忆与写入** | `remember` · `forget_memory` · `save_doc` · `delete_doc` | 长期记忆存取与同主题自动覆盖（同步生成 `.md` 镜像）；将长文或上传文件保存为知识库文档、按标题删除文档 | 🤖 TG + 🟢 微信 |
+
+## 🔧 v7.9.1 联网工具可用性修复
+
+这一版不加新工具，只修「搜索说没结果、抓取说没内容」这两类把用户挡在门外的误报。
+
+| 问题（升级前） | 处理（升级后） |
+| :--- | :--- |
+| DuckDuckGo 的 `html` / `lite` 端点现在对数据中心 IP 返回 **HTTP 202 + 人机校验页**，旧版把校验页当成「解析不到结果」，直接回「搜索「x」无结果」—— 模型据此判定「无任何收录结果」并停止作答，用户看到的就是一张全红的尝试记录 | 新增**反爬识别**：状态码 202/403/429 或正文出现 `anomaly-modal` / `challenge-form` 即判为被拦，**不再谎称无结果**；触发后该 isolate 内 DDG 冷却 3 分钟，直接走备用后端 |
+| 搜索只有 DDG 一个来源，被拦就彻底没结果 | 新增 **Brave 网页版 / Bing 网页版 / Bing RSS** 三个免密钥后端，按「结果质量」排序串行回退：Brave → Bing（`b_algo`）→ Bing RSS。Bing RSS 的 `format=rss` 是给阅读器用的正规出口，数据中心 IP 也能拿到结果，作为最后兜底 |
+| 全部后端都被拦时仍回「无结果」，模型只能反复重试同一关键词 | 明确回「**搜索失败：搜索源被反爬拦截（DuckDuckGo / Brave）**」并给出替代动作（改用 `web_fetch` 抓已知网址 / 换站点内查询），同时命中 `isToolFailureResult` 的失败熔断，不再空转 |
+| 抓取 403 页面只有 Jina 一条退路，而 Jina 对浏览器 UA 直接 403；更致命的是回退请求复用了**已被直连抓取耗光/abort 的 AbortSignal**，等于没有回退，白等 16 秒只拿到一句「抓取失败」 | 回退链重写为**直连 → Jina 阅读器 → Wayback 快照**，三条链路各自独立超时、并行执行；Jina 改用阅读器专用 UA + `Accept: text/plain`，并识别它「返回 200 但正文是报错」的假成功 |
+| 正文提取用 `<(script\|style\|…\|head)[\s\S]*?<\/(script\|style\|…\|head)>` 一条正则跨标签清理，闭标签是 6 选 1 —— 遇到 `<head><style>…</style>` 会在 `</style>` 处提前收尾，把 `<head>` 之后的正文一起吃掉 | **逐标签剥离**，不再做跨标签匹配；标题、meta description 单独提取，正文丢失问题消失 |
+| SPA 页面正文全在 `<script>` 里，剥离脚本后只剩空壳 → 「页面无有效文本内容」 | 新增**内联 JSON 兜底**：从 `__NEXT_DATA__` / `ld+json` / `__NUXT__` / `__INITIAL_STATE__` 中抽取像自然语言的字符串；仍然太少时补 meta description，最后才走回退链 |
+| 中文站点（GBK/GB2312）按 UTF-8 解码，整篇乱码 | 按响应头 `charset` 与 `<meta charset>` **探测编码**后再解码 |
+| 模型对同一个被墙 URL 反复重试，每次都空等十几秒 | 失败结果做 **60 秒负缓存**，同一 URL 立即返回同一结论并附已尝试的手段 |
+| 需要稳定搜索质量时无路可走 | 新增**可选** `BRAVE_API_KEY`：填了就优先用 Brave 官方搜索 API（免费额度足够个人使用），不填仍是零密钥链路 |
 
 ## 🔧 v7.9.0 Agent 输入边界与容错
 
@@ -230,7 +247,7 @@
 ### 本地回归测试
 
 ```bash
-npm test        # 80 个用例：内核纯函数 + mock 上游的端到端循环 + 流式读取 + 知识库存读 + 运行期性能 + 输入边界与容错（不联网）
+npm test        # 100 个用例：内核纯函数 + mock 上游的端到端循环 + 流式读取 + 知识库存读 + 运行期性能 + 输入边界与容错（不联网）
 ```
 
 覆盖：并发闸门、两/三阶段上下文裁剪与配对安全、工具参数修复、失败判定、DSML 兼容、

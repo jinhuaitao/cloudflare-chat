@@ -380,7 +380,7 @@ async function execAgentTool(name, args, env, chatId, kbReadOnly, opts) {
   try {
     const run = (async () => {
       switch (name) {
-        case 'web_search': return await toolWebSearch(args.query, args.count, args.deep_read);
+        case 'web_search': return await toolWebSearch(args.query, args.count, args.deep_read, env);
         case 'web_fetch': return await toolWebFetch(args.url, args.offset, maxChars);
         case 'wiki_lookup': return await toolWikiLookup(args.query, args.lang);
         case 'github_lookup': return await toolGithubLookup(args);
