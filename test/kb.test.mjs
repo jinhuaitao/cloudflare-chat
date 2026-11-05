@@ -5,8 +5,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { kbGetRegistry, kbFindRegEntry } from '../src/kb/registry.js';
+import { kbGetRegistry, kbFindRegEntry, kbParseTags, kbFmtTags } from '../src/kb/registry.js';
 import { toolSaveDoc, toolReadDoc, toolListDocs, toolDeleteDoc } from '../src/kb/doc-tools.js';
+import { extractTagLine, cleanDocTitle, deriveFileDocTitle, autoOrganizeAndSaveKbDoc } from '../src/kb/organize.js';
 
 function makeR2(initial = {}) {
   const data = new Map(Object.entries(initial));
@@ -165,4 +166,223 @@ test('delete_doc 同步失效缓存与注册表', async () => {
 
   const read = await toolReadDoc(env, { query: '待删文档' });
   assert.ok(read.includes('知识库文档为空'), read);
+});
+
+// ==================== v7.11.0：写入模式 / 版本快照 / 指纹去重 / 标签 ====================
+
+test('kbParseTags 与 kbFmtTags：混排分隔符、去 # 前缀、上限 8 个', () => {
+  assert.deepEqual(kbParseTags('R2, 部署、#成本，缓存'), ['R2', '部署', '成本', '缓存']);
+  assert.deepEqual(kbParseTags(''), []);
+  assert.deepEqual(kbParseTags(null), []);
+  assert.deepEqual(kbParseTags([' 甲 ', '', '乙']), ['甲', '乙']);
+  assert.equal(kbParseTags(Array.from({ length: 12 }, (_, i) => 'k' + i)).length, 8);
+  assert.equal(kbFmtTags([]), '');
+  assert.equal(kbFmtTags('a,b'), '｜标签：a、b');
+});
+
+test('save_doc mode=create 遇到同名文档时拒绝覆盖并给出替代方案', async () => {
+  const r2 = makeR2();
+  const env = { R2: r2 };
+  await toolSaveDoc(env, 'c1', { title: '部署笔记', content: '第一版内容' });
+  const out = await toolSaveDoc(env, 'c1', { title: '部署笔记', content: '第二版内容', mode: 'create' });
+  assert.ok(out.includes('已存在'), out);
+  assert.ok(out.includes('mode=overwrite'), out);
+  const body = r2.data.get('kb/docs/部署笔记.md');
+  assert.ok(body.includes('第一版内容'), '旧内容不应被改动');
+  assert.ok(!body.includes('第二版内容'));
+});
+
+test('save_doc mode=append 追加而非覆盖，并为旧版留一份快照', async () => {
+  const r2 = makeR2();
+  const env = { R2: r2 };
+  await toolSaveDoc(env, 'c1', { title: '运维手册', content: '第一章：安装' });
+  const out = await toolSaveDoc(env, 'c1', { title: '运维手册', content: '第二章：升级', mode: 'append' });
+  assert.ok(out.includes('已追加'), out);
+  assert.ok(out.includes('旧版已存档'), out);
+
+  const body = r2.data.get('kb/docs/运维手册.md');
+  assert.ok(body.includes('第一章：安装'));
+  assert.ok(body.includes('第二章：升级'));
+  assert.ok(body.indexOf('第一章') < body.indexOf('第二章'), '新内容应在旧正文之后');
+
+  const versions = [...r2.data.keys()].filter(k => k.startsWith('kb/versions/运维手册/'));
+  assert.equal(versions.length, 1);
+  assert.ok(r2.data.get(versions[0]).includes('第一章：安装'), '快照应保存覆盖前的完整旧版');
+  assert.equal(JSON.parse(r2.data.get('kb/docs/registry.json'))[0].version, 2);
+});
+
+test('save_doc mode=prepend 把整理大纲放到原文之前，snapshot:false 不占版本槽位', async () => {
+  const r2 = makeR2();
+  const env = { R2: r2 };
+  await toolSaveDoc(env, 'c1', { title: '会议纪要', content: '原始正文：讨论了三个方案' });
+  const out = await toolSaveDoc(env, 'c1', {
+    title: '会议纪要',
+    content: '【核心摘要】一句话总结',
+    mode: 'prepend',
+    snapshot: false,
+  });
+  assert.ok(out.includes('已前置整理大纲'), out);
+  const body = r2.data.get('kb/docs/会议纪要.md');
+  assert.ok(body.indexOf('【核心摘要】') < body.indexOf('原始正文'));
+  assert.equal([...r2.data.keys()].filter(k => k.startsWith('kb/versions/')).length, 0);
+});
+
+test('版本快照最多保留最近 3 份，旧快照自动清理', async () => {
+  const r2 = makeR2();
+  const env = { R2: r2 };
+  await toolSaveDoc(env, 'c1', { title: '反复覆盖', content: 'v0 初始内容' });
+  for (let i = 1; i <= 5; i++) {
+    await toolSaveDoc(env, 'c1', { title: '反复覆盖', content: 'v' + i + ' 内容各不同' + i });
+  }
+  const versions = [...r2.data.keys()].filter(k => k.startsWith('kb/versions/'));
+  assert.equal(versions.length, 3);
+});
+
+test('save_doc 用内容指纹挡住「同一篇资料换个标题重复入库」', async () => {
+  const r2 = makeR2();
+  const env = { R2: r2 };
+  await toolSaveDoc(env, 'c1', { title: '甲文档', content: '同一段资料内容 abc' });
+  // 只差空白，指纹应一致
+  const out = await toolSaveDoc(env, 'c1', { title: '乙文档', content: '同一段资料内容    abc' });
+  assert.ok(out.includes('内容指纹一致'), out);
+  assert.equal(r2.data.has('kb/docs/乙文档.md'), false);
+});
+
+test('save_doc 拒绝把 404 / 人机校验页存成知识文档，长文里的引用不受影响', async () => {
+  const r2 = makeR2();
+  const env = { R2: r2 };
+  const bad = await toolSaveDoc(env, 'c1', { title: '抓取失败', content: '404 Not Found\nnginx/1.20' });
+  assert.ok(bad.includes('已拒绝'), bad);
+  assert.equal(r2.data.has('kb/docs/抓取失败.md'), false);
+
+  const long = '正文内容'.repeat(400) + '\n404 Not Found 只是引用';
+  const ok = await toolSaveDoc(env, 'c1', { title: '长文引用', content: long });
+  assert.ok(ok.startsWith('已保存为知识库文档'), ok);
+});
+
+test('tags 写进 frontmatter，注册表自愈重建后仍能解析并按标签读取', async () => {
+  const r2 = makeR2();
+  const env = { R2: r2 };
+  await toolSaveDoc(env, 'c1', {
+    title: 'K8s 入门',
+    content: 'Pod 与 Service 的关系',
+    tags: 'Kubernetes, 容器、#运维',
+  });
+  assert.deepEqual(JSON.parse(r2.data.get('kb/docs/registry.json'))[0].tags, ['Kubernetes', '容器', '运维']);
+  assert.ok(r2.data.get('kb/docs/K8s入门.md').includes('tags: Kubernetes, 容器, 运维'));
+
+  const read = await toolReadDoc(env, { query: '容器' });
+  assert.ok(read.includes('【知识库文档《K8s 入门》'), read.slice(0, 120));
+  assert.ok(read.includes('标签：Kubernetes、容器、运维'), read.slice(0, 160));
+
+  // 注册表丢失时按 frontmatter 重建，tags 不能丢
+  const r2b = makeR2({ 'kb/docs/带标签.md': docBody('带标签文档', '正文', 'tags: 部署, 缓存') });
+  const rebuilt = await kbGetRegistry({ R2: r2b });
+  assert.deepEqual(rebuilt[0].tags, ['部署', '缓存']);
+});
+
+test('kbFindRegEntry 支持按标签命中，但标题命中优先', () => {
+  const reg = [
+    { file: 'a.md', title: '甲文档', tags: ['Kubernetes'] },
+    { file: 'b.md', title: 'Kubernetes 实战', tags: [] },
+  ];
+  assert.equal(kbFindRegEntry(reg, 'Kubernetes').file, 'b.md');
+
+  const reg2 = [
+    { file: 'a.md', title: '甲文档', tags: ['Kubernetes', '容器'] },
+    { file: 'c.md', title: '丙文档', tags: [] },
+  ];
+  assert.equal(kbFindRegEntry(reg2, '容器').file, 'a.md');
+  assert.equal(kbFindRegEntry(reg2, '不存在的词'), null);
+});
+
+test('并发保存多篇文档时注册表不丢条目（写操作已串行化）', async () => {
+  const r2 = makeR2();
+  const env = { R2: r2 };
+  await Promise.all([1, 2, 3, 4, 5].map(i => toolSaveDoc(env, 'c1', { title: '并发' + i, content: '各自内容' + i })));
+  const reg = JSON.parse(r2.data.get('kb/docs/registry.json'));
+  assert.equal(reg.length, 5);
+});
+
+test('extractTagLine 从 AI 整理结果里抽出检索标签', () => {
+  const s = '1. 【📌 核心摘要】略\n4. 【🏷️ 检索关键词标签】：#R2, 部署、缓存; 成本';
+  assert.equal(extractTagLine(s), 'R2, 部署, 缓存, 成本');
+  assert.equal(extractTagLine('没有标签段落'), '');
+  const many = '【检索关键词标签】' + Array.from({ length: 12 }, (_, i) => 'k' + i).join(',');
+  assert.equal(extractTagLine(many).split(', ').length, 8);
+});
+
+test('deriveFileDocTitle 从附言反推标题，推不出则退回文件名', () => {
+  assert.equal(deriveFileDocTitle('把《部署笔记》存进知识库', 'a.txt'), '部署笔记');
+  assert.equal(deriveFileDocTitle('将 周报 保存到知识库', 'b.txt'), '周报');
+  assert.equal(deriveFileDocTitle('', 'R2配置.md'), 'R2配置');
+  assert.equal(deriveFileDocTitle('存进知识库', 'notes.md'), 'notes');
+  assert.equal(deriveFileDocTitle(null, null), '未命名文档');
+});
+
+test('cleanDocTitle 折叠换行并给出兜底标题', () => {
+  assert.equal(cleanDocTitle('  多行\n标题  '), '多行 标题');
+  assert.equal(cleanDocTitle(''), '未命名知识文档');
+  assert.equal(cleanDocTitle(null), '未命名知识文档');
+});
+
+// ==================== v7.11.0：自动整理入库（原文 + 大纲两步写入） ====================
+
+function organizeEnv(r2) {
+  return {
+    R2: r2,
+    API_URL_1: 'https://api.example.com/v1/chat/completions',
+    API_KEY_1: 'sk-test',
+    MODEL_1: 'test-model:测试模型',
+  };
+}
+
+function stubSummary(summary) {
+  const orig = globalThis.fetch;
+  globalThis.fetch = async () => new Response(
+    JSON.stringify({ choices: [{ message: { content: summary } }] }),
+    { status: 200, headers: { 'Content-Type': 'application/json' } },
+  );
+  return () => { globalThis.fetch = orig; };
+}
+
+test('整理入库：首次写入原文并把大纲前置，重复上传不再叠加', async () => {
+  const r2 = makeR2();
+  const env = organizeEnv(r2);
+  const raw = '这是原始文档的正文内容，用来测试自动整理入库流程。'.repeat(3);
+  const summary = '1. 【📌 核心摘要】这是一段用于测试的核心摘要文本。\n4. 【🏷️ 检索关键词标签】测试, 入库';
+  const restore = stubSummary(summary);
+  try {
+    const first = await autoOrganizeAndSaveKbDoc(env, 'c1', 'test-model', '整理测试', raw, 'test');
+    assert.equal(first.ok, true, first.saveResult);
+    let body = r2.data.get('kb/docs/整理测试.md');
+    assert.ok(body.includes('核心摘要'));
+    assert.ok(body.includes('这是原始文档的正文内容'));
+    assert.ok(body.indexOf('核心摘要') < body.indexOf('这是原始文档'), '大纲应在原文之前');
+    assert.deepEqual(JSON.parse(r2.data.get('kb/docs/registry.json'))[0].tags, ['测试', '入库']);
+
+    const again = await autoOrganizeAndSaveKbDoc(env, 'c1', 'test-model', '整理测试', raw, 'test');
+    assert.equal(again.skippedDup, true, again.saveResult);
+    body = r2.data.get('kb/docs/整理测试.md');
+    assert.equal(body.split('【📌 核心摘要】').length - 1, 1, '大纲不应被重复前置');
+    assert.ok(body.includes('这是原始文档的正文内容'), '原文不应被这次覆盖冲掉');
+  } finally {
+    restore();
+  }
+});
+
+test('整理入库：原文被指纹挡下时不会建出只有摘要的孤儿文档', async () => {
+  const r2 = makeR2();
+  const env = organizeEnv(r2);
+  const raw = '同一份资料的内容，先存一篇原始资料。'.repeat(2);
+  await toolSaveDoc(env, 'c1', { title: '原始资料', content: raw });
+  const restore = stubSummary('1. 【📌 核心摘要】另一个标题下的摘要。\n4. 【🏷️ 检索关键词标签】x');
+  try {
+    const res = await autoOrganizeAndSaveKbDoc(env, 'c1', 'test-model', '换个标题', raw, 'test');
+    assert.equal(r2.data.has('kb/docs/换个标题.md'), false, '不应建出孤儿文档');
+    assert.ok(res.saveResult.includes('未重复保存'), res.saveResult);
+    assert.equal(res.ok, true, '内容确实在库里，应算成功');
+  } finally {
+    restore();
+  }
 });

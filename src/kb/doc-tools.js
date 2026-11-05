@@ -99,33 +99,177 @@ function docSearchTokens(s) {
   return [...new Set(out)];
 }
 
+// ==================== 保存：模式、校验、版本快照、并发串行化（v7.11.0） ====================
+// 旧版 save_doc 只有一条路：同名标题静默覆盖，超过 10 万字符直接截断，没有任何回滚余地。
+// 这一版补上四件事：
+//   1) 写入模式（auto/create/overwrite/append/prepend）——「补充一条」不必整篇重存；
+//   2) 覆盖前自动做版本快照（kb/versions/<slug>/，保留 3 份），误覆盖可从控制台捞回；
+//   3) 内容指纹去重——同一篇资料换个标题重复入库会被挡住；
+//   4) 保存动作串行化——注册表是「读-改-写」，并发保存会互相覆盖丢条目。
+const KB_SAVE_MAX_CHARS = 200000;
+const KB_VERSION_DIR = 'kb/versions/';
+const KB_VERSION_KEEP = 3;
+const SAVE_MODES = ['auto', 'create', 'overwrite', 'append', 'prepend'];
+
+function normalizeSaveMode(m) {
+  const s = String(m || '').toLowerCase().trim();
+  return SAVE_MODES.indexOf(s) !== -1 ? s : 'auto';
+}
+
+function normalizeTags(v) {
+  const raw = Array.isArray(v) ? v : String(v == null ? '' : v).split(/[,，、]/);
+  const out = [];
+  for (const x of raw) {
+    const t = String(x).replace(/^#/, '').replace(/[\r\n]+/g, ' ').trim().slice(0, 20);
+    if (!t || out.indexOf(t) !== -1) continue;
+    out.push(t);
+    if (out.length >= 8) break;
+  }
+  return out;
+}
+
+// 去掉 frontmatter，只留正文（追加/前置时需要拼接旧正文）
+function stripFrontmatter(text) {
+  return String(text || '').replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '');
+}
+
+// 内容指纹：长度 + 前 4000 字的 djb2。够用来挡「同一篇换标题重复入库」，
+// 又不需要把整篇文档再哈希一遍（大文档的 CPU 在 Workers 上是真金白银）。
+function contentFingerprint(s) {
+  const t = String(s || '').replace(/\s+/g, ' ').trim();
+  let h = 5381;
+  const n = Math.min(t.length, 4000);
+  for (let i = 0; i < n; i++) h = ((h << 5) + h + t.charCodeAt(i)) >>> 0;
+  return t.length.toString(36) + '-' + h.toString(36);
+}
+
+// 错误页识别：只对短内容生效。长文档里引用一句 "404 Not Found" 是正常的，
+// 但整篇不到 1200 字、开头就是 404/403/人机校验，那基本就是抓取失败的残渣。
+const ERROR_PAGE_HINTS = [
+  /^\s*404\s+not\s+found/i,
+  /^\s*403\s+forbidden/i,
+  /^\s*500\s+internal\s+server\s+error/i,
+  /just\s+a\s+moment\.\.\./i,
+  /enable\s+javascript\s+and\s+cookies/i,
+  /<title>\s*(404|403|500|access denied)/i,
+];
+function looksLikeErrorPage(s) {
+  const t = String(s || '').trim();
+  if (!t || t.length > 1200) return '';
+  for (const re of ERROR_PAGE_HINTS) if (re.test(t)) return '错误页/人机校验页';
+  return '';
+}
+
+// 注册表读改写串行化：Workers 单 isolate 内用一条 promise 链排队。
+// 跨 isolate 无法加锁（R2 没有事务），但至少同一实例里同时保存多篇不会互相覆盖。
+let saveChain = Promise.resolve();
+function withSaveLock(fn) {
+  const next = saveChain.catch(() => {}).then(fn);
+  saveChain = next.catch(() => {});
+  return next;
+}
+
+// 覆盖前把旧正文存档到 kb/versions/<slug>/<ts>.md，只保留最近 KB_VERSION_KEEP 份
+async function snapshotVersion(env, file, body) {
+  if (!env || !env.R2 || !body) return '';
+  const slug = String(file || '').replace(/\.md$/i, '') || 'doc';
+  const dir = KB_VERSION_DIR + slug + '/';
+  const key = dir + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 5) + '.md';
+  const ok = await storePutChecked(env, key, body);
+  if (!ok) return '';
+  try {
+    const listed = await env.R2.list({ prefix: dir, limit: 100 });
+    const keys = (listed.objects || []).map(o => o.key).sort();
+    if (keys.length > KB_VERSION_KEEP) {
+      const drop = keys.slice(0, keys.length - KB_VERSION_KEEP);
+      if (drop.length) await env.R2.delete(drop);
+    }
+  } catch (e) {}
+  return key;
+}
+
 async function toolSaveDoc(env, chatId, args) {
-  args = args || {};
+  return await withSaveLock(() => doSaveDoc(env, chatId, args || {}));
+}
+
+async function doSaveDoc(env, chatId, args) {
   const title = String(args.title || '').replace(/[\r\n]+/g, ' ').trim().slice(0, 80);
   const cleanSource = String(args.source || '').replace(/[\r\n]+/g, ' ').trim().slice(0, 500);
   let content = String(args.content || '');
   if (!title) return '标题为空，未保存';
   if (!content.trim()) return '内容为空，未保存';
   if (!env.R2) return 'R2 未绑定，知识库文档无法保存。请先按 README 第二步绑定 R2 存储桶后再试；本次内容未保存。';
-  if (content.length > 100000) content = content.slice(0, 100000) + '\n\n> （内容过长，仅保存前 10 万字符）';
+
+  const mode = normalizeSaveMode(args.mode);
+  const tags = normalizeTags(args.tags);
+
+  const badKind = looksLikeErrorPage(content);
+  if (badKind) {
+    return '知识库文档写入已拒绝：内容看起来是「' + badKind + '」，不是有效资料。请确认原文可读（或换用 web_fetch 重试）后再保存；本次未写入。';
+  }
+
+  let truncated = false;
+  if (content.length > KB_SAVE_MAX_CHARS) {
+    content = content.slice(0, KB_SAVE_MAX_CHARS);
+    truncated = true;
+  }
+
   const file = kbDocSlug(title) + '.md';
   const key = KB_DOCS_PREFIX + file;
   const reg = await kbGetRegistry(env);
-  const normSrc = kbNormSource(args.source);
-  if (normSrc) {
-    const dup = reg.find(e => kbNormSource(e.source) === normSrc);
-    if (dup && dup.file !== file) {
-      return '该链接已保存为知识库文档《' + (dup.title || dup.file) + '》，未重复保存。如需更新内容，请用标题"' + (dup.title || dup.file) + '"（或清洗后同名标题）重新保存以覆盖，或先用 delete_doc 删除旧文档。';
-    }
-  }
   const prevEntry = reg.find(e => e.file === file);
   const existed = !!prevEntry;
+
+  // 来源去重：同一个 URL 换了标题，不该存第二份
+  const normSrc = kbNormSource(args.source);
+  if (normSrc && !existed) {
+    const dup = reg.find(e => kbNormSource(e.source) === normSrc);
+    if (dup && dup.file !== file) {
+      return '该链接已保存为知识库文档《' + (dup.title || dup.file) + '》，未重复保存。如需更新内容，请用标题"' + (dup.title || dup.file) + '"重新保存以覆盖，或先用 delete_doc 删除旧文档。';
+    }
+  }
+
+  // 内容指纹去重：同一篇资料换了标题
+  const fp = contentFingerprint(content);
+  if (!existed) {
+    const fpDup = reg.find(e => e.file !== file && e.fp && e.fp === fp);
+    if (fpDup) {
+      return '相同内容已保存为《' + (fpDup.title || fpDup.file) + '》，未重复保存（内容指纹一致）。如需另存一份，请在标题上做区分，或先删除旧文档。';
+    }
+  }
+
+  if (existed && mode === 'create') {
+    return '同名文档《' + (prevEntry.title || file) + '》已存在（' + kbFmtSize(prevEntry.size) + '）。如需更新请改用 mode=overwrite 覆盖、mode=append 追加或 mode=prepend 前置整理，或换一个标题。';
+  }
+
+  let finalContent = content;
+  let action = existed ? '已覆盖旧版' : '新建';
+  let versionKey = '';
+
+  if (existed && mode !== 'create') {
+    const oldFull = await kbReadDocTextCached(env, key);
+    if (oldFull != null) {
+      // snapshot:false 供「先落盘原文、再前置整理大纲」这类两步写入使用，
+      // 避免同一次入库占掉两个版本槽位
+      if (args.snapshot !== false) versionKey = await snapshotVersion(env, file, oldFull);
+      const oldBody = stripFrontmatter(oldFull).trim();
+      if (mode === 'append') {
+        finalContent = oldBody + '\n\n' + content;
+        action = '已追加';
+      } else if (mode === 'prepend') {
+        finalContent = content + '\n\n---\n\n' + oldBody;
+        action = '已前置整理大纲';
+      }
+    }
+  }
+
   const nowIso = new Date().toISOString();
   const head = '---\ntitle: "' + title.replace(/"/g, '') + '"\nsaved_at: ' + nowIso
     + '\nchat_id: "' + kbSafeChatId(chatId) + '"'
     + (cleanSource ? '\nsource: ' + cleanSource : '')
+    + (tags.length ? '\ntags: ' + tags.join(', ') : '')
     + '\n---\n\n';
-  const body = head + content;
+  const body = head + finalContent;
   const okDoc = await storePutChecked(env, key, body);
   if (!okDoc) return '知识库文档写入 R2 失败（' + key + '），请检查 R2 绑定与权限后重试；本次内容未保存。';
   // 穿透更新 L1 正文缓存
@@ -134,21 +278,28 @@ async function toolSaveDoc(env, chatId, args) {
     file: file,
     title: title,
     source: cleanSource,
-    // size 统一为字节数（旧版写的是字符数，与重建出来的条目单位不一致）；
-    // chars 供 read_doc 在不下载正文的情况下判断 offset 是否越界
+    tags: tags,
+    // size 统一为字节数；chars 供 read_doc 在不下载正文的情况下判断 offset 是否越界
     size: new TextEncoder().encode(body).byteLength,
     chars: body.length,
+    fp: fp,
+    version: (Number(prevEntry && prevEntry.version) || 0) + 1,
     updated_at: nowIso
   };
   const idx = reg.findIndex(e => e.file === file);
   if (idx >= 0) reg[idx] = entry; else reg.push(entry);
   const okReg = await kbSaveRegistry(env, reg);
   if (!okReg) return '文档正文已写入 R2（' + key + '），但注册表更新失败，文档可能暂不出现在列表中；请稍后重新保存一次以修复注册表，本次内容未丢失。';
-  let verNote = existed ? '，已覆盖旧版本' : '，新建';
+
+  const parts = [finalContent.length + ' 字符', action];
+  if (tags.length) parts.push('标签：' + tags.join('、'));
+  if (truncated) parts.push('内容超长，仅保存前 ' + KB_SAVE_MAX_CHARS + ' 字符');
+  if (versionKey) parts.push('旧版已存档 ' + versionKey);
+  let tail = '';
   if (existed && prevEntry && prevEntry.title !== title) {
-    verNote += '（注意：新标题清洗后与旧文档《' + prevEntry.title + '》同名，旧内容已被覆盖）';
+    tail = '（注意：新标题清洗后与旧文档《' + prevEntry.title + '》同名，旧内容已被覆盖）';
   }
-  return '已保存为知识库文档：' + key + '（' + content.length + ' 字符' + verNote + '）';
+  return '已保存为知识库文档：《' + title + '》（' + parts.join('，') + '）' + tail;
 }
 
 async function toolListDocs(env) {
@@ -167,7 +318,10 @@ async function toolListDocs(env) {
     ? '，按更新时间显示最近 ' + shown.length + ' 篇，其余请用 read_doc 按关键词检索'
     : '';
   return '知识库文档（共' + reg.length + '篇' + more + '）：\n' +
-    shown.map((e, i) => (i + 1) + '. ' + (e.title || e.file) + '（' + kbFmtSize(e.size) + '，' + kbFmtDate(e.updated_at) + '）').join('\n');
+    shown.map((e, i) => {
+      const tagNote = (Array.isArray(e.tags) && e.tags.length) ? '，标签：' + e.tags.join('、') : '';
+      return (i + 1) + '. ' + (e.title || e.file) + '（' + kbFmtSize(e.size) + '，' + kbFmtDate(e.updated_at) + tagNote + '）';
+    }).join('\n');
 }
 
 async function toolReadDoc(env, args, maxChars) {
@@ -203,7 +357,8 @@ async function toolReadDoc(env, args, maxChars) {
     } else if (offset > 0) {
       note = '\n\n> （当前显示第 ' + offset + ' ~ ' + totalLen + ' 字符，已读到文档末尾）';
     }
-    return '【知识库文档《' + (hit.title || hit.file) + '》】\n' + slice + note;
+    const tagNote = (Array.isArray(hit.tags) && hit.tags.length) ? '｜标签：' + hit.tags.join('、') : '';
+    return '【知识库文档《' + (hit.title || hit.file) + '》' + tagNote + '】\n' + slice + note;
   }
   // 标题无命中 → 全文多关键词相关性检索（v7.7.0 覆盖全库，按更新时间优先，带时间预算）
   const ordered = reg.slice().sort((a, b) => {

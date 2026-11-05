@@ -303,13 +303,15 @@ const TOOL_DEFS = [
     type: 'function',
     function: {
       name: 'save_doc',
-      description: '长文保存为知识库文档（仅明确要求保存成文档时）。',
+      description: '长文保存为知识库文档；mode 控制新建/覆盖/追加，tags 便于检索。',
       parameters: {
         type: 'object',
         properties: {
           title: { type: 'string', description: '文档标题' },
           content: { type: 'string', description: 'Markdown 正文' },
-          source: { type: 'string', description: '原文链接' }
+          source: { type: 'string', description: '原文链接' },
+          mode: { type: 'string', description: 'auto(默认)/create/overwrite/append/prepend' },
+          tags: { type: 'string', description: '逗号分隔标签，最多 8 个' }
         },
         required: ['title', 'content']
       }

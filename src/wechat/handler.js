@@ -28,6 +28,7 @@ import { readErrorBody } from '../agent/stability.js';
 import { toolSaveDoc, toolListDocs, toolReadDoc, toolDeleteDoc, kbSearchDocBody,
   kbReadDocTextCached } from '../kb/doc-tools.js';
 import { kbGetRegistry, KB_DOCS_PREFIX } from '../kb/registry.js';
+import { autoOrganizeAndSaveKbDoc, deriveFileDocTitle } from '../kb/organize.js';
 import {
   DEFAULT_ILINK_BASE_URL,
   DEFAULT_ILINK_CDN_URL,
@@ -619,84 +620,6 @@ async function sendWechatImageFromSource(env, creds, userId, contextToken, sourc
 
 const SUPPORTED_DOC_EXT_RE = /\.(md|markdown|txt|csv|tsv|json|jsonl|log|py|js|mjs|ts|tsx|jsx|html|htm|css|xml|yaml|yml|toml|ini|conf|sh|bash|sql|go|rs|java|c|cpp|h)$/i;
 
-// 自动调用 AI 对新入库文档进行结构化知识整理，并将「AI 结构化大纲 + 原始全文归档」自动同步写入知识库
-async function autoOrganizeAndSaveKbDoc(env, chatId, activeModelId, docTitle, rawContent, sourceLabel, userNote = '') {
-  const cleanTitle = String(docTitle || '未命名知识文档').replace(/[\r\n]+/g, ' ').trim().slice(0, 75) || '未命名知识文档';
-  const fullText = String(rawContent || '').trim();
-  if (!fullText) return { ok: false, error: '文档内容为空' };
-
-  // 第一步：先将原始全文安全落盘入库（防止超大文档或网络抖动丢数据）
-  let saveResult = '';
-  if (env && env.R2) {
-    saveResult = await toolSaveDoc(env, chatId, {
-      title: cleanTitle,
-      content: fullText,
-      source: sourceLabel || 'wechat_upload',
-    });
-  }
-
-  // 第二步：调用 AI 自动提炼结构化知识大纲、核心要点、关键数据与检索标签
-  const excerpt = fullText.length > 42000
-    ? fullText.slice(0, 42000) + '\n\n…（原文较长，以上为前 42000 字符）'
-    : fullText;
-  const kbMessages = [
-    {
-      role: 'system',
-      content: '你是一位专业的知识库架构师。请将用户提供的文档或资料自动整理成结构严谨、高信息密度的知识库档案。必须完整保留原文中的关键数据、核心定义、流程步骤、条款规则与结论，切勿遗漏重要细节。',
-    },
-    {
-      role: 'user',
-      content: `请将以下资料《${cleanTitle}》自动整理为结构化知识库档案，严格包含以下四个部分：\n`
-        + `1. 【📌 核心摘要】：用 2~4 句话高度概括文档主旨与用途；\n`
-        + `2. 【🗂️ 结构化知识大纲】：按逻辑模块或章节详细提炼所有核心知识点、规则、公式、接口或流程；\n`
-        + `3. 【📊 关键数据与结论速查】：提取文中的关键参数、数字指标、表格结论或时间节点；\n`
-        + `4. 【🏷️ 检索关键词标签】：列出 5~10 个核心检索词。\n`
-        + (userNote ? `\n用户附加说明：${userNote}\n` : '')
-        + `\n原始资料内容如下：\n\`\`\`\n${excerpt}\n\`\`\``,
-    },
-  ];
-
-  let organizedSummary = '';
-  const aiCfg = buildAIRequest(env, activeModelId, kbMessages, false);
-  if (!aiCfg.error) {
-    try {
-      const resp = await fetch(aiCfg.apiUrl, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${aiCfg.currentApiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(aiCfg.payload),
-        signal: AbortSignal.timeout(55000),
-      });
-      if (resp.ok) {
-        const d = await resp.json();
-        if (d && d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content) {
-          organizedSummary = String(d.choices[0].message.content).trim();
-        }
-      }
-    } catch (e) {}
-  }
-
-  // 第三步：将「AI 结构化知识整理 + 原始文档全文」合并写回知识库，实现检索与精读双优
-  if (organizedSummary && env && env.R2) {
-    const combinedDoc = `## 🤖 AI 自动整理知识大纲\n\n${organizedSummary}\n\n---\n\n## 📄 原始文档全文归档（${cleanTitle}）\n\n${fullText}`;
-    saveResult = await toolSaveDoc(env, chatId, {
-      title: cleanTitle,
-      content: combinedDoc,
-      source: sourceLabel || 'wechat_upload',
-    });
-  }
-
-  return {
-    ok: !!(env && env.R2 && /^已保存为知识库文档/.test(saveResult)),
-    title: cleanTitle,
-    organizedSummary: organizedSummary || ('（已提取原文共 ' + fullText.length + ' 字符）\n' + fullText.slice(0, 1200)),
-    saveResult: saveResult || (env && env.R2 ? '已保存' : '⚠️ 当前未绑定持久化存储 (R2/Blob/KV)，仅在当前会话生效'),
-    charCount: fullText.length,
-  };
-}
-
 // 读取全部知识库文档列表与正文（供网页端自动同步展示）
 // v7.7.0：复用 Agent 的 L1 正文缓存，并按 6 路并发读取（旧版逐篇串行 get，30 篇要等 30 个往返）
 async function loadAllKbDocsForSync(env) {
@@ -871,7 +794,7 @@ async function processWechatMessage(env, creds, rawMsg) {
         if (!fModelId) fModelId = await storeGet(env, `tg_user_${chatId}`);
         const useModelId = resolveModelKey(modelObjList, fModelId) || modelObjList[0].key;
 
-        const docTitle = String(fm.fileName || '微信上传文档').replace(/\.[^.]+$/, '').trim() || fm.fileName;
+        const docTitle = deriveFileDocTitle(userText, fm.fileName);
         const orgRes = await autoOrganizeAndSaveKbDoc(
           env,
           chatId,
@@ -883,7 +806,7 @@ async function processWechatMessage(env, creds, rawMsg) {
         );
         await sendWxTypingStatus(env, creds, userId, contextToken, 2);
 
-        const kbReply = `📚 文件《${fm.fileName}》已自动整理并同步入库！\n`
+        const kbReply = `📚 文件《${fm.fileName}》整理完成\n`
           + `────────────\n`
           + `${orgRes.organizedSummary}\n`
           + `────────────\n`
@@ -991,13 +914,17 @@ async function processWechatMessage(env, creds, rawMsg) {
         + `• 「清空」或 /clear —— 清空对话上下文\n`
         + `• 「记忆」或 /memory —— 查看长期记忆（平时说「记住…」即可保存）\n`
         + `• 「忘掉 关键词」或 /forget —— 删除指定记忆\n`
-        + `• 「知识库」或 /kb —— 查看知识库文档与记忆统计\n`
+        + `• 「知识库」或 /kb —— 查看知识库文档与三层记忆统计\n`
+        + `• 「整理知识库 标题」或 /savekb 标题 —— 把刚聊的内容自动整理成结构化文档入库\n`
+        + `• 「读取文档 标题」或 /readdoc 标题 —— 精读某篇文档全文\n`
+        + `• 「删除文档 标题」或 /deldoc 标题 —— 删除某篇文档\n`
         + `• 「状态」或 /status —— 查看通道健康度与会话统计\n`
         + `• 「继续」—— 当长任务暂停时接着完成推理\n\n`
         + `▎二、多模态能力\n`
         + `• 🎙️ 发语音：自动语音转文字并回答\n`
         + `• 🖼️ 发图片：自动解密并进行 Vision 视觉分析\n`
-        + `• 📄 发文件：支持 .md/.txt/.csv/.json/代码文件阅读与存入知识库`,
+        + `• 📄 发文件：Word/Excel/PPT/PDF/Markdown/文本/表格/代码均可，发送即【自动整理并入库】\n`
+        + `   附言「把《标题》存进知识库」可自定义文档标题`,
         true
       );
       return { processed: true };
@@ -1076,7 +1003,7 @@ async function processWechatMessage(env, creds, rawMsg) {
       const orgRes = await autoOrganizeAndSaveKbDoc(env, chatId, activeModelId, customTitle, recentTurns, 'wechat_chat_summary');
       await sendWxTypingStatus(env, creds, userId, contextToken, 2);
       await sendReply(
-        `📚 已将当前对话自动整理并存入知识库：《${orgRes.title}》\n`
+        `📚 知识库整理完成：《${orgRes.title}》\n`
         + `────────────\n`
         + `${orgRes.organizedSummary}\n`
         + `────────────\n`

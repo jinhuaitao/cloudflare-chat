@@ -53,6 +53,22 @@ function kbParseFrontmatter(head) {
   }
   return out;
 }
+
+// v7.11.0：tags 在 frontmatter 里是 "a, b, c" 一行，读出来要还原成数组，
+// 否则检索时只能整串匹配，等于没有标签能力。
+function kbParseTags(v) {
+  if (Array.isArray(v)) return v.map(x => String(x).trim()).filter(Boolean).slice(0, 8);
+  return String(v == null ? '' : v)
+    .split(/[,，、]/)
+    .map(x => x.replace(/^#/, '').trim())
+    .filter(Boolean)
+    .slice(0, 8);
+}
+
+function kbFmtTags(tags) {
+  const list = kbParseTags(tags);
+  return list.length ? '｜标签：' + list.join('、') : '';
+}
 // 列出 kb/docs/ 下全部文档对象（分页取全量；自动排除 registry.json）
 async function kbListDocObjects(env) {
   const objs = [];
@@ -87,6 +103,7 @@ async function kbRebuildRegistry(env) {
       file: String(o.key).slice(KB_DOCS_PREFIX.length),
       title: fm.title || kbDocTitleOf(o.key),
       source: fm.source || '',
+      tags: kbParseTags(fm.tags),
       size: o.size || 0,
       updated_at: fm.saved_at || (o.uploaded ? new Date(o.uploaded).toISOString() : '')
     };
@@ -133,23 +150,32 @@ async function kbSaveRegistry(env, reg) {
     return false;
   }
 }
-// 注册表内模糊查找：标题精确相等 > 标题包含 > 文件名包含（大小写不敏感）
-// v7.7.0：单遍扫描（旧版最多扫 4 遍），slug 归一化只在常规匹配全部落空时才计算。
+// 注册表内模糊查找：标题精确相等 > 标题包含 > 标签命中 > slug 归一化 > 文件名包含
+// v7.11.0：新增标签命中，让「读一下 Kubernetes 相关的文档」这类按标签检索的需求能落地。
 function kbFindRegEntry(reg, query) {
   const q = String(query || '').trim().toLowerCase();
   if (!q || !Array.isArray(reg) || !reg.length) return null;
   let exact = null;
   let contains = null;
+  let tagHit = null;
   let fileHit = null;
   for (const e of reg) {
     if (!e) continue;
     const title = String(e.title || '').toLowerCase();
     if (!exact && title === q) exact = e;
     if (!contains && title.indexOf(q) !== -1) contains = e;
+    if (!tagHit && Array.isArray(e.tags) && e.tags.length) {
+      for (const t of e.tags) {
+        const tl = String(t || '').toLowerCase();
+        if (!tl) continue;
+        if (tl === q || tl.indexOf(q) !== -1 || q.indexOf(tl) !== -1) { tagHit = e; break; }
+      }
+    }
     if (!fileHit && String(e.file || '').toLowerCase().indexOf(q) !== -1) fileHit = e;
     if (exact) break;
   }
   if (exact || contains) return exact || contains;
+  if (tagHit) return tagHit;
   // v6.8.4：查询也做 slug 归一化（去空格/特殊字符），"甲骨文云 ARM" 能命中 "甲骨文云ARM"
   let qSlug = '';
   try { qSlug = kbDocSlug(query).toLowerCase(); } catch (e) {}
@@ -178,6 +204,8 @@ export {
   kbNormSource,
   kbDocTitleOf,
   kbParseFrontmatter,
+  kbParseTags,
+  kbFmtTags,
   kbListDocObjects,
   kbRebuildRegistry,
   kbGetRegistry,

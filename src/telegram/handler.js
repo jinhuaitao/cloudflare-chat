@@ -14,7 +14,8 @@ import { agentGetMode, agentSetMode } from '../agent/mode.js';
 import { agentLoadResumeState, agentClearResumeState, tgAgentResumeKey } from '../agent/resume.js';
 import { tgAgentChat, tgAgentResume } from '../agent/loop.js';
 import { readErrorBody } from '../agent/stability.js';
-import { toolListDocs } from '../kb/doc-tools.js';
+import { toolListDocs, toolSaveDoc, toolReadDoc, toolDeleteDoc } from '../kb/doc-tools.js';
+import { autoOrganizeAndSaveKbDoc, deriveFileDocTitle } from '../kb/organize.js';
 import {
   DEFAULT_ILINK_BASE_URL,
   DEFAULT_ILINK_CDN_URL,
@@ -106,6 +107,8 @@ async function releaseUpdateForRetry(env, uid) {
   } catch (e) {}
 }
 
+// 从「把 XXX 存进知识库」这类说明里抽出文档标题；抽不出来就用文件名去掉扩展名。
+// 标题直接决定知识库里的 slug，所以必须短、不能带换行、不能是空串。
 // 命令解析：兼容群组里的 /cmd@botname 写法与命令后带参数。
 function parseCommand(t, botUsername) {
   const m = /^(\/[a-zA-Z]+)(?:@([a-zA-Z0-9_]+))?(?:\s+([\s\S]*))?$/.exec(String(t || '').trim());
@@ -349,13 +352,32 @@ export async function handleTgWebhook(request, env) {
           }
           try {
             const bytes = await tgFetchFileBytes(env, doc.file_id, 512 * 1024, tgApiTimeoutMs);
-            let docText = new TextDecoder('utf-8').decode(bytes);
-            if (docText.length > 60000) {
-              docText = docText.slice(0, 60000) + '\n\n…（文件较长，已截取前 60000 字符）';
+            const rawText = new TextDecoder('utf-8').decode(bytes);
+            const caption = cleanedCaption.trim();
+            // v7.11.0：只要用户说了「存/入库/保存/知识库」，就先把全文确定性入库，
+            // 不再赌模型会不会记得调用 save_doc。入库用全文，但塞进上下文的只截前 2 万字符——
+            // 旧版把 6 万字符整段塞进 user 消息，一步就吃掉大半上下文预算，
+            // 后面的工具调用必然触发压缩，前面读到的内容反而被折叠掉。
+            const wantSave = /(入库|存进|存入|保存|收藏|知识库)/.test(caption);
+            let saveNote = '';
+            if (wantSave) {
+              const docTitle = deriveFileDocTitle(caption, fileName);
+              const saveRes = await toolSaveDoc(env, chatId, {
+                title: docTitle,
+                content: rawText,
+                source: 'telegram_file:' + fileName,
+                tags: '文件上传'
+              });
+              saveNote = '\n\n【系统提示】该文件已尝试存入知识库：' + saveRes
+                + '。全文已按标题《' + docTitle + '》入库，需要细节时直接用 read_doc 读取，不要重复调用 save_doc。';
             }
-            const caption = cleanedCaption.trim() || '请阅读并总结这份文档的核心内容；如果我要求保存到知识库，请调用 save_doc 工具。';
-            userText = `【上传文件：《${fileName}》】\n用户说明：${caption}\n\n文件内容如下：\n\`\`\`\n${docText}\n\`\`\``;
-            historyUserText = `【上传文件：《${fileName}》】${caption}`;
+            const inlineLimit = wantSave ? 20000 : 60000;
+            const docText = rawText.length > inlineLimit
+              ? rawText.slice(0, inlineLimit) + '\n\n…（文件较长，已截取前 ' + inlineLimit + ' 字符）'
+              : rawText;
+            const captionForModel = caption || '请阅读并总结这份文档的核心内容。';
+            userText = `【上传文件：《${fileName}》】\n用户说明：${captionForModel}\n\n文件内容如下：\n\`\`\`\n${docText}\n\`\`\`${saveNote}`;
+            historyUserText = `【上传文件：《${fileName}》】${captionForModel}`;
           } catch (e) {
             await tgApi('sendMessage', { chat_id: chatId, text: '⚠️ 读取上传文件失败：' + (e && e.message ? e.message : String(e)), ...replyExtra });
             return;
@@ -536,6 +558,9 @@ export async function handleTgWebhook(request, env) {
                 + "/memory —— 查看三层记忆（L1 会话要点 / L2 长期事实 / L3 归档）\n"
                 + "/forget 关键词 —— 删除包含关键词的长期记忆\n"
                 + "/kb —— 知识库总览（文档列表 + 三层记忆统计）\n"
+                + "/savekb [标题] —— 把最近这段对话自动整理成结构化文档入库\n"
+                + "/readdoc 标题关键词 —— 精读某篇知识库文档\n"
+                + "/deldoc 标题关键词 —— 删除某篇知识库文档\n"
                 + "/wxlogin、/wxstatus、/wxunbind ——（私聊专属）安全扫码绑定/查看/解绑微信 ClawBot\n"
                 + "任务太长被暂停时，发送「继续」（群聊可 @我 继续 或直接回复我「继续」）可接着做\n\n"
                 + "👥 群聊用法：在群里直接 `@机器人 你的问题`，或直接「回复（Reply）」机器人的上一条消息即可连续对话（传图/传文件同理）。\n"
@@ -562,10 +587,75 @@ export async function handleTgWebhook(request, env) {
             text += '🧠 三层记忆：L1 工作记忆 ' + st.l1Items + ' 个话题 / ' + st.l1Pins + ' 条固定；'
               + 'L2 长期记忆 ' + st.l2 + ' 条；L3 归档 ' + st.l3 + ' 条（/memory 查看，/forget 关键词 删除）\n\n';
             text += await toolListDocs(env);
-            text += '\n\n💾 保存文档：对我说"把…存成知识库文档"或直接上传 .md/.txt 文件；🗑️ 删文档：说"删除知识库文档《标题》"';
+            text += '\n\n💡 快捷操作：\n'
+              + '• /savekb [标题] —— 把最近这段对话自动整理成结构化文档入库\n'
+              + '• /readdoc 标题关键词 —— 精读某篇文档全文\n'
+              + '• /deldoc 标题关键词 —— 删除某篇文档\n'
+              + '• 直接上传 .md/.txt/.csv/.json 文件并附言「存进知识库」即全文入库；说「把…存成知识库文档」也可以';
             for (let s = 0; s < text.length; s += 4000) {
               await tgApi('sendMessage', { chat_id: chatId, text: text.slice(s, s + 4000), ...replyExtra });
             }
+            return;
+          }
+
+          // 整理知识库：把最近若干轮对话交给模型提炼成结构化档案再入库。
+          // 微信端一直有这个能力（发「整理知识库 标题」），Telegram 端此前完全没有入口。
+          if (cmd && cmd.cmd === '/savekb') {
+            const hist = await tgGetHistory(env, chatId);
+            if (!hist.length) {
+              await tgApi('sendMessage', {
+                chat_id: chatId,
+                text: '⚠️ 当前会话还没有可整理的对话内容。你可以先聊几句再发 /savekb，或者直接上传文件（附言「存进知识库」）让我入库。',
+                ...replyExtra
+              });
+              return;
+            }
+            const recentTurns = hist.slice(-12)
+              .map(m => (m.role === 'assistant' ? 'AI' : '用户') + '：' + (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)))
+              .join('\n\n');
+            // 命令分支在 targetModelId 解析之前，这里单独取一次（缓存 → R2 → 交给下游默认第一个模型）
+            let kbModelId = mapGetBounded(tgUserModels, chatId, env && env.R2 ? tgUserModelsExp : null);
+            if (!kbModelId) kbModelId = (await storeGet(env, `tg_user_${chatId}`)) || '';
+            const customTitle = (cmd.rest || '').trim() || ('对话知识整理_' + new Date().toISOString().slice(0, 10));
+            await tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
+            let orgRes;
+            try {
+              orgRes = await autoOrganizeAndSaveKbDoc(env, chatId, kbModelId, customTitle, recentTurns, 'telegram_chat_summary');
+            } catch (e) {
+              orgRes = { ok: false, title: customTitle, organizedSummary: '', saveResult: '⚠️ 整理失败：' + (e && e.message ? e.message : String(e)) };
+            }
+            const outText = '📚 知识库整理完成：《' + orgRes.title + '》\n'
+              + '────────────\n'
+              + (orgRes.organizedSummary || '（无摘要）') + '\n'
+              + '────────────\n'
+              + '✅ ' + orgRes.saveResult;
+            for (let s = 0; s < outText.length; s += 4000) {
+              await tgApi('sendMessage', { chat_id: chatId, text: outText.slice(s, s + 4000), ...replyExtra });
+            }
+            return;
+          }
+
+          if (cmd && cmd.cmd === '/readdoc') {
+            const q = (cmd.rest || '').trim();
+            if (!q) {
+              await tgApi('sendMessage', { chat_id: chatId, text: '📖 用法：/readdoc 标题关键词\n例如：/readdoc R2 配置', ...replyExtra });
+              return;
+            }
+            const content = await toolReadDoc(env, { query: q, offset: 0 });
+            for (let s = 0; s < content.length; s += 4000) {
+              await tgApi('sendMessage', { chat_id: chatId, text: content.slice(s, s + 4000), ...replyExtra });
+            }
+            return;
+          }
+
+          if (cmd && cmd.cmd === '/deldoc') {
+            const q = (cmd.rest || '').trim();
+            if (!q) {
+              await tgApi('sendMessage', { chat_id: chatId, text: '🗑️ 用法：/deldoc 标题关键词\n例如：/deldoc 部署笔记', ...replyExtra });
+              return;
+            }
+            const res = await toolDeleteDoc(env, { query: q });
+            await tgApi('sendMessage', { chat_id: chatId, text: '🗑️ ' + res, ...replyExtra });
             return;
           }
 
