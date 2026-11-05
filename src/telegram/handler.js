@@ -586,7 +586,7 @@ export async function handleTgWebhook(request, env) {
             let text = '📚 知识库总览\n\n';
             text += '🧠 三层记忆：L1 工作记忆 ' + st.l1Items + ' 个话题 / ' + st.l1Pins + ' 条固定；'
               + 'L2 长期记忆 ' + st.l2 + ' 条；L3 归档 ' + st.l3 + ' 条（/memory 查看，/forget 关键词 删除）\n\n';
-            text += await toolListDocs(env);
+            text += await toolListDocs(env, { verify: true });
             text += '\n\n💡 快捷操作：\n'
               + '• /savekb [标题] —— 把最近这段对话自动整理成结构化文档入库\n'
               + '• /readdoc 标题关键词 —— 精读某篇文档全文\n'

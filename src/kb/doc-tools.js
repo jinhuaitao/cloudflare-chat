@@ -11,7 +11,8 @@ import { mapSetBounded, mapGetBounded, mapLimit } from '../utils.js';
 import { storePutChecked } from '../store/r2.js';
 import { kbSafeChatId } from '../store/kb.js';
 import { KB_DOCS_PREFIX, kbDocSlug, kbNormSource, kbDocTitleOf, kbGetRegistry,
-  kbSaveRegistry, kbFindRegEntry, kbRegistryVersion, kbFmtSize, kbFmtDate } from './registry.js';
+  kbSaveRegistry, kbFindRegEntry, kbRegistryVersion, kbFmtSize, kbFmtDate,
+  kbTakeRepairCount } from './registry.js';
 
 // v7.1.0：知识库文档正文 L1 内存缓存（每桶最多 48 篇，TTL 120 秒），写入或删除时自动失效/更新
 const KB_DOC_CACHE_MAX = 48;
@@ -216,7 +217,10 @@ async function doSaveDoc(env, chatId, args) {
 
   const file = kbDocSlug(title) + '.md';
   const key = KB_DOCS_PREFIX + file;
-  const reg = await kbGetRegistry(env);
+  // v7.11.1：写路径必须读「最新 + 已核对」的注册表。
+  // 注册表是整表读-改-写，用本实例 30 秒内的旧缓存去写，会把别的实例刚保存的条目整段覆盖掉，
+  // 那些文档正文还在 R2 里、却从此在列表和检索里消失（就是「提示已保存但知识库没有」）。
+  const reg = await kbGetRegistry(env, { fresh: true, verify: true });
   const prevEntry = reg.find(e => e.file === file);
   const existed = !!prevEntry;
 
@@ -264,10 +268,15 @@ async function doSaveDoc(env, chatId, args) {
   }
 
   const nowIso = new Date().toISOString();
+  const nextVersion = (Number(prevEntry && prevEntry.version) || 0) + 1;
+  // v7.11.1：fp / version 也写进 frontmatter。注册表丢了可以按文件重建，
+  // 但重建时只能读到 frontmatter —— 不写进去，重建后就再也挡不住重复入库了。
   const head = '---\ntitle: "' + title.replace(/"/g, '') + '"\nsaved_at: ' + nowIso
     + '\nchat_id: "' + kbSafeChatId(chatId) + '"'
     + (cleanSource ? '\nsource: ' + cleanSource : '')
     + (tags.length ? '\ntags: ' + tags.join(', ') : '')
+    + '\nfp: ' + fp
+    + '\nversion: ' + nextVersion
     + '\n---\n\n';
   const body = head + finalContent;
   const okDoc = await storePutChecked(env, key, body);
@@ -283,7 +292,7 @@ async function doSaveDoc(env, chatId, args) {
     size: new TextEncoder().encode(body).byteLength,
     chars: body.length,
     fp: fp,
-    version: (Number(prevEntry && prevEntry.version) || 0) + 1,
+    version: nextVersion,
     updated_at: nowIso
   };
   const idx = reg.findIndex(e => e.file === file);
@@ -302,10 +311,16 @@ async function doSaveDoc(env, chatId, args) {
   return '已保存为知识库文档：《' + title + '》（' + parts.join('，') + '）' + tail;
 }
 
-async function toolListDocs(env) {
+async function toolListDocs(env, opts) {
   if (!env.R2) return 'R2 未绑定，无法读取知识库文档';
-  const reg = await kbGetRegistry(env);
-  if (!reg.length) return '知识库文档为空（kb/docs/ 下暂无文档，可用 save_doc 保存）';
+  // /kb 这类用户主动查看的入口传 verify:true —— 顺便把索引和实际文件核对一遍，
+  // 免得「文档明明存进去了却不在列表里」。Agent 每轮的 list_docs 走缓存，不额外花 R2 操作。
+  const reg = await kbGetRegistry(env, { verify: !!(opts && opts.verify) });
+  const repaired = kbTakeRepairCount();
+  const repairNote = repaired > 0
+    ? '\n\n🔧 索引与实际文件不一致，已按文件自动修复，补回 ' + repaired + ' 篇此前未列出的文档。'
+    : '';
+  if (!reg.length) return '知识库文档为空（kb/docs/ 下暂无文档，可用 save_doc 保存）' + repairNote;
   // v7.7.0：按更新时间倒序 + 最多列 60 篇。旧版全量列出，几百篇时会撑爆工具结果与上下文
   const MAX_SHOWN = 60;
   const ordered = reg.slice().sort((a, b) => {
@@ -321,7 +336,7 @@ async function toolListDocs(env) {
     shown.map((e, i) => {
       const tagNote = (Array.isArray(e.tags) && e.tags.length) ? '，标签：' + e.tags.join('、') : '';
       return (i + 1) + '. ' + (e.title || e.file) + '（' + kbFmtSize(e.size) + '，' + kbFmtDate(e.updated_at) + tagNote + '）';
-    }).join('\n');
+    }).join('\n') + repairNote;
 }
 
 async function toolReadDoc(env, args, maxChars) {
@@ -329,7 +344,7 @@ async function toolReadDoc(env, args, maxChars) {
   const query = String(args.query || '').trim();
   if (!query) return '请给出要读取的文档标题关键词';
   if (!env.R2) return 'R2 未绑定，无法读取知识库文档';
-  const reg = await kbGetRegistry(env);
+  let reg = await kbGetRegistry(env);
   if (!reg.length) return '知识库文档为空（kb/docs/ 下暂无文档）';
   const offset = Math.max(0, parseInt(args.offset, 10) || 0);
   // v7.9.0：切片长度由调用方预算决定。
@@ -337,7 +352,13 @@ async function toolReadDoc(env, args, maxChars) {
   // 但尾部的"请传 offset=8000"是按 8000 算的，模型照着翻页就会跳过中间 4000 字。
   // 现在由工具自己按预算切片，nextOffset 始终与实际返回的内容对齐。
   const MAX = Math.max(600, Math.min(8000, (maxChars > 0 ? maxChars : 8000)));
-  const hit = kbFindRegEntry(reg, query);
+  let hit = kbFindRegEntry(reg, query);
+  if (!hit) {
+    // v7.11.1：索引可能落后于实际文件（别的实例刚写入、旧版本遗留）。
+    // 未命中时先核对一次索引再判「没有」，避免文档明明在库里却回「未找到」。
+    reg = await kbGetRegistry(env, { verify: true });
+    hit = kbFindRegEntry(reg, query);
+  }
   if (hit) {
     // 注册表带字符数时先判越界：不用为了一个非法 offset 把整篇文档读进内存
     if (typeof hit.chars === 'number' && hit.chars >= 0 && offset >= hit.chars) {
@@ -516,7 +537,7 @@ async function toolDeleteDoc(env, args) {
   const query = String(args.query || '').trim();
   if (!query) return '请给出要删除的文档标题关键词';
   if (!env.R2) return 'R2 未绑定，无法删除知识库文档';
-  const reg = await kbGetRegistry(env);
+  const reg = await kbGetRegistry(env, { fresh: true, verify: true });
   if (!reg.length) return '知识库文档为空，无需删除';
   const hit = kbFindRegEntry(reg, query);
   if (!hit) {

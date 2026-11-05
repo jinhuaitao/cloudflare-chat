@@ -386,3 +386,90 @@ test('整理入库：原文被指纹挡下时不会建出只有摘要的孤儿�
     restore();
   }
 });
+
+// ==================== v7.11.1：索引与真实文件脱节（「已保存但库里没有」） ====================
+
+// 模拟另一个 Worker 实例直接往 R2 写一篇文档 + 索引条目（本实例的内存缓存不会知道）
+function externalAddDoc(r2, file, title, content) {
+  r2.data.set('kb/docs/' + file, docBody(title, content));
+  const list = JSON.parse(r2.data.get('kb/docs/registry.json') || '[]');
+  list.push({
+    file: file,
+    title: title,
+    source: '',
+    tags: [],
+    size: 40,
+    updated_at: '2026-01-02T00:00:00.000Z',
+  });
+  r2.data.set('kb/docs/registry.json', JSON.stringify(list));
+}
+
+test('保存时读最新索引，不会覆盖别的实例刚写入的条目', async () => {
+  const r2 = makeR2();
+  const env = { R2: r2 };
+  await toolSaveDoc(env, 'c1', { title: '甲', content: '甲的内容' });
+  // 另一个实例写入乙（本实例缓存里只有甲）
+  externalAddDoc(r2, '乙.md', '乙', '乙的内容');
+  // 本实例再保存丙：必须保留乙，否则乙的正文还在 R2 里却从列表消失
+  await toolSaveDoc(env, 'c1', { title: '丙', content: '丙的内容' });
+  const files = JSON.parse(r2.data.get('kb/docs/registry.json')).map(e => e.file).sort();
+  assert.deepEqual(files, ['丙.md', '乙.md', '甲.md'].sort());
+});
+
+test('索引落后于实际文件时，/kb 列表自动修复并说明补回了几篇', async () => {
+  const r2 = makeR2();
+  const env = { R2: r2 };
+  await toolSaveDoc(env, 'c1', { title: '甲', content: '甲的内容' });
+  externalAddDoc(r2, '乙.md', '乙', '乙的内容');
+
+  // 默认缓存路径：本实例还不知道乙
+  const stale = await toolListDocs(env);
+  assert.ok(!stale.includes('乙'), '缓存路径不应凭空变出文档');
+
+  const out = await toolListDocs(env, { verify: true });
+  assert.ok(out.includes('共2篇'), out);
+  assert.ok(out.includes('乙'), out);
+  assert.ok(out.includes('补回 1 篇'), out);
+  // 修复结果已写回 R2
+  assert.equal(JSON.parse(r2.data.get('kb/docs/registry.json')).length, 2);
+});
+
+test('read_doc 标题未命中时先核对索引，不把库里的文档报成未找到', async () => {
+  const r2 = makeR2();
+  const env = { R2: r2 };
+  await toolSaveDoc(env, 'c1', { title: '甲', content: '甲的内容' });
+  externalAddDoc(r2, '乙.md', '乙文档', '乙的正文内容');
+
+  const out = await toolReadDoc(env, { query: '乙文档' });
+  assert.ok(out.includes('【知识库文档《乙文档》】'), out.slice(0, 120));
+  assert.ok(out.includes('乙的正文内容'), out);
+});
+
+test('索引丢失后重建仍保留 fp，重复内容依旧挡得住', async () => {
+  const r2 = makeR2();
+  const env = { R2: r2 };
+  const content = '这是一段会被指纹记住的资料内容，用来验证重建后的去重能力。';
+  await toolSaveDoc(env, 'c1', { title: '甲', content });
+  // 模拟索引被删（只剩 .md 文件）
+  r2.data.delete('kb/docs/registry.json');
+  // 重建由下一次写路径触发：换标题存同一份内容应被 fp 挡住
+  const out = await toolSaveDoc(env, 'c1', { title: '乙', content });
+  assert.ok(out.includes('内容指纹一致'), out);
+  assert.equal(r2.data.has('kb/docs/乙.md'), false);
+});
+
+test('frontmatter 记录 fp 与 version，重建后版本号不倒退', async () => {
+  const r2 = makeR2();
+  const env = { R2: r2 };
+  await toolSaveDoc(env, 'c1', { title: '版本测试', content: '第一版' });
+  await toolSaveDoc(env, 'c1', { title: '版本测试', content: '第二版内容' });
+  const body = r2.data.get('kb/docs/版本测试.md');
+  assert.ok(/^fp: [0-9a-z]+-[0-9a-z]+$/m.test(body), body.slice(0, 200));
+  assert.ok(body.includes('version: 2'));
+
+  r2.data.delete('kb/docs/registry.json');
+  const list = await kbGetRegistry(env, { fresh: true });
+  const entry = list.find(e => e.file === '版本测试.md');
+  assert.equal(entry.version, 2);
+  assert.ok(entry.fp, '重建后 fp 应保留');
+});

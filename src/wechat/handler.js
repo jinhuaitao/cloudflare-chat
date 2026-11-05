@@ -962,7 +962,7 @@ async function processWechatMessage(env, creds, rawMsg) {
       const st = await memoryStats(env, chatId);
       let text = '📚 知识库总览（三端实时自动同步）\n────────────\n';
       text += `🧠 三层记忆：L1 ${st.l1Items} 个话题 / ${st.l1Pins} 条固定｜L2 ${st.l2} 条｜L3 ${st.l3} 条（发「记忆」查看）\n\n`;
-      text += await toolListDocs(env);
+      text += await toolListDocs(env, { verify: true });
       text += '\n\n💡 快捷操作：\n• 直接在微信发送文件（.docx/.xlsx/.pptx/.pdf/.md/.txt/.csv/代码）即可【自动整理入库】\n• 发「整理知识库 标题」可将刚聊的内容自动整理入库\n• 发「读取文档 标题」查看内容 | 发「删除文档 标题」删除';
       await sendReply(text, true);
       return { processed: true };

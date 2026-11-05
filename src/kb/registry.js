@@ -87,10 +87,12 @@ async function kbListDocObjects(env) {
 }
 // 从现有文件重建注册表（读每篇前 4096 字节的 frontmatter），并写回。
 // v7.7.0：并发读取（上限 8），文档多时重建耗时从 N × RTT 降到约 N/8 × RTT。
-async function kbRebuildRegistry(env) {
+// v7.11.1：支持传入已列好的对象列表，避免校验时重复 list（Class A 操作）；
+//          并从 frontmatter 还原 fp / version，让重建后的索引仍能去重与显示版本。
+async function kbRebuildRegistry(env, objs) {
   if (!env.R2) return [];
-  const objs = await kbListDocObjects(env);
-  const reg = await mapLimit(objs, 8, async (o) => {
+  const list = Array.isArray(objs) ? objs : await kbListDocObjects(env);
+  const reg = await mapLimit(list, 8, async (o) => {
     let fm = {};
     try {
       // v6.8.4：frontmatter 含长标题/长 source 时 1200 字节可能截断，放大到 4096
@@ -99,7 +101,8 @@ async function kbRebuildRegistry(env) {
         if (r) fm = kbParseFrontmatter(await r.text());
       }
     } catch (e) {}
-    return {
+    const ver = parseInt(fm.version, 10);
+    const entry = {
       file: String(o.key).slice(KB_DOCS_PREFIX.length),
       title: fm.title || kbDocTitleOf(o.key),
       source: fm.source || '',
@@ -107,15 +110,64 @@ async function kbRebuildRegistry(env) {
       size: o.size || 0,
       updated_at: fm.saved_at || (o.uploaded ? new Date(o.uploaded).toISOString() : '')
     };
+    if (fm.fp) entry.fp = fm.fp;
+    if (ver > 0) entry.version = ver;
+    return entry;
   });
   await kbSaveRegistry(env, reg);
   return reg.slice();
 }
-async function kbGetRegistry(env) {
+
+// 索引与真实文件对不上时，以 kb/docs/ 下的实际文件为准重建。
+//
+// 为什么必须有这一步：注册表是「整表读-改-写」，而 R2 没有事务，Workers 又会多实例并发。
+// 两个实例各自用 30 秒内的旧缓存保存文档，后写的那个会把先写的条目整段覆盖掉 ——
+// 结果就是「文档正文好好躺在 R2 里，但列表和检索都找不到它」，
+// 而且因为 registry.json 本身存在且格式合法，旧逻辑永远不会触发自愈，问题就永久留在库里。
+// 这里把「文件」当唯一真相、注册表当可重建索引，索引落后就补回来。
+//
+// lastRepair 记录「被补回索引」的文档数，供列表工具如实告诉用户索引被修过，
+// 而不是让用户以为文档凭空消失。
+let lastRepair = 0;
+function kbTakeRepairCount() {
+  const n = lastRepair;
+  lastRepair = 0;
+  return n;
+}
+
+async function kbVerifyRegistry(env, reg) {
+  const safe = Array.isArray(reg) ? reg : [];
+  if (!env || !env.R2) return { reg: safe, repaired: 0 };
+  let objs = null;
+  try { objs = await kbListDocObjects(env); } catch (e) { objs = null; }
+  // list 失败时宁可用旧索引，也不能把好索引重建没了
+  if (!objs) return { reg: safe, repaired: 0 };
+
+  const files = new Set(objs.map(o => String(o.key).slice(KB_DOCS_PREFIX.length)));
+  const regFiles = new Set(safe.map(e => e && e.file).filter(Boolean));
+  let drift = files.size !== regFiles.size;
+  if (!drift) { for (const f of files) { if (!regFiles.has(f)) { drift = true; break; } } }
+  if (!drift) { for (const f of regFiles) { if (!files.has(f)) { drift = true; break; } } }
+  if (!drift) return { reg: safe, repaired: 0 };
+
+  let repaired = 0;
+  for (const f of files) if (!regFiles.has(f)) repaired += 1;
+  const rebuilt = await kbRebuildRegistry(env, objs);
+  if (repaired > 0) lastRepair += repaired;
+  return { reg: rebuilt, repaired: repaired };
+}
+
+// opts.fresh：跳过 30 秒内存缓存，直接读 R2。写路径必须用（否则会覆盖别的实例刚写入的条目）。
+// opts.verify：读完再和实际文件核对一次，不一致就重建。
+// 另外：注册表为空但 kb/docs/ 下有文件时，无论是否传 verify 都会自动核对修复。
+async function kbGetRegistry(env, opts) {
   if (!env || !env.R2) return [];
+  const o = opts || {};
   const now = Date.now();
-  if (cachedRegistry && cachedRegistryBucket === env.R2 && now < cachedRegistryExp) {
-    return cachedRegistry.slice();
+  if (!o.fresh && cachedRegistry && cachedRegistryBucket === env.R2 && now < cachedRegistryExp) {
+    const hit = cachedRegistry.slice();
+    if (o.verify || !hit.length) return (await kbVerifyRegistry(env, hit)).reg;
+    return hit;
   }
   try {
     const obj = await env.R2.get(KB_REGISTRY_KEY);
@@ -125,6 +177,7 @@ async function kbGetRegistry(env) {
         cachedRegistry = p.slice();
         cachedRegistryBucket = env.R2;
         cachedRegistryExp = Date.now() + KB_REG_CACHE_TTL_MS;
+        if (o.verify || !p.length) return (await kbVerifyRegistry(env, p.slice())).reg;
         return p.slice();
       }
     }
@@ -208,6 +261,8 @@ export {
   kbFmtTags,
   kbListDocObjects,
   kbRebuildRegistry,
+  kbVerifyRegistry,
+  kbTakeRepairCount,
   kbGetRegistry,
   kbSaveRegistry,
   kbFindRegEntry,
