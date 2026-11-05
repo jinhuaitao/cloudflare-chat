@@ -27,11 +27,15 @@ function sseResp(events) {
 const noopTgApi = async () => ({ ok: true, json: async () => ({}) });
 
 // 每步都要重发的固定开销：工具定义 + 系统提示
+// v7.10.0：断言从「总量 < 6000」改为「单工具平均 < 340 字符」。
+// 总量是快照，加一个工具就得改数字；单工具均值才是真正要守的纪律——
+// 它能在新增工具时立刻发现"描述写太啰嗦"，又不会因为工具数量合理增长而误报。
 test('工具定义体积受控（每步重发的固定成本）', () => {
   const tools = getAgentTools(false, { hasKbDocs: true });
   const size = JSON.stringify(tools).length;
-  assert.ok(size < 6000, '工具定义膨胀到 ' + size + ' 字符，单步固定开销过高');
-  assert.equal(tools.length, 18, '工具数量变化时请同步复核体积预算');
+  const perTool = Math.round(size / tools.length);
+  assert.ok(perTool < 340, '工具定义平均 ' + perTool + ' 字符/个（总量 ' + size + '），单步固定开销过高');
+  assert.equal(tools.length, 19, '工具数量变化时请同步复核体积预算');
 });
 
 test('工具定义按权限组合缓存复用，不再每轮重建', () => {
@@ -39,7 +43,7 @@ test('工具定义按权限组合缓存复用，不再每轮重建', () => {
   const b = getAgentTools(false, { hasKbDocs: true });
   assert.equal(a, b, '同一权限组合应返回同一份定义（也是上游前缀缓存的前提）');
   assert.notEqual(a, getAgentTools(true, { hasKbDocs: true }));
-  assert.equal(getAgentTools(false, { hasKbDocs: false }).length, 16);
+  assert.equal(getAgentTools(false, { hasKbDocs: false }).length, 17);
 });
 
 // 系统提示按「稳定前缀 + 动态尾部」排列，多轮对话才能命中上游前缀缓存

@@ -16,6 +16,7 @@ import {
 } from './tools-local.js';
 import { agentSaveMemory, agentForgetMemory } from './memory.js';
 import { toolSaveDoc, toolListDocs, toolReadDoc, toolDeleteDoc } from '../kb/doc-tools.js';
+import { memorySearchText, memoryStatsText, memoryPin, memoryUnpin } from '../memory/index.js';
 
 // ==================== 工具失败判定（唯一入口） ====================
 // v7.5.0：旧版把这个巨型正则内联在 loop.js 里，两个问题：
@@ -40,6 +41,7 @@ const TOOL_FAILURE_PREFIXES = [
   '未找到标题或正文包含', '未找到标题包含',
   'JSON 解析失败', 'JSON 取值失败', '正则编译失败', '正则过长',
   '请提供 pattern', '请提供 path',
+  '记忆检索失败', '记忆写入失败',
 ];
 
 function isToolFailureResult(result) {
@@ -259,9 +261,27 @@ const TOOL_DEFS = [
       parameters: {
         type: 'object',
         properties: {
-          fact: { type: 'string', description: '一句话事实' }
+          fact: { type: 'string', description: '一句话事实' },
+          kind: { type: 'string', description: 'fact/pref/id/task，默认 fact' },
+          weight: { type: 'integer', description: '重要度 1-5，默认 3' }
         },
         required: ['fact']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'memory',
+      description: '三层记忆：search 跨层检索｜stats 各层条数｜pin 固定本会话约束。',
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', description: 'search(默认)|stats|pin' },
+          query: { type: 'string', description: '检索词（search）' },
+          text: { type: 'string', description: '固定内容（pin）' }
+        },
+        required: ['action']
       }
     }
   },
@@ -393,15 +413,40 @@ async function execAgentTool(name, args, env, chatId, kbReadOnly, opts) {
         case 'toolkit': return await toolToolkit(args);
         case 'get_time': return toolGetTime(args.timezone, args);
         case 'get_weather': return await toolGetWeather(args.city);
-        case 'remember': return await agentSaveMemory(env, chatId, args.fact);
+        case 'remember': return await agentSaveMemory(env, chatId, args.fact, { kind: args.kind, weight: args.weight });
+        case 'memory': {
+          const action = String(args.action || 'search').toLowerCase();
+          if (action === 'pin') {
+            // pin 写的是 L1（本会话），Web 只读端不允许——但 search / stats 仍然可用
+            if (kbReadOnly) {
+              return '本端为只读模式，不能固定会话记忆（pin）；检索（search）与统计（stats）仍可使用。请如实告知用户该操作需在 Telegram 或微信 ClawBot 机器人端完成。';
+            }
+            const text = String(args.text || args.query || '').trim();
+            if (!text) return '记忆写入失败：pin 需要给出 text（要固定的内容）';
+            const r = await memoryPin(env, chatId, text);
+            if (!r.ok) return '记忆写入失败：' + (r.reason || '未知原因');
+            if (r.duplicate) return '本会话已经固定过这条内容，无需重复固定（共 ' + r.count + ' 条）。';
+            const persistNote = r.persisted ? '' : '（R2 未绑定或写入失败，仅在当前实例内有效）';
+            return '已固定到本会话工作记忆（L1，共 ' + r.count + ' 条）' + persistNote + '：' + text;
+          }
+          if (action === 'stats') return await memoryStatsText(env, chatId);
+          return await memorySearchText(env, chatId, args.query);
+        }
         case 'forget_memory': {
           const kw = String(args.keyword || '').trim();
           if (!kw) return '关键词为空，未删除任何记忆';
           const rr = await agentForgetMemory(env, chatId, kw);
           if (rr.persistError) return rr.persistError;
+          // v7.10.0：L2 删完顺手清 L1 里同关键词的固定项，避免"忘掉 X"之后提示词里还挂着 X
+          let unpinned = 0;
+          try {
+            const un = await memoryUnpin(env, chatId, kw);
+            unpinned = un.removed || 0;
+          } catch (e) {}
+          const pinNote = unpinned ? '，并解除 ' + unpinned + ' 条本会话固定项' : '';
           return rr.removed > 0
-            ? '已删除 ' + rr.removed + ' 条包含「' + kw + '」的长期记忆'
-            : '未找到包含「' + kw + '」的长期记忆';
+            ? '已删除 ' + rr.removed + ' 条包含「' + kw + '」的长期记忆' + pinNote
+            : (unpinned ? '长期记忆中没有匹配项，但已解除 ' + unpinned + ' 条本会话固定项' : '未找到包含「' + kw + '」的长期记忆');
         }
         case 'save_doc': return await toolSaveDoc(env, chatId, args);
         case 'list_docs': return await toolListDocs(env);

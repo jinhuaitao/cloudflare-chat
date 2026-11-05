@@ -59,6 +59,12 @@ function describeToolCall(name, args) {
     case 'get_weather': return '🌤 正在查询天气：' + (args.city || '');
     case 'get_time': return '🕐 正在获取时间/推算日期…';
     case 'remember': return '🧠 正在记住…';
+    case 'memory': {
+      const a = String(args.action || 'search').toLowerCase();
+      if (a === 'pin') return '📌 正在固定本会话约束…';
+      if (a === 'stats') return '📊 正在统计三层记忆…';
+      return '🔎 正在检索三层记忆：' + (args.query || '');
+    }
     case 'forget_memory': return '🗑️ 正在清理记忆：' + (args.keyword || '');
     case 'save_doc': return '💾 正在保存文档：' + (args.title || '');
     case 'list_docs': return '📚 正在查看知识库文档…';

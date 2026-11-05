@@ -26,10 +26,19 @@ function kbSafeChatId(chatId) { return String(chatId == null ? '' : chatId).repl
 function kbMemDir(chatId) { return KB_PREFIX + 'mem/' + kbSafeChatId(chatId) + '/'; }
 // md 文件名：时间戳（36 进制，可按字典序排列）+ 随机后缀防同毫秒碰撞
 function kbNewMemFile() { return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6) + '.md'; }
-function kbMemMarkdown(chatId, fact, ts) {
+// md 镜像正文。v7.10.0 起支持 meta（kind / weight），
+// 让控制台里翻到的每条记忆自带类型与权重，不用再回 JSON 索引里对照。
+function kbMemMarkdown(chatId, fact, ts, meta) {
   let d = '';
   try { d = new Date(ts || Date.now()).toISOString(); } catch (e) { d = new Date().toISOString(); }
-  return '---\nchat_id: "' + kbSafeChatId(chatId) + '"\nsaved_at: ' + d + '\n---\n\n' + String(fact == null ? '' : fact) + '\n';
+  let extra = '';
+  if (meta && typeof meta === 'object') {
+    const kind = String(meta.kind || '').replace(/[^a-z]/g, '');
+    if (kind) extra += 'kind: ' + kind + '\n';
+    const w = parseInt(meta.weight, 10);
+    if (w >= 1 && w <= 5) extra += 'weight: ' + w + '\n';
+  }
+  return '---\nchat_id: "' + kbSafeChatId(chatId) + '"\nsaved_at: ' + d + '\n' + extra + '---\n\n' + String(fact == null ? '' : fact) + '\n';
 }
 // R2 批量删除（delete 支持字符串数组，一次最多 1000 个）
 async function kbDeleteKeys(env, keys) {

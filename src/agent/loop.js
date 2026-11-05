@@ -40,7 +40,7 @@ import { agentLimits, describeToolCall, toolResultCap } from './limits.js';
 import { agentSaveResumeState } from './resume.js';
 import { readUpstreamMessage } from './upstream.js';
 import { getAgentTools, execAgentTool, isToolFailureResult } from './tools.js';
-import { agentGetMemories } from './memory.js';
+import { memoryLoad, memoryRecordTurn } from '../memory/index.js';
 import { buildAgentSystemPrompt } from './prompt.js';
 import { kbGetRegistry } from '../kb/registry.js';
 import { mapLimit } from '../utils.js';
@@ -153,24 +153,50 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
   }
   const query = lastUserText(safeHistory);
   const kbReadOnly = !!(opts && opts.kbReadOnly);
-  // 并发加载长期记忆与知识库文档注册表（各带兜底超时：R2 抖动不该拖住首字）
+  // 并发加载三层记忆与知识库文档注册表（各带兜底超时：R2 抖动不该拖住首字）。
+  // v7.10.0：原来是"一次读长期记忆 + 一次读注册表"，现在 L1/L2/L3 三层在 memoryLoad
+  // 内部并行读取，外层仍然只占一个等待位——多读两层不等于多等两轮。
   const r2BudgetMs = Math.max(500, Math.min(3000, (opts && opts.r2BudgetMs) || 1500));
-  const [memories, kbDocs] = await Promise.all([
-    kbReadOnly ? Promise.resolve([]) : withTimeout(agentGetMemories(env, chatId), r2BudgetMs, []),
+  const [memoryBundle, kbDocs] = await Promise.all([
+    withTimeout(memoryLoad(env, chatId, query, { readOnly: kbReadOnly }), r2BudgetMs, null),
     withTimeout(kbGetRegistry(env), r2BudgetMs, null)
   ]);
   const hasKbDocs = Array.isArray(kbDocs) ? kbDocs.length > 0 : undefined;
-  const systemPrompt = buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly);
+  const systemPrompt = buildAgentSystemPrompt(
+    memoryBundle ? memoryBundle.longterm : [], query, kbDocs, kbReadOnly, memoryBundle
+  );
   const tools = allowTools ? getAgentTools(kbReadOnly, { hasKbDocs }) : null;
   const messages = [{ role: 'system', content: systemPrompt }];
   for (const m of safeHistory) messages.push(m);
 
   const deadline = tgAgentDeadline(env, opts);
   const origUserText = (opts && opts.origUserText) !== undefined ? opts.origUserText : query;
-  return await tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline,
+  const result = await tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline,
     (opts && opts.resumeKey) || null, false, undefined,
     (opts && opts.onDelta) || null, (opts && opts.onReset) || null, kbReadOnly, origUserText,
     hasKbDocs);
+  await recordWorkingMemory(env, chatId, origUserText, result, opts);
+  return result;
+}
+
+// 回合结束写 L1 工作记忆。
+// 放在主循环出口而不是三个 handler 里：TG / 微信 / Web 走的是同一条链路，
+// 在这里加一次就全覆盖，也不会因为某个 handler 忘了调用而出现"某些端没有会话记忆"。
+// 只读端（Web）默认不写：L1 虽然按会话隔离，但让公开网页往 R2 写数据没有收益，
+// 需要时用 WEB_WORKING_MEMORY=1 打开。
+async function recordWorkingMemory(env, chatId, userText, result, opts) {
+  if (!result || result.error || result.paused || result.fallback) return;
+  // 生图结果是一段 Markdown 图片链接，记成"要点"只会污染摘要
+  if (result.isImage) return;
+  const text = String(result.text || '').trim();
+  if (!text) return;
+  if (opts && opts.kbReadOnly && opts.workingMemory !== true) return;
+  if (opts && opts.workingMemory === false) return;
+  try {
+    // 900ms 上限：一次 wmGet（通常命中内存缓存）+ 一次 R2 put，正常 50ms 内完成。
+    // 超时就让写入在后台继续，绝不为了记一条要点把用户的首字/尾字拖慢。
+    await withTimeout(memoryRecordTurn(env, chatId, userText || '', text), 900, null);
+  } catch (e) {}
 }
 
 // 「继续」入口：messages 里已包含 system + 历史，直接接着跑（仅 Telegram / 微信）
@@ -180,10 +206,12 @@ async function tgAgentResume(env, tgApi, chatId, saved, onProgress, opts) {
   const tools = allowTools ? getAgentTools(kbReadOnly, { hasKbDocs: saved.hasKbDocs }) : null;
   const deadline = tgAgentDeadline(env, opts);
   const baseLoopStartIdx = (typeof saved.loopStartIdx === 'number' && saved.loopStartIdx >= 0) ? saved.loopStartIdx : undefined;
-  return await tgAgentRunLoop(env, tgApi, chatId, saved.targetModelId, saved.messages, tools, allowTools, onProgress, deadline,
+  const result = await tgAgentRunLoop(env, tgApi, chatId, saved.targetModelId, saved.messages, tools, allowTools, onProgress, deadline,
     (opts && opts.resumeKey) || null, true, baseLoopStartIdx,
     (opts && opts.onDelta) || null, (opts && opts.onReset) || null, kbReadOnly, saved.origUserText || '',
     saved.hasKbDocs);
+  await recordWorkingMemory(env, chatId, saved.origUserText || '', result, opts);
+  return result;
 }
 
 async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume, baseLoopStartIdx, onDelta, onReset, kbReadOnly, origUserText, hasKbDocs) {

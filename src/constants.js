@@ -18,6 +18,9 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
+// 7.10.0：三层记忆（L1 工作记忆自动记录会话要点、溢出沉淀；L2 长期记忆带权重/命中/衰减，
+//         容量到顶按衰减分淘汰；L3 归档承接 L1 溢出与 L2 淘汰并可检索），新增 memory 工具，
+//         remember 支持 kind/weight，/memory 改为三层视图，/clear 同步清理 L1）。
 // 7.9.1：联网工具可用性修复（DDG 反爬挑战页不再被误报为「无结果」、新增 Brave/Bing 网页版与
 //        Bing RSS 多后端回退、抓取失败新增阅读器与 Wayback 快照回退、正文提取修复跨标签清理
 //        bug 并支持内联 JSON 与 GBK 编码、失败结果负缓存）。
@@ -35,7 +38,7 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 //        断点起点修正、流式读取不阻塞、抓取失败语义统一）。
 // 7.5.0：Agent 内核加固（工具并发闸门、预算感知超时、步数感知收束、双保险空转熔断、
 //        历史轮次压缩）+ 工具箱新增 JSON/正则动作 + 全量回归测试。
-const APP_VERSION = '7.9.1';
+const APP_VERSION = '7.10.0';
 const PNG_HEADERS = {
   'Content-Type': 'image/png',
   'Cache-Control': 'public, max-age=86400',

@@ -8,7 +8,8 @@ import { mapSetBounded, mapGetBounded, parseCommaSeparated, safeEqual } from '..
 import { storeGet, storePut, storePutChecked } from '../store/r2.js';
 import { getChannelConfig, buildAIRequest } from '../channel.js';
 import { tgTrimHistory, tgGetHistory, tgSaveHistory, tgClearHistory } from '../tg-history.js';
-import { agentGetMemories, agentForgetMemory } from '../agent/memory.js';
+import { agentForgetMemory } from '../agent/memory.js';
+import { memoryReport, memoryClearSession, memoryStats } from '../memory/index.js';
 import { agentGetMode, agentSetMode } from '../agent/mode.js';
 import { agentLoadResumeState, agentClearResumeState, tgAgentResumeKey } from '../agent/resume.js';
 import { tgAgentChat, tgAgentResume } from '../agent/loop.js';
@@ -507,7 +508,7 @@ export async function handleTgWebhook(request, env) {
 
             await tgApi('sendMessage', {
               chat_id: chatId,
-              text: "⚙️ **请选择对话要使用的 AI 模型:**\n\n_支持多轮对话（最近 " + (parseInt(env.TG_HISTORY_ROUNDS || '10', 10) || 10) + " 轮），群聊中直接 @我 或回复我的消息即可对话，支持发送图片识图或上传 .md/.txt/.csv 文档，发送 /clear 可清空上下文。_\n\n🤖 **Agent 模式**（默认开启）：我会自主规划、调用 18 项工具（🔍 搜索、📄 网页、🌐 维基百科、🐙 GitHub、📑 arXiv 论文、📰 HackerNews、💱 实时汇率/币价、🛰️ DNS/IP 诊断、🧮 科学计算、🧰 实用工具箱、🌤 天气、🕐 时间/日期推算），并用 🧠🗑️ 管理长期记忆、用 💾📚📖 存取知识库文档。发送 /agent 可切换模式，/help 查看全部命令。",
+              text: "⚙️ **请选择对话要使用的 AI 模型:**\n\n_支持多轮对话（最近 " + (parseInt(env.TG_HISTORY_ROUNDS || '10', 10) || 10) + " 轮），群聊中直接 @我 或回复我的消息即可对话，支持发送图片识图或上传 .md/.txt/.csv 文档，发送 /clear 可清空上下文。_\n\n🤖 **Agent 模式**（默认开启）：我会自主规划、调用 19 项工具（🔍 搜索、📄 网页、🌐 维基百科、🐙 GitHub、📑 arXiv 论文、📰 HackerNews、💱 实时汇率/币价、🛰️ DNS/IP 诊断、🧮 科学计算、🧰 实用工具箱、🌤 天气、🕐 时间/日期推算），并用 🧠🗑️ 管理长期记忆、🔎 检索三层记忆、用 💾📚📖 存取知识库文档。发送 /agent 可切换模式，/help 查看全部命令。",
               parse_mode: "Markdown",
               reply_markup: { inline_keyboard },
               ...replyExtra
@@ -518,7 +519,10 @@ export async function handleTgWebhook(request, env) {
           if (cmd && (cmd.cmd === '/clear' || cmd.cmd === '/new')) {
             await tgClearHistory(env, chatId);
             await agentClearResumeState(env, chatId);
-            await tgApi('sendMessage', { chat_id: chatId, text: "🧹 上下文已清空，可以开始新的话题了。", ...replyExtra });
+            // v7.10.0：/clear 语义是"换个话题"，所以连 L1 工作记忆一起清；
+            // L2 长期事实与 L3 归档保留——用户不会因为清空上下文就想把"我叫什么"忘掉。
+            await memoryClearSession(env, chatId);
+            await tgApi('sendMessage', { chat_id: chatId, text: "🧹 上下文已清空（含本会话工作记忆），长期记忆与归档保留，可以开始新的话题了。", ...replyExtra });
             return;
           }
 
@@ -528,15 +532,16 @@ export async function handleTgWebhook(request, env) {
               text: "🤖 命令列表：\n\n"
                 + "/start、/model —— 选择对话模型\n"
                 + "/agent —— 切换 Agent / 普通对话模式\n"
-                + "/clear —— 清空当前对话上下文\n"
-                + "/memory —— 查看长期记忆\n"
-                + "/forget 关键词 —— 删除包含关键词的记忆\n"
-                + "/kb —— 知识库总览（文档列表 + 记忆统计）\n"
+                + "/clear —— 清空当前对话上下文（含 L1 工作记忆，保留长期记忆与归档）\n"
+                + "/memory —— 查看三层记忆（L1 会话要点 / L2 长期事实 / L3 归档）\n"
+                + "/forget 关键词 —— 删除包含关键词的长期记忆\n"
+                + "/kb —— 知识库总览（文档列表 + 三层记忆统计）\n"
                 + "/wxlogin、/wxstatus、/wxunbind ——（私聊专属）安全扫码绑定/查看/解绑微信 ClawBot\n"
                 + "任务太长被暂停时，发送「继续」（群聊可 @我 继续 或直接回复我「继续」）可接着做\n\n"
                 + "👥 群聊用法：在群里直接 `@机器人 你的问题`，或直接「回复（Reply）」机器人的上一条消息即可连续对话（传图/传文件同理）。\n"
                 + "✨ 支持直接发送图片（多模态识图 + 工具协同）或上传文本文件（.md/.txt/.csv/.json 等，可直接总结或说“存进知识库”）。\n"
-                + "🛠️ Agent 工具箱（18 项零密钥工具）：🔍 联网搜索（一步深读）、📄 结构化网页阅读（0ms 缓存翻页）、🌐 维基百科、🐙 GitHub 仓库/发版检索、📑 arXiv 论文检索、📰 HackerNews 热榜、💱 实时汇率/加密币价、🛰️ DNS/IP 网络诊断、🧮 科学计算器、🧰 全能工具箱（单位换算/SHA哈希/Base64/UUID/字数统计）、🌤 天气预报、🕐 时间与日期差推算、🧠🗑️ 长期记忆存取、💾📚📖 知识库文档分页精读与多关键词检索。"
+                + "🛠️ Agent 工具箱（19 项零密钥工具）：🔍 联网搜索（一步深读）、📄 结构化网页阅读（0ms 缓存翻页）、🌐 维基百科、🐙 GitHub 仓库/发版检索、📑 arXiv 论文检索、📰 HackerNews 热榜、💱 实时汇率/加密币价、🛰️ DNS/IP 网络诊断、🧮 科学计算器、🧰 全能工具箱（单位换算/SHA哈希/Base64/UUID/字数统计）、🌤 天气预报、🕐 时间与日期差推算、🧠🗑️ 长期记忆存取、🔎 三层记忆检索、💾📚📖 知识库文档分页精读与多关键词检索。"
+                + "\n\n🧠 三层记忆：L1 记录本会话要点（超出 12 条自动沉淀），L2 存跨会话事实/偏好（带权重与衰减，满 240 条淘汰最弱的），L3 是自动归档，随时可用「查一下你记得的…」检索。"
                 + "\n\n📌 当前版本 v" + APP_VERSION + "（当前会话 ID: " + chatId + "）",
               ...replyExtra
             });
@@ -544,24 +549,18 @@ export async function handleTgWebhook(request, env) {
           }
 
           if (cmd && cmd.cmd === '/memory') {
-            const mems = await agentGetMemories(env, chatId);
-            if (!mems.length) {
-              await tgApi('sendMessage', { chat_id: chatId, text: "🧠 暂无长期记忆。\n\n对我说「记住xxx」即可保存，比如：记住，我养了一只猫叫汤圆", ...replyExtra });
-            } else {
-              let text = '🧠 长期记忆（共' + mems.length + '条）：\n';
-              mems.forEach((mm, i) => { text += (i + 1) + '. ' + mm.fact + '\n'; });
-              text += '\n用 /forget 关键词 删除记忆，或直接对我说「忘掉关于xxx的记忆」。';
-              for (let s = 0; s < text.length; s += 4000) {
-                await tgApi('sendMessage', { chat_id: chatId, text: text.slice(s, s + 4000), ...replyExtra });
-              }
+            const text = await memoryReport(env, chatId);
+            for (let s = 0; s < text.length; s += 4000) {
+              await tgApi('sendMessage', { chat_id: chatId, text: text.slice(s, s + 4000), ...replyExtra });
             }
             return;
           }
 
           if (cmd && cmd.cmd === '/kb') {
-            const mems = await agentGetMemories(env, chatId);
+            const st = await memoryStats(env, chatId);
             let text = '📚 知识库总览\n\n';
-            text += '🧠 长期记忆：共' + mems.length + '条（/memory 查看，/forget 关键词 删除）\n\n';
+            text += '🧠 三层记忆：L1 工作记忆 ' + st.l1Items + ' 个话题 / ' + st.l1Pins + ' 条固定；'
+              + 'L2 长期记忆 ' + st.l2 + ' 条；L3 归档 ' + st.l3 + ' 条（/memory 查看，/forget 关键词 删除）\n\n';
             text += await toolListDocs(env);
             text += '\n\n💾 保存文档：对我说"把…存成知识库文档"或直接上传 .md/.txt 文件；🗑️ 删文档：说"删除知识库文档《标题》"';
             for (let s = 0; s < text.length; s += 4000) {
@@ -591,7 +590,7 @@ export async function handleTgWebhook(request, env) {
             await tgApi('sendMessage', {
               chat_id: chatId,
               text: !cur
-                ? "🤖 **Agent 模式已开启**\n\n我会自主规划、调用 18 项工具（🔍 搜索、📄 网页、🌐 维基百科、🐙 GitHub、📑 arXiv、📰 HackerNews、💱 汇率/币价、🛰️ DNS/IP、🧮 计算、🧰 工具箱、🌤 天气、🕐 时间），长期记住或清理你告诉我的重要信息，还能用 💾 保存、📚 查阅知识库文档。"
+                ? "🤖 **Agent 模式已开启**\n\n我会自主规划、调用 19 项工具（🔍 搜索、📄 网页、🌐 维基百科、🐙 GitHub、📑 arXiv、📰 HackerNews、💱 汇率/币价、🛰️ DNS/IP、🧮 计算、🧰 工具箱、🌤 天气、🕐 时间），分三层记住你告诉我的重要信息（本会话要点 / 长期事实 / 历史归档），还能用 💾 保存、📚 查阅知识库文档。"
                 : "💬 **已切换为普通对话模式**\n\n单轮问答，不调用工具、不使用长期记忆。如需 Agent 能力再发送 /agent 切回。",
               parse_mode: "Markdown",
               ...replyExtra

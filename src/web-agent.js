@@ -60,6 +60,9 @@ async function handleWebAgent(env, body) {
         // v6.9.3：Web 端对知识库只读——写入（remember / save_doc / delete_doc）
         // 仅 Telegram / 微信端开放，Web 访客无法污染全局知识库
         kbReadOnly: true,
+        // v7.10.0：L1 工作记忆默认不写。L1 按会话（web_<sid>）隔离，不涉及全局知识库，
+        // 但公开网页每轮都往 R2 写一次没有收益；需要网页端也保留会话脉络时设 WEB_WORKING_MEMORY=1。
+        workingMemory: env.WEB_WORKING_MEMORY === '1',
         onDelta: async (text, kind) => {
           if (kind === 'reasoning') bufReasoning += text;
           else bufContent += text;

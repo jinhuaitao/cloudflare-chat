@@ -13,6 +13,13 @@
 //    最终回答不暴露函数名与调用标记；
 // 3) 知识库与只读端的说明保持原语义，避免行为回归。
 
+// v7.10.0 三层记忆：记忆不再是一坨「长期记忆」，而是 L1 工作记忆 / L2 长期记忆 /
+// L3 归档三层。渲染交给 memory/index.js 的 memoryPromptBlock 统一处理，
+// 这里只负责把它插到「动态尾部」——位置不变，前缀缓存照旧命中。
+
+import { memTokens as memoryTokens } from '../memory/layers.js';
+import { memoryPromptBlock } from '../memory/index.js';
+
 // Intl.DateTimeFormat 在 Workers 里构造较慢，按实例缓存复用
 let cachedFmt = null;
 function formatNow() {
@@ -25,19 +32,6 @@ function formatNow() {
   } catch (e) {
     return now.toISOString();
   }
-}
-
-function memoryTokens(s) {
-  const out = [];
-  const segs = String(s || '').toLowerCase().split(/[^a-z0-9\u4e00-\u9fff]+/);
-  for (const seg of segs) {
-    if (!seg) continue;
-    out.push(seg);
-    if (/[\u4e00-\u9fff]/.test(seg)) {
-      for (let i = 0; i + 2 <= seg.length; i++) out.push(seg.slice(i, i + 2));
-    }
-  }
-  return out;
 }
 
 // 记忆关键词集合按 fact 原文缓存：同一批记忆在一轮里只会被切一次词
@@ -54,9 +48,12 @@ function factTokens(fact) {
 }
 
 // 构建 Agent 系统提示词
-function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly) {
+// memoryBundle 为三层记忆的加载结果（memory/index.js 的 memoryLoad 返回值）。
+// 传入时走三层渲染；不传时退回旧版单层「长期记忆」渲染——老调用方与老测试不受影响。
+function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly, memoryBundle) {
   const kbList = Array.isArray(kbDocs) ? kbDocs.filter(e => e && (e.title || e.file)) : [];
   const hasKb = kbList.length > 0;
+  const hasMemory = !!memoryBundle;
 
   // ---------- 稳定前缀：同一模型、同一端、同一轮里字节不变 ----------
   let p = '你是 Cloudflare-Chat 智能助手：一个会自主规划、并行调用工具、检索知识库的 AI Agent。\n\n';
@@ -76,18 +73,21 @@ function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly) {
   lines.push('· 数学与科学计算 → calculate（多条算式用 ; 一次算完）');
   lines.push('· 单位换算 / SHA 哈希 / Base64·URL 编解码 / UUID / 字数与 Token 统计 / JSON 格式化与取值 / 正则测试 → toolkit');
   lines.push('· 当前时间、日期差、加减天数 → get_time；天气与三天预报 → get_weather（逗号分隔多城市）');
+  // v7.10.0：三层记忆的统一检索入口。不占额外 schema 预算（只有 3 个短参数），
+  // 但让模型在"用户提到以前聊过的事"时有一个确定性的查法，而不是靠翻历史猜。
+  lines.push('· 记忆检索 → memory（action=search 跨 L1/L2/L3 一次查；action=stats 看各层条数；action=pin 固定本会话约束）');
   if (hasKb) {
     lines.push('· 知识库文档 → 直接用 read_doc 读相关文档（标题已在下方列表，无需先 list_docs；超长可传 offset 翻页；标题对不上会自动多关键词检索正文）');
   } else if (!kbReadOnly || !Array.isArray(kbDocs)) {
     lines.push('· 知识库文档 → 先 list_docs 看标题，有相关再 read_doc 细读（支持 offset 分页与多关键词搜正文）');
   }
   if (!kbReadOnly) {
-    lines.push('· 长期记忆/文档写入 → remember（用户明确要求记住时）｜forget_memory｜save_doc（长文入库）｜delete_doc');
+    lines.push('· 长期记忆/文档写入 → remember（用户明确要求记住时，可带 kind/weight）｜forget_memory｜save_doc（长文入库）｜delete_doc');
   }
   p += '【工具速查】\n' + lines.join('\n') + '\n\n';
 
   if (kbReadOnly) {
-    p += '【只读限制】本端知识库只读：没有"记住 / 忘掉记忆 / 保存文档 / 删除文档"类工具。用户提出这类请求时，如实说明该操作仅在 Telegram 或微信 ClawBot 机器人端支持，绝不假装已记住或已保存。\n\n';
+    p += '【只读限制】本端知识库只读：没有"记住 / 忘掉记忆 / 保存文档 / 删除文档"类工具，memory 也只能检索、不能 pin。用户提出这类请求时，如实说明该操作仅在 Telegram 或微信 ClawBot 机器人端支持，绝不假装已记住或已保存。\n\n';
   } else {
     p += '【写入纪律】只有工具真的返回成功，才可以告诉用户"已记住 / 已保存 / 已删除"；没有成功返回就如实说明失败原因。长文档用 save_doc，不要用 remember 硬塞。\n\n';
   }
@@ -117,7 +117,12 @@ function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly) {
       + shown.join('\n') + '\n\n';
   }
 
-  if (Array.isArray(memories) && memories.length) {
+  // 三层记忆：L1 会话脉络 / L2 长期事实 / L3 历史归档，各自独立预算，互不挤占
+  if (hasMemory) {
+    const block = memoryPromptBlock(memoryBundle, query);
+    if (block) p += block;
+  } else if (Array.isArray(memories) && memories.length) {
+    // ---- 旧版单层渲染（兼容未传 memoryBundle 的调用方） ----
     const qTokens = memoryTokens(query);
     const scored = memories.map((m) => {
       const fSet = factTokens(m.fact);
