@@ -111,26 +111,6 @@ export default `</head>
   </div>
 </div>
 
-<div class="settings-modal-overlay" id="kbModal">
-  <div class="settings-box" style="max-width:560px;max-height:86vh;overflow-y:auto;">
-    <h3>📚 知识库文档</h3>
-    <div class="settings-field">
-      <div class="settings-hint" style="line-height:1.7;">
-        与 Telegram、微信 ClawBot 共用同一份 R2 存储。<b>网页端只读</b>：保存、覆盖、删除文档请在机器人端操作（发送文件、<code>/savekb</code>、<code>/deldoc</code>）。
-      </div>
-    </div>
-    <div class="settings-field">
-      <div id="kbListBox" style="font-size:13px;line-height:1.7;padding:10px 12px;border-radius:10px;background:var(--bg-soft);border:1px solid var(--border);max-height:46vh;overflow-y:auto;">
-        正在读取知识库…
-      </div>
-    </div>
-    <div class="settings-actions" style="display:flex;gap:8px;">
-      <button type="button" id="kbRefreshBtn" class="btn" style="flex:1;">🔄 刷新</button>
-      <button type="button" id="kbCloseBtn" class="settings-btn" style="flex:1;">关闭</button>
-    </div>
-  </div>
-</div>
-
 <div class="app-container">
   <div class="sidebar" id="sidebar">
     <div class="sidebar-header">
@@ -146,9 +126,6 @@ export default `</head>
     <div class="session-list" id="sessionList"></div>
     <div class="sidebar-footer">
       <div class="side-tools">
-        <button class="theme-toggle" id="kbModalToggle" title="查看知识库文档（只读）">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path></svg>
-        </button>
         <button class="theme-toggle" id="settingsToggle" title="系统设置">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
         </button>

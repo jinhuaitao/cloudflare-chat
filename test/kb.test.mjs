@@ -8,8 +8,6 @@ import assert from 'node:assert/strict';
 import { kbGetRegistry, kbFindRegEntry, kbParseTags, kbFmtTags } from '../src/kb/registry.js';
 import { toolSaveDoc, toolReadDoc, toolListDocs, toolDeleteDoc } from '../src/kb/doc-tools.js';
 import { extractTagLine, cleanDocTitle, deriveFileDocTitle, autoOrganizeAndSaveKbDoc } from '../src/kb/organize.js';
-import worker from '../_worker.js';
-import { webKbClaimNeedsCorrection } from '../src/web-agent.js';
 
 function makeR2(initial = {}) {
   const data = new Map(Object.entries(initial));
@@ -474,90 +472,4 @@ test('frontmatter 记录 fp 与 version，重建后版本号不倒退', async ()
   const entry = list.find(e => e.file === '版本测试.md');
   assert.equal(entry.version, 2);
   assert.ok(entry.fp, '重建后 fp 应保留');
-});
-
-// ==================== v7.11.2：写入后回读校验（堵住「提示已保存、库里没有」） ====================
-
-test('索引被并发写成空表时，保存仍回读确认并按文件自愈，不谎报成功', async () => {
-  const r2 = makeR2();
-  const env = { R2: r2 };
-  let raced = false;
-  const realPut = r2.put.bind(r2);
-  r2.put = async function (key, value) {
-    await realPut(key, value);
-    if (key === 'kb/docs/registry.json' && !raced) {
-      raced = true;
-      // 另一个实例用旧快照把整表覆盖成空
-      r2.data.set(key, JSON.stringify([]));
-    }
-  };
-  const out = await toolSaveDoc(env, 'c1', { title: '并发空表', content: '正文内容 ABC' });
-  assert.ok(out.startsWith('已保存为知识库文档'), out);
-  const reg = JSON.parse(r2.data.get('kb/docs/registry.json'));
-  assert.ok(reg.some(e => e.file === '并发空表.md'), JSON.stringify(reg));
-});
-
-test('索引被旧快照覆盖（非空）时，回读校验会按文件重建并补回本次条目', async () => {
-  const r2 = makeR2();
-  const env = { R2: r2 };
-  await toolSaveDoc(env, 'c1', { title: '甲', content: '甲的内容' });
-  const staleSnapshot = r2.data.get('kb/docs/registry.json');
-  let raced = false;
-  const realPut = r2.put.bind(r2);
-  r2.put = async function (key, value) {
-    await realPut(key, value);
-    if (key === 'kb/docs/registry.json' && !raced) {
-      raced = true;
-      // 另一个实例拿旧快照（只有甲）覆盖，乙的条目被冲掉
-      r2.data.set(key, staleSnapshot);
-    }
-  };
-  const out = await toolSaveDoc(env, 'c1', { title: '乙', content: '乙的内容' });
-  assert.ok(out.startsWith('已保存为知识库文档'), out);
-  const reg = JSON.parse(r2.data.get('kb/docs/registry.json')).map(e => e.file).sort();
-  assert.deepEqual(reg, ['乙.md', '甲.md'].sort());
-});
-
-test('写路径的索引核对不污染「补回 N 篇」提示', async () => {
-  const r2 = makeR2();
-  const env = { R2: r2 };
-  await toolSaveDoc(env, 'c1', { title: '甲', content: '甲的内容' });
-  externalAddDoc(r2, '乙.md', '乙', '乙的内容');
-  // 保存丙时会核对索引并把乙补回来，但那是写路径自己的事，不该算进「补回」计数
-  await toolSaveDoc(env, 'c1', { title: '丙', content: '丙的内容' });
-  const out = await toolListDocs(env);
-  assert.ok(!out.includes('补回'), out);
-  assert.ok(out.includes('共3篇'), out);
-});
-
-test('未绑定 R2 时保存直接返回失败，不产生任何成功措辞', async () => {
-  const out = await toolSaveDoc({}, 'c1', { title: '无桶', content: '正文' });
-  assert.ok(out.includes('R2 未绑定'), out);
-  assert.ok(!out.includes('已保存为知识库文档'), out);
-});
-
-test('GET /api/kb/list 返回真实清单且不泄露正文', async () => {
-  const r2 = makeR2();
-  const env = { R2: r2 };
-  await toolSaveDoc(env, 'c1', { title: '接口文档', content: '这段是正文，不该出现在清单里' });
-  const res = await worker.fetch(new Request('https://kb-test.workers.dev/api/kb/list'), env, {});
-  assert.equal(res.status, 200);
-  const data = await res.json();
-  assert.equal(data.ok, true);
-  assert.equal(data.count, 1);
-  assert.equal(data.docs[0].title, '接口文档');
-  assert.ok(!JSON.stringify(data).includes('不该出现在清单里'), JSON.stringify(data));
-});
-
-test('网页端「已保存到知识库」的断言会被识别并校正', () => {
-  // 用户实际遇到的那句话
-  assert.equal(webKbClaimNeedsCorrection('✅ 分析完成！知识库文件已生成并保存 💾'), true);
-  assert.equal(webKbClaimNeedsCorrection('已保存到知识库，标题是《部署笔记》。'), true);
-  assert.equal(webKbClaimNeedsCorrection('内容已成功入库，稍后可在知识库查看。'), true);
-  // 如实说明只读/失败的，不再贴校正
-  assert.equal(webKbClaimNeedsCorrection('网页端知识库只读，已保存这类操作请到 Telegram 端完成。'), false);
-  assert.equal(webKbClaimNeedsCorrection('本次未能保存到知识库，原因是 R2 未绑定。'), false);
-  // 只是提到知识库里已有的文档，不算断言
-  assert.equal(webKbClaimNeedsCorrection('知识库里现有 3 篇文档，需要我读哪一篇？'), false);
-  assert.equal(webKbClaimNeedsCorrection(''), false);
 });

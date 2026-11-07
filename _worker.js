@@ -14,7 +14,6 @@ import { MANIFEST_JSON } from './src/pwa/manifest.js';
 import { SW_JS } from './src/pwa/service-worker.js';
 import { getPwaVersion } from './src/pwa/version.js';
 import { HTML_CONTENT } from './src/ui/index.js';
-import { kbGetRegistry, kbTakeRepairCount } from './src/kb/registry.js';
 
 // 逗号分隔可多个）后，Access-Control-Allow-Origin 只回显名单内的 Origin，
 // 名单外的跨站请求拿不到 CORS 头 —— 别的网站即使拿到了泄露的访问令牌，
@@ -63,44 +62,6 @@ async function routeRequest(request, env, ctx) {
 
     if (url.pathname.startsWith('/api/wx/')) {
       return await handleWxApi(request, env, url, ctx);
-    }
-
-    // 知识库只读清单：供网页端「📚 知识库」面板核对文档是否真的入库。
-    // 只返回标题/大小/时间/标签等元数据，不返回正文，也不提供任何写入能力 ——
-    // 网页端仍然是只读的，保存与删除只在 Telegram / 微信 ClawBot 端开放。
-    // verify:true 会顺便把索引与实际文件核对一遍，所以「正文在、列表没有」的
-    // 历史遗留条目在这里就会被自动修好并如实回报补回了几篇。
-    if (request.method === 'GET' && url.pathname === '/api/kb/list') {
-      const denied = denyUnauthorized(env, request);
-      if (denied) return denied;
-      try {
-        const reg = await kbGetRegistry(env, { verify: true });
-        const repaired = kbTakeRepairCount();
-        const docs = reg.slice().sort((a, b) => {
-          const ta = Date.parse((a && a.updated_at) || '') || 0;
-          const tb = Date.parse((b && b.updated_at) || '') || 0;
-          return tb - ta;
-        }).slice(0, 200).map(e => ({
-          title: (e && (e.title || e.file)) || '(未命名)',
-          file: (e && e.file) || '',
-          size: (e && e.size) || 0,
-          chars: (e && typeof e.chars === 'number') ? e.chars : 0,
-          tags: (e && Array.isArray(e.tags)) ? e.tags : [],
-          source: (e && e.source) || '',
-          updated_at: (e && e.updated_at) || ''
-        }));
-        return new Response(JSON.stringify({
-          ok: true,
-          r2Bound: !!env.R2,
-          count: reg.length,
-          repaired: repaired,
-          docs: docs
-        }), { headers: CORS_HEADERS });
-      } catch (e) {
-        return new Response(JSON.stringify({ ok: false, error: e && e.message ? e.message : String(e) }), {
-          status: 500, headers: CORS_HEADERS
-        });
-      }
     }
 
     if (request.method === 'POST' && url.pathname === '/api/chat') {

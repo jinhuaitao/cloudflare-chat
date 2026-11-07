@@ -189,31 +189,6 @@ async function snapshotVersion(env, file, body) {
   return key;
 }
 
-// 写完注册表立刻回读校验：条目到底在不在？
-//
-// 为什么需要这一步：注册表是「整表读-改-写」，R2 没有事务，Workers 又会多实例并发。
-// 两个实例几乎同时保存时，后写的那个会把先写的条目整段覆盖掉 —— 正文好好躺在 kb/docs/ 下，
-// 列表和检索里却没有它。而 save_doc 早已返回「已保存为知识库文档」，用户于是看到
-// 「提示保存成功、知识库里什么都没有」。旧版把修复推迟到下一次 /kb（verify），
-// 保存的那一刻仍然是谎报成功。
-//
-// 这里做两遍：第一遍直接读 R2 上的注册表；不在就以文件为准重建一次再确认。
-// 只有确认条目真的在索引里，才允许对外说「已保存」。
-async function confirmSavedEntry(env, file) {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    let reg = null;
-    try {
-      // attempt 0：只读最新注册表，多花 1 次 Class B；
-      // attempt 1：带上 verify，按 kb/docs/ 下的真实文件重建索引（这是最后一道保险）
-      reg = await kbGetRegistry(env, { fresh: true, verify: attempt > 0, quiet: true });
-    } catch (e) {
-      reg = null;
-    }
-    if (Array.isArray(reg) && reg.some(e => e && e.file === file)) return true;
-  }
-  return false;
-}
-
 async function toolSaveDoc(env, chatId, args) {
   return await withSaveLock(() => doSaveDoc(env, chatId, args || {}));
 }
@@ -245,8 +220,7 @@ async function doSaveDoc(env, chatId, args) {
   // v7.11.1：写路径必须读「最新 + 已核对」的注册表。
   // 注册表是整表读-改-写，用本实例 30 秒内的旧缓存去写，会把别的实例刚保存的条目整段覆盖掉，
   // 那些文档正文还在 R2 里、却从此在列表和检索里消失（就是「提示已保存但知识库没有」）。
-  // quiet：写路径自己会回报修复情况，不再计入全局「补回 N 篇」。
-  const reg = await kbGetRegistry(env, { fresh: true, verify: true, quiet: true });
+  const reg = await kbGetRegistry(env, { fresh: true, verify: true });
   const prevEntry = reg.find(e => e.file === file);
   const existed = !!prevEntry;
 
@@ -325,14 +299,6 @@ async function doSaveDoc(env, chatId, args) {
   if (idx >= 0) reg[idx] = entry; else reg.push(entry);
   const okReg = await kbSaveRegistry(env, reg);
   if (!okReg) return '文档正文已写入 R2（' + key + '），但注册表更新失败，文档可能暂不出现在列表中；请稍后重新保存一次以修复注册表，本次内容未丢失。';
-  // v7.11.2：注册表写成功 ≠ 条目还在。并发保存时别的实例可能刚把整表覆盖掉，
-  // 这里必须回读确认，否则又会回到「提示已保存、知识库里没有」的老问题。
-  const confirmed = await confirmSavedEntry(env, file);
-  if (!confirmed) {
-    return '文档正文已写入 R2（' + key + '），但索引校验未通过：该文档暂时无法在列表与检索中查到。'
-      + '内容本身没有丢失，请在 Telegram 或微信端发送 /kb（会按文件重建索引）后再确认；'
-      + '回答用户时必须如实说明「已写入但索引异常」，不要声称保存完全成功。';
-  }
 
   const parts = [finalContent.length + ' 字符', action];
   if (tags.length) parts.push('标签：' + tags.join('、'));
@@ -390,8 +356,7 @@ async function toolReadDoc(env, args, maxChars) {
   if (!hit) {
     // v7.11.1：索引可能落后于实际文件（别的实例刚写入、旧版本遗留）。
     // 未命中时先核对一次索引再判「没有」，避免文档明明在库里却回「未找到」。
-    // quiet：修复计数留给列表类入口去回报，读文档这里自己会说明结果。
-    reg = await kbGetRegistry(env, { verify: true, quiet: true });
+    reg = await kbGetRegistry(env, { verify: true });
     hit = kbFindRegEntry(reg, query);
   }
   if (hit) {
@@ -572,7 +537,7 @@ async function toolDeleteDoc(env, args) {
   const query = String(args.query || '').trim();
   if (!query) return '请给出要删除的文档标题关键词';
   if (!env.R2) return 'R2 未绑定，无法删除知识库文档';
-  const reg = await kbGetRegistry(env, { fresh: true, verify: true, quiet: true });
+  const reg = await kbGetRegistry(env, { fresh: true, verify: true });
   if (!reg.length) return '知识库文档为空，无需删除';
   const hit = kbFindRegEntry(reg, query);
   if (!hit) {

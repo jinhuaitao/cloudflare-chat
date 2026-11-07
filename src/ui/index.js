@@ -12,7 +12,6 @@ import APP_DIALOGS_HTML from './app-dialogs.js';
 import APP_RENDER_HTML from './app-render.js';
 import APP_SEND_HTML from './app-send.js';
 import APP_SETTINGS_HTML from './app-settings.js';
-import APP_KB_HTML from './app-kb.js';
 import APP_PWA_HTML from './app-pwa.js';
 
 export const HTML_CONTENT =
@@ -27,5 +26,4 @@ export const HTML_CONTENT =
   + APP_RENDER_HTML
   + APP_SEND_HTML
   + APP_SETTINGS_HTML
-  + APP_KB_HTML
   + APP_PWA_HTML;

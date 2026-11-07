@@ -18,9 +18,6 @@ const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json）
-// 7.11.2：知识库「提示已保存、列表里没有」专项（save_doc 写完回读校验条目是否真的在索引里，
-//         跨实例覆盖就地按文件重建；Telegram 上传文件与微信整理入库不再无条件播报成功；
-//         新增只读接口 GET /api/kb/list 与网页端「📚 知识库」面板，让用户能自己核对）。
 // 7.10.0：三层记忆（L1 工作记忆自动记录会话要点、溢出沉淀；L2 长期记忆带权重/命中/衰减，
 //         容量到顶按衰减分淘汰；L3 归档承接 L1 溢出与 L2 淘汰并可检索），新增 memory 工具，
 //         remember 支持 kind/weight，/memory 改为三层视图，/clear 同步清理 L1）。
@@ -41,7 +38,7 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 //        断点起点修正、流式读取不阻塞、抓取失败语义统一）。
 // 7.5.0：Agent 内核加固（工具并发闸门、预算感知超时、步数感知收束、双保险空转熔断、
 //        历史轮次压缩）+ 工具箱新增 JSON/正则动作 + 全量回归测试。
-const APP_VERSION = '7.11.2';
+const APP_VERSION = '7.11.1';
 const PNG_HEADERS = {
   'Content-Type': 'image/png',
   'Cache-Control': 'public, max-age=86400',
