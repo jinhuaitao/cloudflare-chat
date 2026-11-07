@@ -806,12 +806,18 @@ async function processWechatMessage(env, creds, rawMsg) {
         );
         await sendWxTypingStatus(env, creds, userId, contextToken, 2);
 
+        // v7.11.2：旧版无论 orgRes.ok 是什么都拼上「✅ 入库状态」，
+        // 还宣称「已自动同步至网页端知识库中心」—— 网页端此前根本没有这个界面，
+        // 用户按提示去找只会看到空的。现在按真实结果分叉，只说确实发生的事。
         const kbReply = `📚 文件《${fm.fileName}》整理完成\n`
           + `────────────\n`
           + `${orgRes.organizedSummary}\n`
           + `────────────\n`
-          + `✅ 入库状态：${orgRes.saveResult}\n`
-          + `🔄 已自动同步至微信、Telegram 与网页端「📚 知识库中心」，后续在任意端直接提问即可自动检索引用！`;
+          + (orgRes.ok
+            ? `✅ 入库状态：${orgRes.saveResult}\n`
+              + `📌 已写入知识库（kb/docs/），可在微信或 Telegram 发送 /kb 查看；网页端左侧 📚 知识库面板也可只读查看。`
+            : `⚠️ 未能入库：${orgRes.saveResult}\n`
+              + `本次入库未完成，请按上面的原因处理（检查 R2 绑定或稍后重新发送文件）。`);
 
         // 将本次文件整理结果同步写入会话历史，方便后续直接追问及网页端同步查看
         const baseHist = await tgGetHistory(env, chatId);
@@ -960,7 +966,7 @@ async function processWechatMessage(env, creds, rawMsg) {
 
     if (cmd && cmd.cmd === '/kb') {
       const st = await memoryStats(env, chatId);
-      let text = '📚 知识库总览（三端实时自动同步）\n────────────\n';
+      let text = '📚 知识库总览（微信 / Telegram / 网页共用同一 R2 存储）\n────────────\n';
       text += `🧠 三层记忆：L1 ${st.l1Items} 个话题 / ${st.l1Pins} 条固定｜L2 ${st.l2} 条｜L3 ${st.l3} 条（发「记忆」查看）\n\n`;
       text += await toolListDocs(env, { verify: true });
       text += '\n\n💡 快捷操作：\n• 直接在微信发送文件（.docx/.xlsx/.pptx/.pdf/.md/.txt/.csv/代码）即可【自动整理入库】\n• 发「整理知识库 标题」可将刚聊的内容自动整理入库\n• 发「读取文档 标题」查看内容 | 发「删除文档 标题」删除';
@@ -1007,7 +1013,7 @@ async function processWechatMessage(env, creds, rawMsg) {
         + `────────────\n`
         + `${orgRes.organizedSummary}\n`
         + `────────────\n`
-        + `✅ ${orgRes.saveResult}`,
+        + (orgRes.ok ? `✅ ${orgRes.saveResult}` : `⚠️ 未能入库：${orgRes.saveResult}\n本次入库未完成，请按上面的原因处理。`),
       );
       return { processed: true };
     }

@@ -87,7 +87,8 @@ function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly, memoryBundl
   p += '【工具速查】\n' + lines.join('\n') + '\n\n';
 
   if (kbReadOnly) {
-    p += '【只读限制】本端知识库只读：没有"记住 / 忘掉记忆 / 保存文档 / 删除文档"类工具，memory 也只能检索、不能 pin。用户提出这类请求时，如实说明该操作仅在 Telegram 或微信 ClawBot 机器人端支持，绝不假装已记住或已保存。\n\n';
+    p += '【只读限制】本端知识库只读：没有"记住 / 忘掉记忆 / 保存文档 / 删除文档"类工具，memory 也只能检索、不能 pin。'
+      + '用户提出这类请求时，如实说明该操作仅在 Telegram 或微信 ClawBot 机器人端支持（保存后可在网页端左侧「📚 知识库」面板只读查看），绝不假装已记住或已保存。\n\n';
   } else {
     p += '【写入纪律】只有工具真的返回成功，才可以告诉用户"已记住 / 已保存 / 已删除"；没有成功返回就如实说明失败原因。长文档用 save_doc，不要用 remember 硬塞。\n\n';
   }

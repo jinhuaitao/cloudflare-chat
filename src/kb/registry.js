@@ -135,7 +135,10 @@ function kbTakeRepairCount() {
   return n;
 }
 
-async function kbVerifyRegistry(env, reg) {
+// opts.quiet：不累加 lastRepair。写路径自己会回报修复情况，
+// 若也计入全局计数，下一次 list_docs 会莫名其妙地多出一句「补回 N 篇」。
+async function kbVerifyRegistry(env, reg, opts) {
+  const quiet = !!(opts && opts.quiet);
   const safe = Array.isArray(reg) ? reg : [];
   if (!env || !env.R2) return { reg: safe, repaired: 0 };
   let objs = null;
@@ -153,12 +156,13 @@ async function kbVerifyRegistry(env, reg) {
   let repaired = 0;
   for (const f of files) if (!regFiles.has(f)) repaired += 1;
   const rebuilt = await kbRebuildRegistry(env, objs);
-  if (repaired > 0) lastRepair += repaired;
+  if (repaired > 0 && !quiet) lastRepair += repaired;
   return { reg: rebuilt, repaired: repaired };
 }
 
 // opts.fresh：跳过 30 秒内存缓存，直接读 R2。写路径必须用（否则会覆盖别的实例刚写入的条目）。
 // opts.verify：读完再和实际文件核对一次，不一致就重建。
+// opts.quiet：核对时触发的修复不累加全局「补回 N 篇」计数（写路径自己会回报）。
 // 另外：注册表为空但 kb/docs/ 下有文件时，无论是否传 verify 都会自动核对修复。
 async function kbGetRegistry(env, opts) {
   if (!env || !env.R2) return [];
@@ -166,7 +170,7 @@ async function kbGetRegistry(env, opts) {
   const now = Date.now();
   if (!o.fresh && cachedRegistry && cachedRegistryBucket === env.R2 && now < cachedRegistryExp) {
     const hit = cachedRegistry.slice();
-    if (o.verify || !hit.length) return (await kbVerifyRegistry(env, hit)).reg;
+    if (o.verify || !hit.length) return (await kbVerifyRegistry(env, hit, { quiet: o.quiet })).reg;
     return hit;
   }
   try {
@@ -177,7 +181,7 @@ async function kbGetRegistry(env, opts) {
         cachedRegistry = p.slice();
         cachedRegistryBucket = env.R2;
         cachedRegistryExp = Date.now() + KB_REG_CACHE_TTL_MS;
-        if (o.verify || !p.length) return (await kbVerifyRegistry(env, p.slice())).reg;
+        if (o.verify || !p.length) return (await kbVerifyRegistry(env, p.slice(), { quiet: o.quiet })).reg;
         return p.slice();
       }
     }

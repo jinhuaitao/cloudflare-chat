@@ -368,8 +368,15 @@ export async function handleTgWebhook(request, env) {
                 source: 'telegram_file:' + fileName,
                 tags: '文件上传'
               });
-              saveNote = '\n\n【系统提示】该文件已尝试存入知识库：' + saveRes
-                + '。全文已按标题《' + docTitle + '》入库，需要细节时直接用 read_doc 读取，不要重复调用 save_doc。';
+              // v7.11.2：旧版无论保存成功与否都往上下文写「全文已按标题《X》入库」，
+              // 模型据此回一句「✅ 已保存」，而实际可能因为 R2 未绑定、写入失败、
+              // 内容指纹去重、索引校验未通过而根本没进库。现在按真实结果分叉。
+              const savedOk = /^已保存为知识库文档/.test(saveRes) || /未重复保存/.test(saveRes);
+              saveNote = savedOk
+                ? '\n\n【系统提示】该文件已存入知识库：' + saveRes
+                  + '。需要细节时直接用 read_doc 读取，不要重复调用 save_doc。'
+                : '\n\n【系统提示】该文件未能存入知识库，原因：' + saveRes
+                  + '。回答用户时必须如实说明保存失败及原因，绝不能声称「已保存 / 已入库」。';
             }
             const inlineLimit = wantSave ? 20000 : 60000;
             const docText = rawText.length > inlineLimit
@@ -628,7 +635,9 @@ export async function handleTgWebhook(request, env) {
               + '────────────\n'
               + (orgRes.organizedSummary || '（无摘要）') + '\n'
               + '────────────\n'
-              + '✅ ' + orgRes.saveResult;
+              // v7.11.2：ok=false 时不能再用 ✅ 开头，否则用户只看到绿勾、看不到失败原因
+              + (orgRes.ok ? '✅ ' : '⚠️ 未能入库：') + orgRes.saveResult
+              + (orgRes.ok ? '' : '\n本次入库未完成，请按上面的原因处理（检查 R2 绑定或稍后重试）。');
             for (let s = 0; s < outText.length; s += 4000) {
               await tgApi('sendMessage', { chat_id: chatId, text: outText.slice(s, s + 4000), ...replyExtra });
             }

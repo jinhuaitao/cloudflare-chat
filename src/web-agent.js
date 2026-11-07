@@ -3,6 +3,32 @@
 import { SSE_HEADERS } from './constants.js';
 import { tgAgentChat } from './agent/loop.js';
 
+// ==================== 「已保存到知识库」的真伪校验（v7.11.2） ====================
+// Web 端 kbReadOnly=true，getAgentTools 已经把 save_doc / delete_doc / remember 全部过滤掉，
+// 也就是说这一端**物理上不存在**任何写入路径。但模型仍然会顺着上下文里的
+// 「保存到知识库」说法回一句「✅ 分析完成！知识库文件已生成并保存 💾」——
+// 用户回到知识库一看是空的，就成了「提示已保存、库里没有」。
+// 提示词里已经写明不许假装，但提示词管不住所有模型；这里做一次确定性校正：
+// 既然本轮不可能有写入，凡出现「已保存/已存入知识库」这类断言，就在结尾补一句实话。
+const KB_CLAIM_PATTERNS = [
+  /知识库[^。\n]{0,16}(已|成功)[^。\n]{0,8}(保存|存入|写入|生成)/,
+  /已(经|成功){0,2}(保存|存入|写入|入库)[^。\n]{0,20}知识库/,
+  /知识库[^。\n]{0,10}(保存|入库)[^。\n]{0,4}(成功|完成)/,
+];
+// 已经如实说明「只读 / 没保存」的回答不用再校正，否则等于在诚实回答后面贴一句噪音
+const KB_CLAIM_HONEST = /只读|未保存|没有保存|无法保存|不能保存|未写入|保存失败|未能入库|不会保存/;
+
+function webKbClaimNeedsCorrection(text) {
+  const t = String(text || '');
+  if (!t) return false;
+  if (KB_CLAIM_HONEST.test(t)) return false;
+  for (const re of KB_CLAIM_PATTERNS) if (re.test(t)) return true;
+  return false;
+}
+
+const WEB_KB_CORRECTION = '\n\n> ⚠️ 校正：网页端知识库是**只读**的，本轮没有任何写入动作。上面若提到「已保存 / 已存入知识库」，实际并未写入。'
+  + '请在 Telegram 或微信 ClawBot 机器人端保存（上传文件并附言「存进知识库」，或发送 /savekb），存完可点左侧 📚 核对。';
+
 // ==================== Web 端 Agent（v6.6.0，v6.9.3 只读权限分域） ====================
 // 与 Telegram 共用 tgAgentChat（提供联网搜索、网页抓取、计算、天气、时间及知识库只读检索），
 // Web 端对知识库只读（kbReadOnly: true），不暴露写入工具，也不再读取/产生 Web 会话记忆。
@@ -87,9 +113,13 @@ async function handleWebAgent(env, body) {
           }
           send({ choices: [{ delta: { content: '\n\n> 网页端不支持断点续做，可以把问题拆小一些，或补充更具体的范围后重问。' } }] });
         } else if (r.streamed) {
-          // 正文已经在流式过程中逐字推完了，这里什么都不用补，直接收尾
+          // 正文已经在流式过程中逐字推完了，这里什么都不用补，直接收尾。
+          // 唯一例外：模型声称「已保存到知识库」——本端根本没有写入工具，补一句校正。
+          if (webKbClaimNeedsCorrection(r.text)) {
+            send({ choices: [{ delta: { content: WEB_KB_CORRECTION } }] });
+          }
         } else if (r.text) {
-          const t = r.text;
+          const t = webKbClaimNeedsCorrection(r.text) ? r.text + WEB_KB_CORRECTION : r.text;
           for (let i = 0; i < t.length; i += 2000) {
             send({ choices: [{ delta: { content: t.slice(i, i + 2000) } }] });
           }
@@ -112,4 +142,5 @@ async function handleWebAgent(env, body) {
 
 export {
   handleWebAgent,
+  webKbClaimNeedsCorrection,
 };
