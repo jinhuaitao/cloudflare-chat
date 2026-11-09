@@ -16,7 +16,8 @@ import { SW_JS } from './src/pwa/service-worker.js';
 import { getPwaVersion } from './src/pwa/version.js';
 import { HTML_CONTENT } from './src/ui/index.js';
 
-// 逗号分隔可多个）后，Access-Control-Allow-Origin 只回显名单内的 Origin，
+// CORS_ORIGIN 跨域白名单：配置为完整域名列表（多个域名用逗号分隔）后，
+// Access-Control-Allow-Origin 只回显名单内的 Origin，
 // 名单外的跨站请求拿不到 CORS 头 —— 别的网站即使拿到了泄露的访问令牌，
 // 也无法从浏览器直接调用 /api/chat。未配置时保持 *，与旧部署完全兼容。
 // 在 fetch 顶层统一改写，覆盖包括 web-agent / auth 等所有子模块的响应。

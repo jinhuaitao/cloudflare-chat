@@ -118,6 +118,14 @@ kb/versions/<标题>/<ts>.md       覆盖前的旧版快照（每篇保留 3 份
    https://api.telegram.org/bot<TG_BOT_TOKEN>/setWebhook?url=https://<你的Worker域名>/tg-webhook&secret_token=<TG_WEBHOOK_SECRET>
    ```
 
+## 🛠️ 本地开发与调试
+
+```bash
+cp .dev.vars.example .dev.vars   # 复制密钥模板并填入本地 Key（.gitignore 已忽略，绝不入库）
+npx wrangler dev                 # 本地起 Worker（默认 http://localhost:8787）
+npm run verify                   # 发版前一键：一致性检查 + 全量回归测试（约 15 秒）
+```
+
 ## ⚙️ 环境变量分类速查
 
 > 标记说明：`🔴 必填` 核心运行必需 · `🟠 推荐` 生产环境建议配置 · `🟢 可选` 不填即用默认值 · `🔵 自动` 系统自动探测

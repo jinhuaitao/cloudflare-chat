@@ -3,10 +3,14 @@
   "version": "7.12.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "description": "Cloudflare Worker 上的多通道 AI 对话前端 + Telegram & 微信 ClawBot (iLink) 机器人（三层记忆 + 19 项零密钥 Agent 工具 + R2 知识库：写入模式/版本快照/标签检索）",
   "scripts": {
     "test": "node --test \"test/**/*.test.mjs\"",
     "check": "node scripts/check-consistency.mjs",
+    "verify": "node scripts/check-consistency.mjs && node --test \"test/**/*.test.mjs\"",
     "build:tts-demo": "node scripts/build-tts-demo.mjs",
     "deploy": "wrangler deploy"
   },
