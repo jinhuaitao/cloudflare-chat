@@ -1,4 +1,4 @@
-# ⚡ Cloudflare-Chat `v7.13.0`
+# ⚡ Cloudflare-Chat `v7.12.0`
 
 > **基于 Cloudflare Workers + R2 的零依赖多通道 AI 对话前端 + 全能 Telegram 机器人 + 微信 ClawBot (iLink) 官方通道**  
 > `🌐 流式 Web + PWA` · `🤖 Telegram 私聊/群聊` · `🟢 微信 ClawBot 安全绑定` · `🧠 三层记忆（L1/L2/L3）` · `🛠 19 项零密钥 Agent 工具` · `📚 R2 知识库（写入模式/版本快照/标签检索）` · `🔄 多 Key 轮询容灾`
@@ -230,7 +230,8 @@ kb/versions/<标题>/<ts>.md       覆盖前的旧版快照（每篇保留 3 份
 ## 🧪 本地回归测试
 
 ```bash
-npm test                  # 283 个用例：内核纯函数 + mock 上游的端到端循环 + 流式读取 + 知识库存读/写入模式/索引自愈 + 三层记忆 + 运行期性能 + 输入边界与容错 + SSRF + 微信加解密与排版 + 通道配置 + 前端分片约束（不联网）
+npm test                  # 224 个用例：内核纯函数 + mock 上游的端到端循环 + 流式读取 + 知识库存读/写入模式/索引自愈 + 三层记忆 + 运行期性能 + 输入边界与容错 + SSRF + 微信加解密与排版 + 通道配置 + 前端分片约束（不联网）
+npm run check             # 发版前一致性检查：版本号三处对齐 + 全量语法检查 + tts-demo.html 同步 + README 用例数与实测核对
 npm run build:tts-demo    # 从 src/ui/speech.js 重新生成 tts-demo.html（改了朗读规则才需要跑）
 ```
 
@@ -246,3 +247,13 @@ npm run build:tts-demo    # 从 src/ui/speech.js 重新生成 tts-demo.html（�
 SSRF 全规则（私网/保留段/云元数据/IPv6 映射与 NAT64/十进制与十六进制归一化/FQDN 尾点）、
 微信 MD5 与 AES-128-ECB 对拍 `node:crypto`、Markdown→微信排版、长文本分段、中英双语口令、
 通道配置三级回退与同名模型跨通道、朗读清洗行为、演示页与源码一致、前端分片转义约束。
+
+## ⚠️ 已知限制
+
+- **限流为 isolate 级内存**：`RATE_LIMIT_PER_MIN` 在单个 Worker isolate 内本地计数，多个 isolate 并存时的实际放行量约为标称值的 N 倍。作为轻量防刷够用；需要严格限流请前置 Cloudflare WAF / Rate Limiting 规则。
+- **DNS 重绑定残余风险**：Workers 拿不到底层 DNS，`web_fetch` 的 SSRF 拦截无法在建连时对解析结果做二次校验（私网 IP 字面量、IPv6 映射等均已在 `src/net/ssrf.js` 覆盖）。如需彻底封堵，请在前置 WAF / 出站代理层限制。
+- **未绑定 R2 时退化为纯内存**：`wrangler.toml` 已开启 R2 自动置备，正常部署不受影响；但若置备失效且未手动绑定，Telegram / 微信的历史与记忆将随 isolate 重启丢失。
+- **KV → R2 迁移**：v6.3.1 起彻底移除 KV。从 v6.2 及更早版本升级且 KV 有旧数据的，请先部署 v6.3.0 过渡一次再升级。
+
+**发版前请跑 `npm run check`**：校验 `package.json` / `src/constants.js` / `README.md` 三处版本号一致、全量模块语法检查、`tts-demo.html` 与源码同步、README 用例数与实测一致。CI（`.github/workflows/ci.yml`）会在每次 push / PR 时自动执行同样检查。
+

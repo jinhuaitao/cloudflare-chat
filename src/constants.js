@@ -17,7 +17,8 @@ const SSE_HEADERS = {
 const HTML_HEADERS = { 'Content-Type': 'text/html;charset=UTF-8' };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
-// 应用版本号（/help 显示；发版时同步 package.json）
+// 应用版本号（/help 显示；发版时同步 package.json 与 README.md 的版本号，
+// CI 会用 npm run check 校验三处一致，防止文档与代码再次脱节）
 // 7.12.0：缺陷修复与工程化收尾（网页端知识库只读面板接线：新增 GET /api/kb/list + 侧栏入口 +
 //         弹窗 DOM，此前 app-kb.js 是三处断链的死代码；朗读清洗收敛为单一来源 src/ui/speech.js，
 //         tts-demo.html 改为生成产物；web_fetch 退出同轮记忆化；同名模型跨通道不再互相吞掉，
