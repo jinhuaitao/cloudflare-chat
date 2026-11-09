@@ -39,7 +39,7 @@ const TOOL_FAILURE_PREFIXES = [
   '工具调用参数解析失败',
   '文档读取失败', '删除失败', '请给出要读取的文档标题', '请给出要删除的文档标题',
   '未找到标题或正文包含', '未找到标题包含',
-  'JSON 解析失败', 'JSON 取值失败', '正则编译失败', '正则过长',
+  'JSON 解析失败', 'JSON 取值失败', '正则编译失败', '正则过长', '正则拒绝',
   '请提供 pattern', '请提供 path',
   '记忆检索失败', '记忆写入失败',
 ];
@@ -398,26 +398,40 @@ async function execAgentTool(name, args, env, chatId, kbReadOnly, opts) {
   // v7.9.0：分页类工具（read_doc / web_fetch）需要知道自己这次能输出多少字符，
   // 否则它按 8000 切片、循环再按预算截到 4000，尾部给出的 nextOffset 就对不上实际内容
   const maxChars = parseInt(opts.maxChars, 10) > 0 ? parseInt(opts.maxChars, 10) : 0;
+  const memoryAction = name === 'memory' ? String(args.action || 'search').toLowerCase() : '';
+  const isWrite = WRITE_TOOL_NAMES.indexOf(name) !== -1 || (name === 'memory' && memoryAction === 'pin');
+  const controller = isWrite ? null : new AbortController();
+  const callContext = { signal: controller ? controller.signal : null, timeoutMs: toolTimeoutMs };
   let timer;
+  let timedOut = false;
+  let removeParentAbort = null;
+  if (controller && opts.signal && typeof opts.signal.addEventListener === 'function') {
+    const parentAbort = () => controller.abort();
+    if (opts.signal.aborted) controller.abort();
+    else {
+      opts.signal.addEventListener('abort', parentAbort, { once: true });
+      removeParentAbort = () => opts.signal.removeEventListener('abort', parentAbort);
+    }
+  }
   try {
     const run = (async () => {
       switch (name) {
-        case 'web_search': return await toolWebSearch(args.query, args.count, args.deep_read, env);
-        case 'web_fetch': return await toolWebFetch(args.url, args.offset, maxChars);
-        case 'wiki_lookup': return await toolWikiLookup(args.query, args.lang);
-        case 'github_lookup': return await toolGithubLookup(args);
-        case 'arxiv_search': return await toolArxivSearch(args);
-        case 'hn_top': return await toolHnTop(args);
-        case 'exchange_rate': return await toolExchangeRate(args);
-        case 'net_lookup': return await toolNetLookup(args);
+        case 'web_search': return await toolWebSearch(args.query, args.count, args.deep_read, env, callContext);
+        case 'web_fetch': return await toolWebFetch(args.url, args.offset, maxChars, callContext);
+        case 'wiki_lookup': return await toolWikiLookup(args.query, args.lang, callContext);
+        case 'github_lookup': return await toolGithubLookup(args, callContext);
+        case 'arxiv_search': return await toolArxivSearch(args, callContext);
+        case 'hn_top': return await toolHnTop(args, callContext);
+        case 'exchange_rate': return await toolExchangeRate(args, callContext);
+        case 'net_lookup': return await toolNetLookup(args, callContext);
         // 兼容模型把 expression 写成 expr / query 的情况，避免因参数名不一致直接判失败
-        case 'calculate': return toolCalculate(args.expression || args.expr || args.query);
-        case 'toolkit': return await toolToolkit(args);
-        case 'get_time': return toolGetTime(args.timezone, args);
-        case 'get_weather': return await toolGetWeather(args.city);
+        case 'calculate': return toolCalculate(args.expression || args.expr || args.query, callContext);
+        case 'toolkit': return await toolToolkit(args, callContext);
+        case 'get_time': return toolGetTime(args.timezone, args, callContext);
+        case 'get_weather': return await toolGetWeather(args.city, callContext);
         case 'remember': return await agentSaveMemory(env, chatId, args.fact, { kind: args.kind, weight: args.weight });
         case 'memory': {
-          const action = String(args.action || 'search').toLowerCase();
+          const action = memoryAction;
           if (action === 'pin') {
             // pin 写的是 L1（本会话），Web 只读端不允许——但 search / stats 仍然可用
             if (kbReadOnly) {
@@ -431,8 +445,8 @@ async function execAgentTool(name, args, env, chatId, kbReadOnly, opts) {
             const persistNote = r.persisted ? '' : '（R2 未绑定或写入失败，仅在当前实例内有效）';
             return '已固定到本会话工作记忆（L1，共 ' + r.count + ' 条）' + persistNote + '：' + text;
           }
-          if (action === 'stats') return await memoryStatsText(env, chatId);
-          return await memorySearchText(env, chatId, args.query);
+          if (action === 'stats') return await memoryStatsText(env, chatId, callContext);
+          return await memorySearchText(env, chatId, args.query, callContext);
         }
         case 'forget_memory': {
           const kw = String(args.keyword || '').trim();
@@ -451,21 +465,31 @@ async function execAgentTool(name, args, env, chatId, kbReadOnly, opts) {
             : (unpinned ? '长期记忆中没有匹配项，但已解除 ' + unpinned + ' 条本会话固定项' : '未找到包含「' + kw + '」的长期记忆');
         }
         case 'save_doc': return await toolSaveDoc(env, chatId, args);
-        case 'list_docs': return await toolListDocs(env);
-        case 'read_doc': return await toolReadDoc(env, args, maxChars);
+        case 'list_docs': return await toolListDocs(env, callContext);
+        case 'read_doc': return await toolReadDoc(env, args, maxChars, callContext);
         case 'delete_doc': return await toolDeleteDoc(env, args);
         default: return '未知工具: ' + name;
       }
     })();
+    // 写操作不能用 Promise.race 报「超时失败」后继续落盘：等待它给出确定的成功或自身失败。
+    if (isWrite) return await run;
     const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error('__TOOL_TIMEOUT__')), toolTimeoutMs);
+      timer = setTimeout(() => {
+        timedOut = true;
+        // 先让 race 确定进入超时分支，再取消底层 fetch / 读取，避免 AbortError 被误报成工具自身错误。
+        reject(new Error('__TOOL_TIMEOUT__'));
+        controller.abort();
+      }, toolTimeoutMs);
     });
     return await Promise.race([run, timeout]);
   } catch (e) {
-    if (e && e.message === '__TOOL_TIMEOUT__') return '工具 ' + name + ' 执行超时（' + Math.round(toolTimeoutMs / 1000) + ' 秒），已跳过';
+    if (timedOut || (e && e.message === '__TOOL_TIMEOUT__')) {
+      return '工具 ' + name + ' 执行超时（' + Math.round(toolTimeoutMs / 1000) + ' 秒），已取消';
+    }
     return '工具执行失败: ' + (e && e.message ? e.message : String(e));
   } finally {
     if (timer) clearTimeout(timer);
+    if (removeParentAbort) removeParentAbort();
   }
 }
 

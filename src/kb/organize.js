@@ -117,7 +117,7 @@ async function autoOrganizeAndSaveKbDoc(env, chatId, activeModelId, docTitle, ra
   // 也不会把刚落盘的原文覆盖掉）。整理失败则保留第一步的原文，数据不丢。
   let skippedDup = false;
   if (organizedSummary && env && env.R2 && bodySaved) {
-    if (prevBody && sameSummaryExists(prevBody, organizedSummary)) {
+    if (rawAlready && prevBody && sameSummaryExists(prevBody, organizedSummary)) {
       // 同一个文件重复上传、或对同一段对话重复整理：大纲已经在文档里，不再前置一遍
       skippedDup = true;
     } else {
@@ -148,10 +148,11 @@ async function autoOrganizeAndSaveKbDoc(env, chatId, activeModelId, docTitle, ra
   };
 }
 
-// 原文是否已经在文档里：比对前 400 个非空白字符（prepend 会把大纲放在前面，
-// 所以不能用「以原文开头」判断，只能做包含判断）。
+// 原文是否已经在文档里：完整规范化后做包含判断（prepend 会把大纲放在前面，
+// 所以不能用「以原文开头」判断）。不能只比前缀，否则仅尾部不同的新原文会被
+// 误判为已存在，后续覆盖与整理都会被跳过。
 function bodyHasRaw(body, raw) {
-  const probe = String(raw || '').replace(/\s+/g, '').slice(0, 400);
+  const probe = String(raw || '').replace(/\s+/g, '');
   if (probe.length < 20) return false;
   return String(body || '').replace(/\s+/g, '').indexOf(probe) !== -1;
 }

@@ -289,27 +289,39 @@ function toolGetTime(timezone, opts) {
   } catch (e) { return '时区无效: ' + tz; }
 }
 
-async function fetchJson(url, timeoutMs, headers) {
+async function fetchJson(url, timeoutMs, headers, signal) {
   const ctrl = new AbortController();
+  const parentAbort = () => ctrl.abort();
+  if (signal && signal.aborted) ctrl.abort();
+  else if (signal && typeof signal.addEventListener === 'function') signal.addEventListener('abort', parentAbort, { once: true });
   const timer = setTimeout(() => ctrl.abort(), timeoutMs || 12000);
   try {
     const res = await fetch(url, { signal: ctrl.signal, headers: headers || {} });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     return await res.json();
-  } finally { clearTimeout(timer); }
+  } finally {
+    clearTimeout(timer);
+    if (signal && typeof signal.removeEventListener === 'function') signal.removeEventListener('abort', parentAbort);
+  }
 }
 
-async function fetchText(url, timeoutMs, headers) {
+async function fetchText(url, timeoutMs, headers, signal) {
   const ctrl = new AbortController();
+  const parentAbort = () => ctrl.abort();
+  if (signal && signal.aborted) ctrl.abort();
+  else if (signal && typeof signal.addEventListener === 'function') signal.addEventListener('abort', parentAbort, { once: true });
   const timer = setTimeout(() => ctrl.abort(), timeoutMs || 12000);
   try {
     const res = await fetch(url, { signal: ctrl.signal, headers: headers || {} });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     return await res.text();
-  } finally { clearTimeout(timer); }
+  } finally {
+    clearTimeout(timer);
+    if (signal && typeof signal.removeEventListener === 'function') signal.removeEventListener('abort', parentAbort);
+  }
 }
 
-async function querySingleCityWeather(city) {
+async function querySingleCityWeather(city, signal) {
   city = String(city || '').trim();
   if (!city) return '城市名为空';
   const cacheKey = 'weather:' + city.toLowerCase();
@@ -319,14 +331,14 @@ async function querySingleCityWeather(city) {
     const normKey = city.toLowerCase().replace(/\s+/g, '');
     let loc = PRESET_CITY_COORDS[city] || PRESET_CITY_COORDS[normKey] || geoCoordCache.get(normKey);
     if (!loc) {
-      const g = await fetchJson('https://geocoding-api.open-meteo.com/v1/search?name=' + encodeURIComponent(city) + '&count=1&language=zh&format=json');
+      const g = await fetchJson('https://geocoding-api.open-meteo.com/v1/search?name=' + encodeURIComponent(city) + '&count=1&language=zh&format=json', 12000, {}, signal);
       if (!g.results || !g.results.length) return '找不到城市：' + city;
       loc = g.results[0];
       mapSetBounded(geoCoordCache, normKey, loc, 300);
     }
     const w = await fetchJson('https://api.open-meteo.com/v1/forecast?latitude=' + loc.latitude + '&longitude=' + loc.longitude +
       '&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m' +
-      '&daily=temperature_2m_max,temperature_2m_min,weather_code&timezone=auto&forecast_days=3');
+      '&daily=temperature_2m_max,temperature_2m_min,weather_code&timezone=auto&forecast_days=3', 12000, {}, signal);
     const wm = { 0: '晴', 1: '大致晴', 2: '多云', 3: '阴', 45: '雾', 48: '雾凇', 51: '毛毛雨', 53: '毛毛雨', 55: '毛毛雨', 61: '小雨', 63: '中雨', 65: '大雨', 71: '小雪', 73: '中雪', 75: '大雪', 80: '阵雨', 81: '阵雨', 82: '暴雨', 95: '雷阵雨' };
     const c = w.current, d = w.daily;
     let t = loc.name + '（' + (loc.country || '') + '）当前：' + (wm[c.weather_code] || '未知') +
@@ -338,12 +350,13 @@ async function querySingleCityWeather(city) {
 }
 
 // 支持单城市或逗号分隔的多城市并发查询（如 "北京, 上海, 东京"）
-async function toolGetWeather(city) {
+async function toolGetWeather(city, opts) {
+  const signal = opts && opts.signal;
   const raw = String(city || '').trim();
   if (!raw) return '城市名为空';
   const cities = raw.split(/[,，、;；]+/).map(s => s.trim()).filter(Boolean);
-  if (cities.length <= 1) return await querySingleCityWeather(cities[0] || raw);
-  const resList = await Promise.all(cities.slice(0, 5).map(c => querySingleCityWeather(c)));
+  if (cities.length <= 1) return await querySingleCityWeather(cities[0] || raw, signal);
+  const resList = await Promise.all(cities.slice(0, 5).map(c => querySingleCityWeather(c, signal)));
   return resList.join('\n\n');
 }
 
@@ -385,7 +398,7 @@ function normCurrencyCode(c) {
   return CURRENCY_ALIASES[raw] || CURRENCY_ALIASES[up] || up;
 }
 
-async function querySingleExchangeRate(fromCode, toCode, amount) {
+async function querySingleExchangeRate(fromCode, toCode, amount, signal) {
   const from = normCurrencyCode(fromCode || 'USD');
   const to = normCurrencyCode(toCode || 'CNY');
   if (!from || !to) return '汇率查询失败: 请提供源货币与目标货币代码（如 USD、CNY、JPY、BTC）';
@@ -402,7 +415,8 @@ async function querySingleExchangeRate(fromCode, toCode, amount) {
       const cg = await fetchJson(
         `https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(cryptoId)}&vs_currencies=${encodeURIComponent(fiat)},usd,cny&include_24hr_change=true`,
         10000,
-        { 'Accept': 'application/json', 'User-Agent': 'Cloudflare-Chat/7.2' }
+        { 'Accept': 'application/json', 'User-Agent': 'Cloudflare-Chat/7.2' },
+        signal
       );
       const item = cg && cg[cryptoId];
       if (!item) return '汇率查询失败: 未找到加密货币 ' + (isFromCrypto ? from : to) + ' 的实时行情';
@@ -421,7 +435,7 @@ async function querySingleExchangeRate(fromCode, toCode, amount) {
     let rate = null;
     let dateStr = '';
     try {
-      const er = await fetchJson(`https://open.er-api.com/v6/latest/${encodeURIComponent(from)}`, 10000);
+      const er = await fetchJson(`https://open.er-api.com/v6/latest/${encodeURIComponent(from)}`, 10000, {}, signal);
       if (er && er.rates && typeof er.rates[to] === 'number') {
         rate = er.rates[to];
         dateStr = er.time_last_update_utc ? er.time_last_update_utc.slice(0, 16) : '';
@@ -429,7 +443,7 @@ async function querySingleExchangeRate(fromCode, toCode, amount) {
     } catch (e) {}
 
     if (rate === null) {
-      const fk = await fetchJson(`https://api.frankfurter.dev/v1/latest?base=${encodeURIComponent(from)}&symbols=${encodeURIComponent(to)}`, 10000);
+      const fk = await fetchJson(`https://api.frankfurter.dev/v1/latest?base=${encodeURIComponent(from)}&symbols=${encodeURIComponent(to)}`, 10000, {}, signal);
       if (fk && fk.rates && typeof fk.rates[to] === 'number') {
         rate = fk.rates[to];
         dateStr = fk.date || '';
@@ -447,19 +461,21 @@ async function querySingleExchangeRate(fromCode, toCode, amount) {
 }
 
 // 支持单币种或逗号分隔多币种并发查询（如 from="USD, JPY, BTC", to="CNY"）
-async function toolExchangeRate(args) {
+async function toolExchangeRate(args, opts) {
   args = args || {};
+  const signal = opts && opts.signal;
   const rawFrom = String(args.from || 'USD').trim();
   const to = args.to || 'CNY';
   const amount = isFinite(parseFloat(args.amount)) && parseFloat(args.amount) > 0 ? parseFloat(args.amount) : 1;
   const fromList = rawFrom.split(/[,，、;；]+/).map(s => s.trim()).filter(Boolean);
-  if (fromList.length <= 1) return await querySingleExchangeRate(fromList[0] || rawFrom, to, amount);
-  const resList = await Promise.all(fromList.slice(0, 6).map(f => querySingleExchangeRate(f, to, amount)));
+  if (fromList.length <= 1) return await querySingleExchangeRate(fromList[0] || rawFrom, to, amount, signal);
+  const resList = await Promise.all(fromList.slice(0, 6).map(f => querySingleExchangeRate(f, to, amount, signal)));
   return resList.join('\n\n');
 }
 
 // 维基百科权威词条检索（自动识别中英文，支持搜索 + 摘要提取）
-async function toolWikiLookup(query, lang) {
+async function toolWikiLookup(query, lang, opts) {
+  const signal = opts && opts.signal;
   query = String(query || '').trim();
   if (!query) return '维基百科查询关键词为空';
   const hasCjk = /[\u4e00-\u9fff]/.test(query);
@@ -475,7 +491,7 @@ async function toolWikiLookup(query, lang) {
   };
   try {
     const searchUrl = `${host}/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&srlimit=3&utf8=1&format=json`;
-    const sr = await fetchJson(searchUrl, 10000, headers);
+    const sr = await fetchJson(searchUrl, 10000, headers, signal);
     const hits = (sr && sr.query && sr.query.search) || [];
     if (!hits.length) {
       if (wikiLang === 'zh' && !lang) return await toolWikiLookup(query, 'en');

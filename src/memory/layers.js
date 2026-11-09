@@ -15,7 +15,8 @@
 //
 // 本文件只放纯函数与常量，不碰 R2，方便在 Node 里直接跑回归测试。
 
-export const MEM_LAYER = { WORKING: 'L1', LONGTERM: 'L2', ARCHIVE: 'L3' };
+// 层号字面量（L1/L2/L3）在注释与提示词里直接写，不再单独导出一个常量表 ——
+// 之前那个 MEM_LAYER 没有任何引用，只会让人以为层号有第二处定义。
 
 // ---------- 容量与生命周期 ----------
 // L1：12 条要点足够覆盖 10 轮历史裁剪后的缺口，再多就会挤占 L2 的注入预算
@@ -54,7 +55,7 @@ export function memLimits(env) {
     l1: clampInt(e.MEM_L1_MAX_ITEMS, 4, 30, WM_MAX_ITEMS),
     l2: clampInt(e.MEM_L2_MAX_ITEMS, 50, 1000, LT_MAX_ITEMS),
     l3: clampInt(e.MEM_L3_MAX_ITEMS, 50, 2000, AR_MAX_ITEMS),
-    halflifeDays: clampNum(e.MEM_L2_HALFLIFE_DAYS, 1, 3650, LT_HALFLIFE_DAYS),
+    halflifeDays: normalizeHalflifeDays(e.MEM_L2_HALFLIFE_DAYS),
     promptBudget: clampInt(e.MEM_PROMPT_BUDGET, 1500, 20000, MEM_PROMPT_BUDGET)
   };
 }
@@ -90,6 +91,14 @@ export function clampNum(v, min, max, dflt) {
   if (n < min) return min;
   if (n > max) return max;
   return n;
+}
+
+// 半衰期必须是有限正数。非法值与 0 回退默认值，正常值夹到 1~3650 天，
+// 防止除零、NaN 或无限大的排序分污染淘汰与召回。
+function normalizeHalflifeDays(v) {
+  const n = typeof v === 'number' ? v : parseFloat(v);
+  if (!isFinite(n) || n <= 0) return LT_HALFLIFE_DAYS;
+  return Math.min(3650, Math.max(1, n));
 }
 
 export function clipText(s, max) {
@@ -164,9 +173,9 @@ export function memDecayScore(entry, now, halflifeDays) {
   const w = clampNum(e.weight, 1, 5, 3);
   const ts = Number(e.ts) || 0;
   const at = now || Date.now();
-  const half = halflifeDays > 0 ? halflifeDays : LT_HALFLIFE_DAYS;
+  const half = normalizeHalflifeDays(halflifeDays);
   const ageDays = ts > 0 ? Math.max(0, (at - ts) / 86400000) : 0;
-  const recency = Math.exp(-ageDays / half);
+  const recency = Math.exp(-Math.LN2 * ageDays / half);
   const hits = Math.min(50, Math.max(0, Number(e.hits) || 0));
   return w * (0.35 + 0.65 * recency) + Math.min(1.5, Math.log2(1 + hits) * 0.4);
 }

@@ -34,12 +34,13 @@ export async function memoryLoad(env, chatId, query, opts) {
   const wm = working || { items: [], pins: [] };
   const lt = Array.isArray(longterm) ? longterm : [];
   const ar = archive || { items: [] };
-  const budgets = memBudgets(memLimits(env).promptBudget);
+  const limits = memLimits(env);
+  const budgets = memBudgets(limits.promptBudget);
 
   // 命中计数只更新内存缓存（不落盘），让"常被用到的事实"在后续淘汰中更抗跌
   if (lt.length) {
     try {
-      const picked = pickLongterm(lt, query, budgets.L2);
+      const picked = pickLongterm(lt, query, budgets.L2, { halflifeDays: limits.halflifeDays });
       await ltTouch(env, chatId, picked.map(m => m.fact));
     } catch (e) {}
   }
@@ -49,6 +50,7 @@ export async function memoryLoad(env, chatId, query, opts) {
     longterm: lt,
     archive: ar,
     budgets: budgets,
+    halflifeDays: limits.halflifeDays,
     query: String(query || ''),
     stats: {
       l1Items: Array.isArray(wm.items) ? wm.items.length : 0,
@@ -62,10 +64,11 @@ export async function memoryLoad(env, chatId, query, opts) {
 // L2 挑选：相关性优先，同相关性看衰减分；按预算截断。
 // includeAll 让"与本次提问无关但权重高"的记忆也能进来（用户画像的完整性），
 // 只是排在命中项之后——旧版全量注入的行为在这里被保留下来。
-export function pickLongterm(arr, query, budget) {
+export function pickLongterm(arr, query, budget, opts) {
   const list = Array.isArray(arr) ? arr : [];
   if (!list.length) return [];
-  const ranked = rankLongterm(list, query, list.length, { includeAll: true });
+  const halflifeDays = typeof opts === 'number' ? opts : (opts && opts.halflifeDays);
+  const ranked = rankLongterm(list, query, list.length, { includeAll: true, halflifeDays });
   const out = [];
   let left = budget > 0 ? budget : MEM_BUDGET.L2;
   for (const m of ranked) {
@@ -96,7 +99,7 @@ export function memoryPromptBlock(bundle, query) {
   // L2
   const lt = Array.isArray(bundle.longterm) ? bundle.longterm : [];
   if (lt.length) {
-    const picked = pickLongterm(lt, q, budget.L2);
+    const picked = pickLongterm(lt, q, budget.L2, { halflifeDays: bundle.halflifeDays });
     if (picked.length) {
       const lines = picked.map(m => {
         const label = m.kind && m.kind !== 'fact' ? '[' + (MEM_KIND_LABEL[m.kind] || m.kind) + '·权重' + (m.weight || 3) + '] ' : '';
