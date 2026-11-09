@@ -4,6 +4,14 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>朗读功能演示 - Cloudflare-Chat</title>
+<!--
+  这个文件由 scripts/build-tts-demo.mjs 从 scripts/tts-demo.template.html 生成，
+  不要直接改它 —— 改完下次生成就被覆盖了。
+
+  生成时会把 src/ui/speech.js 里的 cleanForSpeech / containsCJK 源码原样注入到
+  下方脚本的占位符处，因此演示页与线上页面的朗读行为永远一致。
+  改规则请改 src/ui/speech.js，然后执行：npm run build:tts-demo
+-->
 <style>
   :root{
     --bg-base:#f8fafc; --glass-bg:rgba(255,255,255,.75); --glass-border:rgba(15,23,42,.10);
@@ -124,118 +132,123 @@
 </div>
 
 <script>
-  let activeSpeakBtn = null;
-  let autoSpeak = false;
+// ===== 以下两段由 scripts/build-tts-demo.mjs 从 src/ui/speech.js 注入，请勿手改 =====
+function cleanForSpeech(text) {
+  if (!text) return '';
 
-  const SPEAK_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path><path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path></svg>';
+  const rules = [
+    // 代码块整体省略 —— 朗读代码没有意义，念出来全是符号
+    [/```[\s\S]*?```/g, ' （代码块已省略） '],
+    // 行内代码保留文字本身
+    [/`([^`]*)`/g, '$1'],
+    // 图片只留「（图片）」，链接只念标题，地址不念
+    [/!\[[^\]]*\]\(([^)]*)\)/g, ' （图片） '],
+    [/\[([^\]]*)\]\(([^)]*)\)/g, '$1'],
+    // 标题、引用、列表、有序列表的标记符号
+    [/^\s{0,3}#{1,6}\s*/gm, ''],
+    [/^\s{0,3}>\s?/gm, ''],
+    [/(\*\*|__)(.*?)\1/g, '$2'],
+    [/(\*|_)(.*?)\1/g, '$2'],
+    [/^\s*[-*+]\s+/gm, ''],
+    [/^\s*\d+\.\s+/gm, ''],
+    // 表格竖线念不出来，换成空格
+    [/\|/g, ' '],
+    [/^[-=]{3,}$/gm, ' '],
+    [/^[\s:-]*[-:][\s:-]*$/gm, ''],
+    [/[ \t]{2,}/g, ' '],
+    [/\n{3,}/g, '\n\n'],
+  ];
 
-  function cleanForSpeech(text) {
-    if (!text) return '';
-    const BT = String.fromCharCode(96);
-    const BS = String.fromCharCode(92);
-    const NL = String.fromCharCode(10);
-    const TAB = String.fromCharCode(9);
-    const rx = function (p) { return p.split('@').join(BS); };
-    const rules = [
-      [BT + BT + BT + rx('[@s@S]*?') + BT + BT + BT, 'g', ' （代码块已省略） '],
-      [BT + '([^' + BT + ']*)' + BT, 'g', '$1'],
-      [rx('!@[[^@]]*@]@([^)]*@)'), 'g', ' （图片） '],
-      [rx('@[([^@]]*)@]@([^)]*@)'), 'g', '$1'],
-      [rx('^@s{0,3}#{1,6}@s*'), 'gm', ''],
-      [rx('^@s{0,3}>@s?'), 'gm', ''],
-      [rx('(@*@*|__)(.*?)@1'), 'g', '$2'],
-      [rx('(@*|_)(.*?)@1'), 'g', '$2'],
-      [rx('^@s*[-*+]@s+'), 'gm', ''],
-      [rx('^@s*@d+@.@s+'), 'gm', ''],
-      [rx('@|'), 'g', ' '],
-      ['^[-=]{3,}$', 'gm', ' '],
-      [rx('^[@s:-]*[-:][@s:-]*$'), 'gm', ''],
-      ['[ ' + TAB + ']{2,}', 'g', ' '],
-      [rx('@n{3,}'), 'g', NL + NL]
-    ];
-    let out = String(text);
-    for (let i = 0; i < rules.length; i++) {
-      try { out = out.replace(new RegExp(rules[i][0], rules[i][1]), rules[i][2]); } catch (e) {}
-    }
-    return out.trim();
+  let out = String(text);
+  for (let i = 0; i < rules.length; i++) {
+    try {
+      out = out.replace(rules[i][0], rules[i][1]);
+    } catch (e) { /* 单条规则异常不影响其余 */ }
   }
+  return out.trim();
+}
 
-  function containsCJK(text) {
-    const re = new RegExp('[' + String.fromCharCode(0x4e00) + '-' + String.fromCharCode(0x9fff) + ']');
-    return re.test(text);
+function containsCJK(text) {
+  return /[\u4e00-\u9fff]/.test(String(text == null ? '' : text));
+}
+// ===== 注入结束：以下为演示页自身的交互逻辑 =====
+
+let activeSpeakBtn = null;
+let autoSpeak = false;
+
+const SPEAK_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path><path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path></svg>';
+
+function getBubbleText(bubble) {
+  const box = bubble.querySelector('.message-text') || bubble;
+  return (box.innerText || box.textContent || '').trim();
+}
+
+function stopSpeaking() {
+  if (window.speechSynthesis) { try { window.speechSynthesis.cancel(); } catch (e) {} }
+  if (activeSpeakBtn) {
+    activeSpeakBtn.classList.remove('speaking');
+    const s = activeSpeakBtn.querySelector('span');
+    if (s) s.textContent = '朗读';
+    activeSpeakBtn = null;
   }
+}
 
-  function getBubbleText(bubble) {
-    const box = bubble.querySelector('.message-text') || bubble;
-    return (box.innerText || box.textContent || '').trim();
-  }
+function toggleSpeak(btn, bubble) {
+  if (btn.classList.contains('speaking')) { stopSpeaking(); return; }
+  if (!('speechSynthesis' in window)) { alert('当前浏览器不支持语音朗读，请用 Chrome / Edge / Safari 较新版本。'); return; }
+  stopSpeaking();
+  const text = cleanForSpeech(getBubbleText(bubble));
+  if (!text) return;
 
-  function stopSpeaking() {
-    if (window.speechSynthesis) { try { window.speechSynthesis.cancel(); } catch (e) {} }
-    if (activeSpeakBtn) {
-      activeSpeakBtn.classList.remove('speaking');
-      const s = activeSpeakBtn.querySelector('span');
+  const utter = new SpeechSynthesisUtterance(text);
+  utter.lang = containsCJK(text) ? 'zh-CN' : 'en-US';
+  utter.rate = 1; utter.pitch = 1;
+
+  const reset = () => {
+    if (activeSpeakBtn === btn) {
+      btn.classList.remove('speaking');
+      const s = btn.querySelector('span');
       if (s) s.textContent = '朗读';
       activeSpeakBtn = null;
     }
+  };
+  utter.onend = reset; utter.onerror = reset;
+
+  activeSpeakBtn = btn;
+  btn.classList.add('speaking');
+  const s = btn.querySelector('span');
+  if (s) s.textContent = '停止';
+  window.speechSynthesis.speak(utter);
+}
+
+document.querySelectorAll('.bubble[data-demo]').forEach(bubble => {
+  const actions = document.createElement('div');
+  actions.className = 'msg-actions';
+  const btn = document.createElement('button');
+  btn.className = 'speak-btn';
+  btn.type = 'button';
+  btn.title = '朗读这条回复';
+  btn.innerHTML = SPEAK_ICON + '<span>朗读</span>';
+  btn.addEventListener('click', () => toggleSpeak(btn, bubble));
+  actions.appendChild(btn);
+  bubble.appendChild(actions);
+});
+
+const autoBtn = document.getElementById('autoBtn');
+const autoLabel = document.getElementById('autoLabel');
+autoBtn.addEventListener('click', () => {
+  autoSpeak = !autoSpeak;
+  autoBtn.classList.toggle('active', autoSpeak);
+  autoLabel.textContent = autoSpeak ? '自动朗读：开' : '自动朗读：关';
+  autoBtn.title = autoSpeak ? '自动朗读：已开启（点击关闭）' : '自动朗读：已关闭（点击开启）';
+  if (!autoSpeak) stopSpeaking();
+  if (autoSpeak) {
+    const last = document.querySelector('.bubble[data-demo]:last-of-type .speak-btn');
+    if (last) toggleSpeak(last, last.closest('.bubble'));
   }
+});
 
-  function toggleSpeak(btn, bubble) {
-    if (btn.classList.contains('speaking')) { stopSpeaking(); return; }
-    if (!('speechSynthesis' in window)) { alert('当前浏览器不支持语音朗读，请用 Chrome / Edge / Safari 较新版本。'); return; }
-    stopSpeaking();
-    const text = cleanForSpeech(getBubbleText(bubble));
-    if (!text) return;
-
-    const utter = new SpeechSynthesisUtterance(text);
-    utter.lang = containsCJK(text) ? 'zh-CN' : 'en-US';
-    utter.rate = 1; utter.pitch = 1;
-
-    const reset = () => {
-      if (activeSpeakBtn === btn) {
-        btn.classList.remove('speaking');
-        const s = btn.querySelector('span');
-        if (s) s.textContent = '朗读';
-        activeSpeakBtn = null;
-      }
-    };
-    utter.onend = reset; utter.onerror = reset;
-
-    activeSpeakBtn = btn;
-    btn.classList.add('speaking');
-    const s = btn.querySelector('span');
-    if (s) s.textContent = '停止';
-    window.speechSynthesis.speak(utter);
-  }
-
-  document.querySelectorAll('.bubble[data-demo]').forEach(bubble => {
-    const actions = document.createElement('div');
-    actions.className = 'msg-actions';
-    const btn = document.createElement('button');
-    btn.className = 'speak-btn';
-    btn.type = 'button';
-    btn.title = '朗读这条回复';
-    btn.innerHTML = SPEAK_ICON + '<span>朗读</span>';
-    btn.addEventListener('click', () => toggleSpeak(btn, bubble));
-    actions.appendChild(btn);
-    bubble.appendChild(actions);
-  });
-
-  const autoBtn = document.getElementById('autoBtn');
-  const autoLabel = document.getElementById('autoLabel');
-  autoBtn.addEventListener('click', () => {
-    autoSpeak = !autoSpeak;
-    autoBtn.classList.toggle('active', autoSpeak);
-    autoLabel.textContent = autoSpeak ? '自动朗读：开' : '自动朗读：关';
-    autoBtn.title = autoSpeak ? '自动朗读：已开启（点击关闭）' : '自动朗读：已关闭（点击开启）';
-    if (!autoSpeak) stopSpeaking();
-    if (autoSpeak) {
-      const last = document.querySelector('.bubble[data-demo]:last-of-type .speak-btn');
-      if (last) toggleSpeak(last, last.closest('.bubble'));
-    }
-  });
-
-  window.addEventListener('beforeunload', stopSpeaking);
+window.addEventListener('beforeunload', stopSpeaking);
 </script>
 </body>
 </html>

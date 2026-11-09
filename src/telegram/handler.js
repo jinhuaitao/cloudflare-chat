@@ -525,7 +525,9 @@ export async function handleTgWebhook(request, env) {
 
           if (cmd && (cmd.cmd === '/start' || cmd.cmd === '/model')) {
             const inline_keyboard = modelObjList.map((model, index) => {
-              return [{ text: model.name, callback_data: `M:${index}` }];
+              // 同名模型来自不同通道时补主机名，否则按钮文案完全一样、用户无从区分
+              const label = model.channelHint ? model.name + ' @' + model.channelHint : model.name;
+              return [{ text: label, callback_data: `M:${index}` }];
             });
 
             await tgApi('sendMessage', {

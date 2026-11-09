@@ -100,6 +100,18 @@ export default `</head>
         <div style="font-weight:600;color:#10b981;">⚡ 全自动后台收发（像 Telegram 一样免配置外部监控）</div>
         <div style="color:var(--text-sub);margin-top:2px;">扫码绑定成功后，服务端会自动启动「自接力常驻长轮询引擎」；即使直接关掉当前网页，机器人也会在云端自动接力收发微信消息，无需手动添加任何外部监控。</div>
       </div>
+      <div class="settings-field" id="wxKeepaliveBox" style="display:none;margin-top:10px;">
+        <label class="settings-label" for="wxKeepaliveUrlInput">🔗 免开网页保活地址（可选）</label>
+        <div style="display:flex;gap:8px;">
+          <input type="text" id="wxKeepaliveUrlInput" class="settings-input" style="flex:1;font-size:11.5px;" readonly>
+          <button type="button" id="wxCopyKeepaliveBtn" class="btn">复制</button>
+        </div>
+        <div class="settings-hint">把这个地址加到任意在线定时任务（如 cron-job.org）里每 10 分钟请求一次，即使没人打开网页，云端也会持续接力收发微信消息。</div>
+      </div>
+      <div class="settings-field" style="margin-top:10px;display:flex;align-items:flex-start;gap:8px;font-size:12.5px;line-height:1.5;">
+        <input type="checkbox" id="wxLivePollToggle" style="width:15px;height:15px;margin-top:2px;flex:none;">
+        <label for="wxLivePollToggle" style="cursor:pointer;">网页打开时保持实时轮询（关掉可省流量；后台仍由 Cron 定时接管）</label>
+      </div>
       <div class="settings-field" id="wxDiagSection" style="display:none;margin-top:10px;">
         <label class="settings-label">📋 实时收发与诊断日志</label>
         <div id="wxDiagBox" style="font-size:12px;line-height:1.55;max-height:130px;overflow-y:auto;padding:8px 10px;border-radius:8px;background:var(--bg-soft);border:1px solid var(--border);font-family:monospace;white-space:pre-wrap;">暂无收发记录</div>
@@ -107,6 +119,17 @@ export default `</head>
       <div class="settings-actions">
         <button id="closeWxModalBtn" class="settings-btn">关闭</button>
       </div>
+    </div>
+  </div>
+</div>
+
+<div class="settings-modal-overlay" id="kbModal">
+  <div class="settings-box" style="max-width:560px;display:flex;flex-direction:column;max-height:86vh;">
+    <h3>📚 知识库（只读）</h3>
+    <div id="kbListBox" style="flex:1;overflow-y:auto;font-size:13px;line-height:1.6;min-height:110px;padding-right:4px;">正在读取知识库…</div>
+    <div class="settings-actions" style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;">
+      <button type="button" id="kbRefreshBtn" class="btn">🔄 刷新</button>
+      <button type="button" id="kbCloseBtn" class="settings-btn" style="width:auto;padding:10px 20px;">关闭</button>
     </div>
   </div>
 </div>
@@ -128,6 +151,9 @@ export default `</head>
       <div class="side-tools">
         <button class="theme-toggle" id="settingsToggle" title="系统设置">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+        </button>
+        <button class="theme-toggle" id="kbModalToggle" title="知识库文档（只读清单）">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path></svg>
         </button>
         <button class="theme-toggle" id="wxModalToggle" title="微信 ClawBot 通道绑定与管理" style="position:relative;">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path></svg>
@@ -165,7 +191,7 @@ export default `</head>
       <div class="empty-state" id="emptyState">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path></svg>
         <h2>今天我能为你提供什么帮助？</h2>
-        <p>输入问题即可开始，支持 Markdown、代码高亮、18 项 Agent 工具、Telegram 与微信 ClawBot 通道。</p>
+        <p>输入问题即可开始，支持 Markdown、代码高亮、19 项 Agent 工具、Telegram 与微信 ClawBot 通道。</p>
         <div class="suggestion-grid" id="suggestionGrid">
           <button class="suggestion-chip" type="button" data-prompt="帮我写一封得体的商务邮件">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"></path><polyline points="22,6 12,13 2,6"></polyline></svg>

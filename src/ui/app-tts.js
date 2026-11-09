@@ -1,4 +1,10 @@
 // 语音朗读（Web Speech API，浏览器原生，无需 API Key）（_worker.js 原第 3548-3698 行，内嵌页面分片；只允许字符串导出）
+//
+// cleanForSpeech / containsCJK 不再写在本分片里 —— 它们来自 src/ui/speech.js，
+// 以源码字符串形式插入。原因：分片内有「两层转义」，写反斜杠会被吃掉，
+// 而这两个函数全是正则；同一段逻辑还要供 tts-demo.html 使用，必须单一来源。
+import { CLEAN_FOR_SPEECH_SRC, CONTAINS_CJK_SRC } from './speech.js';
+
 export default `  // ===== 语音朗读（Web Speech API，浏览器原生，无需任何 API Key）=====
   const TTS_AUTO_KEY = 'tts_auto';
   let autoSpeak = localStorage.getItem(TTS_AUTO_KEY) === '1';
@@ -50,51 +56,11 @@ export default `  // ===== 语音朗读（Web Speech API，浏览器原生，无
     }
   }
 
-  // 把 Markdown / 代码块清理成适合朗读的纯文本
-  // ⚠️ 本段位于外层模板字符串内部，存在「两层转义」：
-  //    模板字符串吃掉一层反斜杠，浏览器解析 JS 字符串字面量再吃掉一层。
-  //    因此这里【完全不写反斜杠】，一律用字符码拼接，避免正则被破坏。
-  function cleanForSpeech(text) {
-    if (!text) return '';
-    const BT = String.fromCharCode(96);  // 反引号
-    const BS = String.fromCharCode(92);  // 反斜杠
-    const NL = String.fromCharCode(10);  // 换行
-    const TAB = String.fromCharCode(9);
-    // 用 @ 占位，展开成反斜杠；这样源码里不出现任何反斜杠
-    const rx = function (p) { return p.split('@').join(BS); };
-
-    const rules = [
-      [BT + BT + BT + rx('[@s@S]*?') + BT + BT + BT, 'g', ' （代码块已省略） '],
-      [BT + '([^' + BT + ']*)' + BT, 'g', '$1'],
-      [rx('!@[[^@]]*@]@([^)]*@)'), 'g', ' （图片） '],
-      [rx('@[([^@]]*)@]@([^)]*@)'), 'g', '$1'],
-      [rx('^@s{0,3}#{1,6}@s*'), 'gm', ''],
-      [rx('^@s{0,3}>@s?'), 'gm', ''],
-      [rx('(@*@*|__)(.*?)@1'), 'g', '$2'],
-      [rx('(@*|_)(.*?)@1'), 'g', '$2'],
-      [rx('^@s*[-*+]@s+'), 'gm', ''],
-      [rx('^@s*@d+@.@s+'), 'gm', ''],
-      [rx('@|'), 'g', ' '],
-      ['^[-=]{3,}$', 'gm', ' '],
-      [rx('^[@s:-]*[-:][@s:-]*$'), 'gm', ''],
-      ['[ ' + TAB + ']{2,}', 'g', ' '],
-      [rx('@n{3,}'), 'g', NL + NL]
-    ];
-
-    let out = String(text);
-    for (let i = 0; i < rules.length; i++) {
-      try {
-        out = out.replace(new RegExp(rules[i][0], rules[i][1]), rules[i][2]);
-      } catch (e) { /* 单条规则异常不影响其余 */ }
-    }
-    return out.trim();
-  }
+  // 把 Markdown / 代码块清理成适合朗读的纯文本（实现见 src/ui/speech.js，此处只插入源码）
+${CLEAN_FOR_SPEECH_SRC}
 
   // 是否包含中日韩字符（用于选择朗读语言）
-  function containsCJK(text) {
-    const re = new RegExp('[' + String.fromCharCode(0x4e00) + '-' + String.fromCharCode(0x9fff) + ']');
-    return re.test(text);
-  }
+${CONTAINS_CJK_SRC}
 
   function getBubbleText(bubble) {
     const box = bubble.querySelector('.message-text') || bubble;

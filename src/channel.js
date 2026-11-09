@@ -12,6 +12,7 @@ const keyRoundRobinIdx = new Map();
 //   original —— 环境变量里的原始串（id:name）
 //   key      —— 选择键。id 全局唯一时等于 id；同一 id 被多个供应商复用时取 original，
 //               这样「同一个上游模型名 + 不同 API_URL/API_KEY」的多条通道可以并存，互不覆盖。
+//               若连 original 也相同（两个通道声明了完全一样的 "id:name"），再追加 #2/#3 后缀。
 //               下游（前端、TG、微信、断点续做）统一保存 key，转发上游时用 id。
 function getChannelConfig(env) {
   if (cachedConfig) {
@@ -19,15 +20,20 @@ function getChannelConfig(env) {
   }
 
   const pending = [];
-  const seenOriginal = new Set();
+  // 去重范围是「单个通道内」而不是全局：同一条 MODEL_1 里写两遍同一个模型是笔误，应当合并；
+  // 但 API_URL_1 与 API_URL_2 各声明一次 gpt-4o 是主备双通道，两条都必须保留 ——
+  // 旧版用全局 seenOriginal 去重，会把第二条通道整个吞掉（配了备用线路却永远打不到）。
+  const seenInChannel = new Set();
 
-  const addModels = (modelStr, url, keys) => {
+  const addModels = (modelStr, url, keys, channelTag) => {
     if (!modelStr) return;
     const arr = modelStr.split(',');
     for (let i = 0; i < arr.length; i++) {
       const raw = arr[i].trim();
-      if (!raw || seenOriginal.has(raw)) continue;
-      seenOriginal.add(raw);
+      if (!raw) continue;
+      const dedupeKey = channelTag + '|' + raw;
+      if (seenInChannel.has(dedupeKey)) continue;
+      seenInChannel.add(dedupeKey);
 
       const colonIdx = raw.indexOf(':');
       const id = colonIdx > 0 ? raw.substring(0, colonIdx).trim() : raw;
@@ -40,11 +46,11 @@ function getChannelConfig(env) {
   if (env.API_CONFIG) {
     try {
       const channels = JSON.parse(env.API_CONFIG);
-      channels.forEach(ch => {
+      channels.forEach((ch, ci) => {
         const url = ch.url;
         const keys = Array.isArray(ch.keys) ? ch.keys : parseCommaSeparated(ch.keys);
         const modelStr = Array.isArray(ch.models) ? ch.models.join(',') : ch.models;
-        if (url && modelStr) addModels(modelStr, url, keys);
+        if (url && modelStr) addModels(modelStr, url, keys, 'cfg' + ci);
       });
       if (pending.length > 0) parsedApiConfig = true;
     } catch (e) {
@@ -59,14 +65,14 @@ function getChannelConfig(env) {
       const modelStr = env[`MODEL_${i}`];
       if (url && modelStr) {
         hasIndexed = true;
-        addModels(modelStr, url, parseCommaSeparated(env[`API_KEY_${i}`]));
+        addModels(modelStr, url, parseCommaSeparated(env[`API_KEY_${i}`]), 'idx' + i);
       }
     }
     if (!hasIndexed || pending.length === 0) {
       const fallbackUrl = env.API_URL || "";
       const fallbackModelStr = env.MODEL || "";
       if (fallbackUrl && fallbackModelStr) {
-        addModels(fallbackModelStr, fallbackUrl, parseCommaSeparated(env.API_KEY));
+        addModels(fallbackModelStr, fallbackUrl, parseCommaSeparated(env.API_KEY), 'base');
       }
     }
   }
@@ -80,15 +86,40 @@ function getChannelConfig(env) {
     idCount.set(e.id, (idCount.get(e.id) || 0) + 1);
   }
   for (const e of pending) {
-    let key = idCount.get(e.id) > 1 ? e.original : e.id;
-    if (modelMap.has(key)) key = e.original + '#' + (models.length + 1);
-    const meta = { key, id: e.id, name: e.name, original: e.original };
+    const duplicated = idCount.get(e.id) > 1;
+    let key = duplicated ? e.original : e.id;
+    if (modelMap.has(key)) {
+      // original 也撞了（两个通道写了完全相同的 "id:name"）：补一个稳定后缀。
+      // 用递增序号而不是 models.length，避免中间有被跳过的条目时序号跳号。
+      let n = 2;
+      while (modelMap.has(e.original + '#' + n)) n++;
+      key = e.original + '#' + n;
+    }
+    // 下拉框里的显示名：同名模型来自不同通道时补上主机名，否则用户看到两个一模一样的选项
+    const channelHint = duplicated ? hostOf(e.url) : '';
+    const meta = { key, id: e.id, name: e.name, channelHint, original: e.original };
     models.push(meta);
     modelMap.set(key, { ...meta, url: e.url, keys: e.keys });
   }
 
   cachedConfig = { models, modelMap };
   return cachedConfig;
+}
+
+// 从 API_URL 里取主机名，只用于显示。取不到就退回空串，调用方会退回 name。
+function hostOf(url) {
+  try {
+    return new URL(String(url)).host || '';
+  } catch (e) {
+    return '';
+  }
+}
+
+// 清掉解析缓存。生产环境不需要（同一个 isolate 里 env 不会变），
+// 但测试要在同一进程里反复用不同 env 验证配置解析，必须能重置。
+function resetChannelConfigCache() {
+  cachedConfig = null;
+  keyRoundRobinIdx.clear();
 }
 
 // 把各种历史 / 外部传入的模型标识统一解析成当前模型的元信息：
@@ -187,4 +218,5 @@ export {
   getChannelConfig,
   resolveModelKey,
   buildAIRequest,
+  resetChannelConfigCache,
 };

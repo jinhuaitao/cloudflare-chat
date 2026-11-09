@@ -325,3 +325,69 @@ test('断点存档保存裁剪后的本轮起点，恢复后从工具轮次继�
     globalThis.fetch = original;
   }
 });
+
+// ==================== 同轮记忆化：只读工具去重 vs web_fetch 例外 ====================
+// 记忆化的生效场景是「后一步重复调用了前面已成功的只读工具，同时又带了新工具」——
+// 整步签名因此不同，不会先被空转熔断拦住。
+
+const MEMO_MARK = '已执行过完全相同的调用';
+
+test('普通只读工具重复调用被记忆化短路', async () => {
+  const original = globalThis.fetch;
+  const f = mockFetch([
+    () => sse([toolDelta(0, 'c1', 'calculate', { expression: '7*7' })]),
+    // 第 2 步：重复 calculate + 新增 get_time → 整步签名不同，不触发熔断
+    () => sse([
+      toolDelta(0, 'c2', 'calculate', { expression: '7*7' }),
+      toolDelta(1, 'c3', 'get_time', {}),
+    ]),
+    () => sse([delta('答案是 49。')]),
+  ]);
+  globalThis.fetch = f;
+  try {
+    await tgAgentChat(ENV, noopTgApi, 'chat11', 'mock-model',
+      [{ role: 'user', content: '7 乘 7 是多少' }], true, null, { maxRuntimeMs: 30000 });
+
+    const toolMsgs = f.calls[2].messages.filter(m => m.role === 'tool');
+    assert.ok(toolMsgs.some(m => m.content.includes(MEMO_MARK)), '重复的 calculate 应被记忆化短路');
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('web_fetch 不参与记忆化：同一 URL 再次调用仍然真的去取', async () => {
+  const original = globalThis.fetch;
+  const PAGE = '<html><head><title>探针页</title></head><body>'
+    + '<p>MEMO-PROBE-CONTENT 这是一段用于验证抓取确实发生的正文，长度足够避免触发回退抓取。</p>'
+    + '<p>' + '补充内容。'.repeat(60) + '</p></body></html>';
+
+  const f = mockFetch([
+    () => sse([toolDelta(0, 'c1', 'web_fetch', { url: 'https://example.test/probe' })]),
+    () => sse([
+      toolDelta(0, 'c2', 'web_fetch', { url: 'https://example.test/probe' }),
+      toolDelta(1, 'c3', 'get_time', {}),
+    ]),
+    () => sse([delta('看完了。')]),
+  ]);
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('example.test')) {
+      return new Response(PAGE, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+    }
+    return f(url, init);
+  };
+  try {
+    await tgAgentChat(ENV, noopTgApi, 'chat12', 'mock-model',
+      [{ role: 'user', content: '看看这个页面' }], true, null, { maxRuntimeMs: 30000 });
+
+    const toolMsgs = f.calls[2].messages.filter(m => m.role === 'tool');
+    const fetchResults = toolMsgs.filter(m => m.name === 'web_fetch');
+    assert.equal(fetchResults.length, 2, '两次 web_fetch 都应产生工具结果');
+    for (const m of fetchResults) {
+      assert.ok(!m.content.includes(MEMO_MARK), 'web_fetch 不应被记忆化短路：' + m.content.slice(0, 80));
+      assert.ok(m.content.includes('MEMO-PROBE-CONTENT'), '两次都应拿到真实正文');
+    }
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+

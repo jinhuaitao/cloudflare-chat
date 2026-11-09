@@ -163,9 +163,20 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
     if (scrollBottomBtn) scrollBottomBtn.classList.remove('show');
     const currentSession = sessions.find(s => s.id === id);
     if (currentSession && currentSession.model) {
-      const exists = Array.from(modelSelect.options).some(opt => opt.value === currentSession.model);
-      if (exists) {
-        modelSelect.value = currentSession.model;
+      const opts = Array.from(modelSelect.options);
+      let match = opts.find(opt => opt.value === currentSession.model);
+      if (!match) {
+        // 兼容旧版会话里存的裸模型名：同一模型被多个通道复用时，
+        // 选择键会变成 "id:name" 或 "id:name#2"，这里按 id 再匹配一次，避免静默切回第一个模型
+        const bare = String(currentSession.model).split('#')[0].split(':')[0];
+        match = opts.find(opt => opt.value.split('#')[0].split(':')[0] === bare);
+      }
+      if (match) {
+        modelSelect.value = match.value;
+        if (currentSession.model !== match.value) {
+          currentSession.model = match.value;
+          saveSessions();
+        }
       } else {
         modelSelect.selectedIndex = 0;
         currentSession.model = modelSelect.value;

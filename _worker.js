@@ -7,6 +7,7 @@ import { hitRateLimit } from './src/rate-limit.js';
 import { getChannelConfig, buildAIRequest } from './src/channel.js';
 import { readErrorBody } from './src/agent/stability.js';
 import { handleWebAgent } from './src/web-agent.js';
+import { handleKbList } from './src/kb/api.js';
 import { handleTgWebhook } from './src/telegram/handler.js';
 import { handleWxWebhook, handleWxApi, handleWxScheduled, maybeWakeWxDaemon } from './src/wechat/handler.js';
 import { ICON_B64, getIconBytes } from './src/pwa/icons.js';
@@ -62,6 +63,12 @@ async function routeRequest(request, env, ctx) {
 
     if (url.pathname.startsWith('/api/wx/')) {
       return await handleWxApi(request, env, url, ctx);
+    }
+
+    // 网页端「📚 知识库」只读清单（面板 UI 在 src/ui/app-kb.js）。
+    // 只读：写入入口仍只在 Telegram / 微信 ClawBot，这里不提供任何写操作。
+    if (request.method === 'GET' && url.pathname === '/api/kb/list') {
+      return await handleKbList(request, env);
     }
 
     if (request.method === 'POST' && url.pathname === '/api/chat') {
@@ -159,7 +166,9 @@ async function routeRequest(request, env, ctx) {
         if (!item.original.includes(':')) {
           displayName = item.id.length > 24 ? item.id.substring(0, 22) + '...' : item.id;
         }
-        optionsHtml += `<option value="${escHtml(item.id)}" ${i === 0 ? 'selected' : ''}>${escHtml(displayName)}</option>`;
+        // 同名模型来自不同通道时补主机名 —— 否则下拉框里会出现两个完全一样的选项
+        if (item.channelHint) displayName += ' · ' + item.channelHint;
+        optionsHtml += `<option value="${escHtml(item.key)}" ${i === 0 ? 'selected' : ''}>${escHtml(displayName)}</option>`;
       }
 
       if (models.length === 0) {

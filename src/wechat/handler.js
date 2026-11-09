@@ -50,6 +50,7 @@ import {
   extractWechatDocumentText,
   extractWechatMessageContent,
 } from './ilink.js';
+import { splitWechatText, parseWxCommand } from './text.js';
 
 // ================= R2 键名与 L1 内存缓存 =================
 const WX_CREDS_KEY = 'wx_clawbot_creds';
@@ -485,94 +486,7 @@ async function sendWxTypingStatus(env, creds, userId, contextToken, status) {
 }
 
 // ================= 5. 微信文本分段与中英双语口令解析 =================
-function splitWechatText(text, maxLength = 3800, maxChunks = 5) {
-  const chunks = [];
-  let remaining = String(text || '').trim();
-  while (remaining.length > 0) {
-    if (remaining.length <= maxLength || chunks.length >= maxChunks - 1) {
-      if (remaining.length > maxLength * 2) {
-        chunks.push(remaining.slice(0, maxLength * 2) + '\n\n…（内容过长，已截断显示）');
-      } else {
-        chunks.push(remaining);
-      }
-      break;
-    }
-    let sliceLength = maxLength;
-    const lastNewline = remaining.lastIndexOf('\n', maxLength);
-    if (lastNewline > Math.floor(maxLength * 0.7)) {
-      sliceLength = lastNewline;
-    }
-    const chunk = remaining.slice(0, sliceLength).trim();
-    remaining = remaining.slice(sliceLength).trim();
-    if (chunk) chunks.push(chunk);
-  }
-  return chunks.length ? chunks : [''];
-}
-
-function parseWxCommand(text) {
-  const s = String(text || '').trim();
-  if (!s) return null;
-
-  const slash = /^(\/[a-zA-Z]+)(?:\s+([\s\S]*))?$/.exec(s);
-  if (slash) {
-    const rawCmd = slash[1].toLowerCase();
-    const rest = (slash[2] || '').trim();
-    if (rawCmd === '/menu') return { cmd: '/help', rest };
-    if (rawCmd === '/img' || rawCmd === '/image' || rawCmd === '/paint') return { cmd: '/draw', rest };
-    return { cmd: rawCmd, rest };
-  }
-
-  if (/^(菜单|帮助|指令|功能|命令|使用说明)$/.test(s)) {
-    return { cmd: '/help', rest: '' };
-  }
-  if (/^(模型|模型列表|切换模型|换模型|查看模型)$/.test(s)) {
-    return { cmd: '/model', rest: '' };
-  }
-  const modelMatch = /^(?:切换模型|换模型|模型)\s+(.+)$/.exec(s);
-  if (modelMatch) {
-    return { cmd: '/model', rest: modelMatch[1].trim() };
-  }
-  if (/^(模式|切换模式|智能体|智能体模式|普通模式)$/.test(s)) {
-    return { cmd: '/agent', rest: '' };
-  }
-  if (/^(清空|清空上下文|新对话|重置|重置对话|清空记忆上下文)$/.test(s)) {
-    return { cmd: '/clear', rest: '' };
-  }
-  if (/^(记忆|查看记忆|长期记忆)$/.test(s)) {
-    return { cmd: '/memory', rest: '' };
-  }
-  const forgetMatch = /^(?:忘掉|删除记忆|清除记忆)\s+(.+)$/.exec(s);
-  if (forgetMatch) {
-    return { cmd: '/forget', rest: forgetMatch[1].trim() };
-  }
-  if (/^(知识库|查看知识库|文档列表)$/.test(s)) {
-    return { cmd: '/kb', rest: '' };
-  }
-  if (/^(整理知识库|存入知识库|整理成知识库|保存到知识库|入库)$/.test(s)) {
-    return { cmd: '/savekb', rest: '' };
-  }
-  const saveKbMatch = /^(?:整理知识库|存入知识库|整理成知识库|保存到知识库|保存知识库)[:：\s]+(.+)$/.exec(s);
-  if (saveKbMatch) {
-    return { cmd: '/savekb', rest: saveKbMatch[1].trim() };
-  }
-  const readKbMatch = /^(?:读取文档|查看文档|精读文档|打开文档)[:：\s]+(.+)$/.exec(s);
-  if (readKbMatch) {
-    return { cmd: '/readdoc', rest: readKbMatch[1].trim() };
-  }
-  const delKbMatch = /^(?:删除文档|删除知识库|删除知识库文档)[:：\s]+(.+)$/.exec(s);
-  if (delKbMatch) {
-    return { cmd: '/deldoc', rest: delKbMatch[1].trim() };
-  }
-  if (/^(状态|连接状态|运行状态|系统状态)$/.test(s)) {
-    return { cmd: '/status', rest: '' };
-  }
-  const drawMatch = /^(?:画一张|画一幅|画个|画|生成图片|生图)[:：\s]+([\s\S]+)$/.exec(s);
-  if (drawMatch && drawMatch[1].trim()) {
-    return { cmd: '/draw', rest: drawMatch[1].trim() };
-  }
-
-  return null;
-}
+// 实现已抽到 ./text.js（纯函数、可单测），这里只负责在导出表里保持原有 API 不变。
 
 async function sendWechatImageFromSource(env, creds, userId, contextToken, source) {
   const chanVer = wxChannelVersion(env);
@@ -871,7 +785,9 @@ async function processWechatMessage(env, creds, rawMsg) {
       const useAgentNow = await agentGetMode(env, chatId);
       const listLines = modelObjList.map((m, i) => {
         const mark = m.key === activeModelId ? ' ✅ [当前]' : '';
-        return `${i + 1}. ${m.name} (${m.id})${mark}`;
+        // 同名模型来自不同通道时补主机名，否则列表里两行完全一样、用户无从区分
+        const hint = m.channelHint ? ' @' + m.channelHint : '';
+        return `${i + 1}. ${m.name} (${m.id})${hint}${mark}`;
       }).join('\n');
 
       await sendReply(

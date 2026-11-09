@@ -48,6 +48,13 @@ import { sanitizeHistory, lastUserText } from './history.js';
 
 const WRITE_TOOLS_SET = new Set(['remember', 'forget_memory', 'save_doc', 'delete_doc']);
 
+// 不参与「同轮记忆化」的只读工具。
+// web_fetch 读的是外部实时状态：同一步里让模型再取一次同一个 URL，语义上就应该重新取
+// （页面可能刚更新、上一次可能取到截断内容）。它本身在 tools-web.js 里有 3 分钟页面缓存 +
+// inflight 合并，重复请求的代价接近于零，所以在循环层再拦一次只会有害无益。
+const NO_MEMO_TOOLS = new Set(['web_fetch']);
+
+
 const TRUNC_NOTE = '\n\n> ⚠️ 输出达到模型单次长度上限被截断，回复「继续」可以让我接着写完。';
 
 // 兼容旧导出名：失败判定已收敛到 tools.js（前缀表 + 兜底正则），此处仅做转发
@@ -569,8 +576,9 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       const args = parsed.args || {};
       const sig = callSigs[tcIdx];
       const isReadOnlyTool = !WRITE_TOOLS_SET.has(fn.name);
+      const isMemoizable = isReadOnlyTool && !NO_MEMO_TOOLS.has(fn.name);
       // 同轮记忆化短路：本轮前面步骤已经成功调用过一模一样的只读工具，0ms 返回提示，不再重复请求或撑大上下文
-      if (isReadOnlyTool && turnToolMemo.has(sig)) {
+      if (isMemoizable && turnToolMemo.has(sig)) {
         const prev = turnToolMemo.get(sig);
         return {
           tc,
@@ -588,7 +596,7 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       const ms = Math.max(1, Date.now() - t0);
       const failed = isToolFailureResult(result);
       const truncated = truncateToolResult(result, perToolCap);
-      if (isReadOnlyTool && !failed) {
+      if (isMemoizable && !failed) {
         turnToolMemo.set(sig, {
           step: step + 1,
           preview: String(truncated).replace(/\s+/g, ' ').slice(0, 160)
