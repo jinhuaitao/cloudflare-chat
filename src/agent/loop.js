@@ -76,9 +76,11 @@ async function agentWrapUp(env, targetModelId, messages, loopStartIdx, ctxBudget
   if (Date.now() > deadline - reserve * 0.5) return null;
   const sendMessages = trimAgentMessages(messages, loopStartIdx, ctxBudget).concat([{
     role: 'user',
-    content: '【系统提示】工具调用阶段已结束，不能再调用任何工具。请仅根据上面已经拿到的工具结果，直接给出最终答案：先给结论，再说明依据；没查到的部分明确说"未查到"，不要编造，也不要再输出调用计划或工具名。'
+    content: '【系统提示】工具调用阶段已结束，不能再调用任何工具。请仅根据上面已经拿到的工具结果，直接给出最终答案：先给结论，再说明依据；没查到的部分明确说"未查到"，不要编造，也不要再输出调用计划或工具名。数字、日期、价格、版本号必须原样引用工具结果，不要凭记忆改写或换算；不同来源的数据不一致时，如实说明分歧并给出更权威或更新的一方。'
   }]);
-  const cfg = buildAIRequest(env, targetModelId, sendMessages, true, null);
+  // 传空数组而非 null：收尾作答不携带 tools（避免模型继续调用），
+  // 但能让 buildAIRequest 识别这是 Agent 步骤，同样享受 AGENT_TEMPERATURE 低温采样
+  const cfg = buildAIRequest(env, targetModelId, sendMessages, true, []);
   if (cfg.error) return null;
   let resp;
   try {

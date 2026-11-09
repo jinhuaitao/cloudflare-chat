@@ -386,6 +386,19 @@ test('buildAgentSystemPrompt 包含铁律、工具速查与时间', () => {
   assert.ok(p.includes('不编造'));
 });
 
+// v7.12.1 准确率：提示词必须包含来源交叉验证与搜索关键词策略
+test('buildAgentSystemPrompt 含交叉验证规则与搜索关键词策略', () => {
+  const p = buildAgentSystemPrompt([], 'Python 3.13 有什么新特性', null, false);
+  // 铁律 3：关键数字双源交叉印证
+  assert.ok(p.includes('交叉印证'), '应要求关键数字与结论交叉印证');
+  assert.ok(p.includes('来源冲突'), '应说明来源冲突时的取舍规则');
+  // 搜索策略：技术类英文关键词、时效词带年份
+  assert.ok(p.includes('英文'), '应指引技术类搜索用英文关键词');
+  assert.ok(p.includes('年份'), '应指引时效性搜索带年份');
+  // 输出要求：时效不确定要标注
+  assert.ok(p.includes('时效未确认'), '时效无法确认时应要求标注');
+});
+
 test('buildAgentSystemPrompt 只读端声明写入限制', () => {
   const ro = buildAgentSystemPrompt([], '记住我喜欢咖啡', [], true);
   assert.ok(ro.includes('只读限制'));

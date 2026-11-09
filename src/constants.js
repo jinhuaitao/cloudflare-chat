@@ -19,6 +19,9 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json 与 README.md 的版本号，
 // CI 会用 npm run check 校验三处一致，防止文档与代码再次脱节）
+// 7.12.1：Agent 准确率专项（铁律新增关键数字双源交叉印证与来源冲突取舍规则、搜索关键词
+//         语言/年份策略进提示词与工具描述、AGENT_TEMPERATURE 可选低温采样仅对 Agent 步骤生效、
+//         收尾作答强制原样引用工具数字并说明来源分歧、搜索结果按归一化 URL 去重防伪多源）。
 // 7.12.0：缺陷修复与工程化收尾（网页端知识库只读面板接线：新增 GET /api/kb/list + 侧栏入口 +
 //         弹窗 DOM，此前 app-kb.js 是三处断链的死代码；朗读清洗收敛为单一来源 src/ui/speech.js，
 //         tts-demo.html 改为生成产物；web_fetch 退出同轮记忆化；同名模型跨通道不再互相吞掉，
@@ -44,7 +47,7 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 //        断点起点修正、流式读取不阻塞、抓取失败语义统一）。
 // 7.5.0：Agent 内核加固（工具并发闸门、预算感知超时、步数感知收束、双保险空转熔断、
 //        历史轮次压缩）+ 工具箱新增 JSON/正则动作 + 全量回归测试。
-const APP_VERSION = '7.12.0';
+const APP_VERSION = '7.12.1';
 const PNG_HEADERS = {
   'Content-Type': 'image/png',
   'Cache-Control': 'public, max-age=86400',

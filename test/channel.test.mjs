@@ -181,3 +181,31 @@ test('buildAIRequest 对 MAX_TOKENS 做上下限收敛', () => {
   assert.equal(buildAIRequest({ ...base, MAX_TOKENS: '0' }, 'm', msgs, true).payload.max_tokens, 16384);
   assert.equal(buildAIRequest({ ...base, MAX_TOKENS: '-5' }, 'm', msgs, true).payload.max_tokens, 16384);
 });
+
+// v7.12.1 准确率：AGENT_TEMPERATURE 仅对 Agent 步骤（带 tools 参数，含收尾的空数组）生效
+test('AGENT_TEMPERATURE 只在带 tools 的请求上生效', () => {
+  resetChannelConfigCache();
+  const base = { API_URL_1: 'https://a.com', API_KEY_1: 'k', MODEL_1: 'm' };
+  const msgs = [{ role: 'user', content: 'hi' }];
+  const tools = [{ type: 'function', function: { name: 'get_time', parameters: { type: 'object', properties: {} } } }];
+
+  // 未配置：不发送 temperature（保持与上游默认兼容，o1 等模型不受影响）
+  assert.equal(buildAIRequest(base, 'm', msgs, true, tools).payload.temperature, undefined);
+
+  // 配置 0.3：带 tools 的请求携带
+  const envT = { ...base, AGENT_TEMPERATURE: '0.3' };
+  assert.equal(buildAIRequest(envT, 'm', msgs, true, tools).payload.temperature, 0.3);
+  // 收尾作答（传空数组）：同样携带低温采样，但不附加 tools 字段
+  const wrap = buildAIRequest(envT, 'm', msgs, true, []);
+  assert.equal(wrap.payload.temperature, 0.3);
+  assert.equal(wrap.payload.tools, undefined, '空数组不得附加 tools');
+
+  // 普通对话（不传 tools）：不受影响
+  assert.equal(buildAIRequest(envT, 'm', msgs, true).payload.temperature, undefined);
+  assert.equal(buildAIRequest(envT, 'm', msgs, true, null).payload.temperature, undefined);
+
+  // 非法值（NaN / 超范围）：忽略，不发送
+  assert.equal(buildAIRequest({ ...base, AGENT_TEMPERATURE: 'abc' }, 'm', msgs, true, tools).payload.temperature, undefined);
+  assert.equal(buildAIRequest({ ...base, AGENT_TEMPERATURE: '-1' }, 'm', msgs, true, tools).payload.temperature, undefined);
+  assert.equal(buildAIRequest({ ...base, AGENT_TEMPERATURE: '3' }, 'm', msgs, true, tools).payload.temperature, undefined);
+});

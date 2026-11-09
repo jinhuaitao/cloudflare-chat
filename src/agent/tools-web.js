@@ -770,6 +770,38 @@ async function searchBraveApi(query, count, apiKey, budgetMs) {
   return out;
 }
 
+// v7.12.1 准确率：URL 归一化去重 —— 剥掉 utm_* / spm 等跟踪参数、统一 host 大小写与尾斜杠，
+// 使 `example.com/a?utm_source=x` 与 `example.com/a/` 被识别为同一页面。
+function normalizeSearchUrl(u) {
+  try {
+    const url = new URL(String(u));
+    url.hash = '';
+    const drop = [];
+    for (const k of url.searchParams.keys()) {
+      if (/^(utm_|spm|from|ref|ref_src|fbclid|gclid|igshid)/i.test(k)) drop.push(k);
+    }
+    for (const k of drop) url.searchParams.delete(k);
+    let s = url.toString();
+    if (s.endsWith('/')) s = s.slice(0, -1);
+    return s;
+  } catch (e) {
+    return String(u || '').replace(/\/+$/, '');
+  }
+}
+
+function dedupeSearchResults(list) {
+  const seen = new Set();
+  const out = [];
+  for (const r of list) {
+    if (!r || !r.url) continue;
+    const key = normalizeSearchUrl(r.url);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(r);
+  }
+  return out;
+}
+
 async function toolWebSearch(query, count, deepRead, env) {
   if (query && typeof query === 'object') {
     const a = query;
@@ -853,6 +885,11 @@ async function toolWebSearch(query, count, deepRead, env) {
       }
       return '搜索「' + query + '」无结果（可换更通用的关键词重试，或直接用 web_fetch 抓取已知网址）';
     }
+
+    // v7.12.1 准确率：结果去重（按 URL 归一化：去跟踪参数、统一大小写与尾斜杠）。
+    // 搜索源偶发把同一页面以多个带参 URL 重复返回，模型会误以为"多来源都在说"从而省略交叉验证；
+    // 去重后剩下的才是真正的独立来源。解析函数内部已有精确去重，这里兜住跨形态的重复。
+    out = dedupeSearchResults(out);
 
     let text = '搜索「' + query + '」结果：\n';
     out.forEach((r, i) => {
@@ -953,6 +990,8 @@ export {
   detectCharset,
   stripReaderPreamble,
   isReaderError,
+  normalizeSearchUrl,
+  dedupeSearchResults,
   toolWebSearch,
   toolWebFetch,
 };

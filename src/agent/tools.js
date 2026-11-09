@@ -65,7 +65,7 @@ const TOOL_DEFS = [
     type: 'function',
     function: {
       name: 'web_search',
-      description: '联网搜索实时信息，自动预读前2条正文；稳定常识勿搜。',
+      description: '联网搜索实时信息，自动预读前2条正文；关键词宜精炼，技术类用英文、时效问题带年份；稳定常识勿搜。',
       parameters: {
         type: 'object',
         properties: {

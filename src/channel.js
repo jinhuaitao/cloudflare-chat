@@ -209,6 +209,14 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
       max_tokens: maxTokens,
     };
     if (tools && tools.length) payload.tools = tools;
+    // v7.12.1 准确率：Agent 步骤（带 tools 的请求，含收尾作答传 []）可选低温采样。
+    // 采样温度越低，工具选择与 JSON 参数生成越确定，误选工具 / 参数畸形率显著下降。
+    // 默认不发送（沿用上游默认值，避免 o1 等对 temperature 有硬性要求的模型报错），
+    // 通过 AGENT_TEMPERATURE=0.2~0.6 显式开启；仅对带 tools 的请求生效，普通对话不受影响。
+    if (tools) {
+      const temp = parseFloat(env.AGENT_TEMPERATURE);
+      if (Number.isFinite(temp) && temp >= 0 && temp <= 2) payload.temperature = temp;
+    }
   }
 
   return { apiUrl, currentApiKey, channelKeys: keys, payload, isImageAPI };

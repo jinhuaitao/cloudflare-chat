@@ -15,6 +15,8 @@ import {
   extractEmbeddedContent,
   decodeBodyBytes,
   stripReaderPreamble,
+  normalizeSearchUrl,
+  dedupeSearchResults,
   toolWebSearch,
   toolWebFetch,
 } from '../src/agent/tools-web.js';
@@ -312,4 +314,28 @@ test('抓取：批量 URL 全部失败时聚合结果可被判定为失败', asy
 
   assert.ok(result.indexOf('抓取失败') === 0, result.slice(0, 120));
   assert.equal(isToolFailureResult(result), true);
+});
+
+// ==================== v7.12.1 搜索结果去重 ====================
+test('搜索结果去重：跟踪参数、尾斜杠与大小写归一化后视为同一 URL', () => {
+  const list = [
+    { title: 'A', url: 'https://Example.com/docs/guide', snip: 's1' },
+    { title: 'A2', url: 'https://example.com/docs/guide/', snip: 's2' },           // 尾斜杠 + host 大小写
+    { title: 'A3', url: 'https://example.com/docs/guide?utm_source=bing&spm=a1', snip: 's3' }, // 跟踪参数
+    { title: 'B', url: 'https://example.com/docs/guide#section-2', snip: 's4' },   // 仅 hash 不同
+    { title: 'C', url: 'https://example.com/docs/other', snip: 's5' },
+  ];
+  const deduped = dedupeSearchResults(list);
+  assert.equal(deduped.length, 2, '前四条应合并为一条：' + deduped.map(r => r.url).join(','));
+  assert.equal(deduped[0].title, 'A', '保留首个出现的条目');
+  assert.equal(deduped[1].title, 'C');
+});
+
+test('normalizeSearchUrl 对非法 URL 退化为字符串处理', () => {
+  assert.equal(normalizeSearchUrl('not a url'), 'not a url');
+  assert.equal(normalizeSearchUrl('https://a.com/x/'), 'https://a.com/x');
+  // utm 全剥，业务参数保留
+  const n = normalizeSearchUrl('https://a.com/p?id=7&utm_campaign=x');
+  assert.ok(n.indexOf('id=7') !== -1, '业务参数必须保留：' + n);
+  assert.ok(n.indexOf('utm_campaign') === -1, '跟踪参数必须剥掉：' + n);
 });

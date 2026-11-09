@@ -1,4 +1,4 @@
-# ⚡ Cloudflare-Chat `v7.12.0`
+# ⚡ Cloudflare-Chat `v7.12.1`
 
 > **基于 Cloudflare Workers + R2 的零依赖多通道 AI 对话前端 + 全能 Telegram 机器人 + 微信 ClawBot (iLink) 官方通道**  
 > `🌐 流式 Web + PWA` · `🤖 Telegram 私聊/群聊` · `🟢 微信 ClawBot 安全绑定` · `🧠 三层记忆（L1/L2/L3）` · `🛠 19 项零密钥 Agent 工具` · `📚 R2 知识库（写入模式/版本快照/标签检索）` · `🔄 多 Key 轮询容灾`
@@ -175,6 +175,7 @@ npm run verify                   # 发版前一键：一致性检查 + 全量回
 | :--- | :---: | :---: | :--- |
 | `BRAVE_API_KEY` | 🟢 可选 | — | Brave 官方搜索 API Key（[免费申请](https://brave.com/search/api/)）。填了 `web_search` 优先走官方 API，结果最稳；不填则使用零密钥的 DuckDuckGo / Brave / Bing 多后端回退 |
 | `AGENT_MAX_STEPS` | 🟢 可选 | `6` | 单轮任务最大工具推理步数（上限 `12` 步，耗尽后自动汇总收尾） |
+| `AGENT_TEMPERATURE` | 🟢 可选 | 不发送 | **Agent 步骤采样温度**（0~2）：设为 `0.2`~`0.6` 可显著降低误选工具与参数畸形率、提升事实类回答稳定性；仅对带工具的 Agent 请求（含收尾作答）生效，普通对话不受影响。不设则沿用上游默认值（o1 等对 temperature 有硬性约束的推理模型请勿设置） |
 | `AGENT_TIMEOUT_MS` | 🟢 可选 | `240000` | Agent 单轮任务全局超时上限（毫秒，默认 4 分钟） |
 | `WEB_AGENT_TIMEOUT_MS` | 🟢 可选 | `90000` | Web 网页端 Agent 单轮超时预算（毫秒，默认 90 秒，范围 `10000`~`240000`） |
 | `AGENT_TOOL_TIMEOUT_MS` | 🟢 可选 | `30000` | 单个工具单次执行超时上限（毫秒，默认 30 秒；实际生效值还会被本轮剩余预算压缩） |
@@ -238,7 +239,7 @@ npm run verify                   # 发版前一键：一致性检查 + 全量回
 ## 🧪 本地回归测试
 
 ```bash
-npm test                  # 224 个用例：内核纯函数 + mock 上游的端到端循环 + 流式读取 + 知识库存读/写入模式/索引自愈 + 三层记忆 + 运行期性能 + 输入边界与容错 + SSRF + 微信加解密与排版 + 通道配置 + 前端分片约束（不联网）
+npm test                  # 228 个用例：内核纯函数 + mock 上游的端到端循环 + 流式读取 + 知识库存读/写入模式/索引自愈 + 三层记忆 + 运行期性能 + 输入边界与容错 + SSRF + 微信加解密与排版 + 通道配置 + 前端分片约束（不联网）
 npm run check             # 发版前一致性检查：版本号三处对齐 + 全量语法检查 + tts-demo.html 同步 + README 用例数与实测核对
 npm run build:tts-demo    # 从 src/ui/speech.js 重新生成 tts-demo.html（改了朗读规则才需要跑）
 ```
