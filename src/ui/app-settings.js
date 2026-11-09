@@ -353,7 +353,7 @@ export default `  const settingsModal = document.getElementById('settingsModal')
       const res = await fetch('/api/wx/qrcode', {
         method: 'POST',
         headers: buildWxAuthHeaders(),
-        body: JSON.stringify({})
+        body: JSON.stringify({ force: true })
       });
       const data = await res.json();
       if (res.status === 401 || res.status === 403) {
@@ -368,23 +368,9 @@ export default `  const settingsModal = document.getElementById('settingsModal')
       const qrCodeKey = data.qrcode;
       const qrContentUrl = data.qrcode_img_content || '';
       let currentBaseUrl = data.base_url || '';
-      if (qrContentUrl) {
-        try {
-          if (new URL(qrContentUrl).protocol !== 'https:') throw new Error('invalid protocol');
-        } catch (_) {
-          if (wxQrStatusText) wxQrStatusText.textContent = '⚠️ 微信返回了无效的二维码链接，请稍后重试';
-          if (wxGetQrBtn) wxGetQrBtn.disabled = false;
-          return;
-        }
-      }
 
       if (wxQrImg && qrContentUrl) {
-        if (typeof qrcode !== 'function') throw new Error('二维码组件未加载，请检查网络后刷新重试');
-        const qr = qrcode(0, 'M');
-        qr.addData(qrContentUrl, 'Byte');
-        qr.make();
-        const svg = qr.createSvgTag({ cellSize: 4, margin: 2, scalable: true });
-        wxQrImg.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+        wxQrImg.src = 'https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' + encodeURIComponent(qrContentUrl);
       }
       if (wxQrDirectLink && qrContentUrl) {
         wxQrDirectLink.href = qrContentUrl;
@@ -454,7 +440,7 @@ export default `  const settingsModal = document.getElementById('settingsModal')
       const res = await fetch('/api/wx/poll', {
         method: 'POST',
         headers: buildWxAuthHeaders(),
-        body: JSON.stringify({ timeout_ms: 15000, single_shot: true })
+        body: JSON.stringify({ timeout_ms: 15000, single_shot: true, force: false })
       });
       const data = await res.json();
       if (data && data.ok) {

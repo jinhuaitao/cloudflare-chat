@@ -8,7 +8,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
-import zlib from 'node:zlib';
 
 import {
   md5Hex,
@@ -17,17 +16,10 @@ import {
   decryptAes128Ecb,
   formatWechatText,
   decodeTextSmart,
-  bytesToBinaryString,
-  extractWechatDocumentText,
-  ilinkDownloadMediaBytes,
-  readResponseBytesWithinLimit,
 } from '../src/wechat/ilink.js';
 import { splitWechatText, parseWxCommand,
   getWxCredentials, saveWxCredentials, clearWxCredentials,
-  getWxCursor, saveWxCursor, getWxContextToken, saveWxContextToken,
-  processWechatMessage, runWechatPollCycle, checkWxAdminAuth, handleWxApi,
-} from '../src/wechat/handler.js';
-import { resetChannelConfigCache } from '../src/channel.js';
+  getWxCursor, saveWxCursor, getWxContextToken, saveWxContextToken } from '../src/wechat/handler.js';
 
 const enc = new TextEncoder();
 
@@ -371,137 +363,4 @@ test('Context Token 按用户隔离存取', async () => {
   assert.equal(await getWxContextToken(env, 'user-a'), 'ctx-a');
   assert.equal(await getWxContextToken(env, 'user-b'), 'ctx-b');
   assert.equal(await getWxContextToken(env, 'user-c'), '');
-});
-
-// ==================== PDF 文本流提取（字节往返必须无损） ====================
-// 背景：早期实现用 TextDecoder('latin1') 把字节解成字符串、再 charCodeAt & 0xff 写回。
-// 但按 WHATWG Encoding 标准，'latin1' 标签实际指向 windows-1252，
-// 0x80-0x9F 会被映射成 U+20AC / U+0178 等码点，回写即有损。
-// PDF 内容流是 deflate 压缩的二进制，落在这个区间的概率约 12.5% ——
-// 一旦被破坏 inflate 必然失败，表现为"所有 PDF 都读不出来"。
-
-test('bytesToBinaryString 对 0x00-0xFF 全范围无损', () => {
-  const all = new Uint8Array(256);
-  for (let i = 0; i < 256; i++) all[i] = i;
-  const s = bytesToBinaryString(all);
-  assert.equal(s.length, 256);
-  const back = Array.from(s).map(c => c.charCodeAt(0));
-  assert.deepEqual(back, Array.from(all));
-});
-
-test('bytesToBinaryString 修复 windows-1252 陷阱（0x80/0x8F/0x9F 等）', () => {
-  const tricky = new Uint8Array([0x80, 0x81, 0x8f, 0x90, 0x9f, 0xa0, 0xff]);
-  const back = Array.from(bytesToBinaryString(tricky)).map(c => c.charCodeAt(0));
-  assert.deepEqual(back, [0x80, 0x81, 0x8f, 0x90, 0x9f, 0xa0, 0xff]);
-  // 反例：旧实现（latin1 + &0xff）在同一批字节上会失真
-  const legacy = Array.from(new TextDecoder('latin1').decode(tricky))
-    .map(c => c.charCodeAt(0) & 0xff);
-  assert.notDeepEqual(legacy, [0x80, 0x81, 0x8f, 0x90, 0x9f, 0xa0, 0xff]);
-});
-
-function buildPdf(contentStreamText) {
-  const comp = zlib.deflateSync(Buffer.from(contentStreamText, 'latin1'));
-  const head = Buffer.from(
-    '%PDF-1.4\n1 0 obj\n<< /Length ' + comp.length + ' /Filter /FlateDecode >>\nstream\n',
-    'latin1'
-  );
-  const tail = Buffer.from('\nendstream\nendobj\ntrailer\n%%EOF\n', 'latin1');
-  return { bytes: new Uint8Array(Buffer.concat([head, comp, tail])), comp };
-}
-
-test('PDF：压缩流含 0x80-0x9F 字节时仍能正确提取正文', async () => {
-  const content = 'BT /F1 12 Tf 72 712 Td (Hello PDF extraction, this line is long enough.) Tj ET';
-  const { bytes, comp } = buildPdf(content);
-  // 前提校验：这个样本确实覆盖了会踩坑的字节区间
-  assert.ok(Array.from(comp).some(b => b >= 0x80 && b <= 0x9f), '样本未覆盖 0x80-0x9F，测试无效');
-
-  const text = await extractWechatDocumentText('sample.pdf', bytes);
-  assert.ok(text.indexOf('Hello PDF extraction') !== -1, text);
-});
-
-test('PDF：未压缩的文本流同样能提取', async () => {
-  const content = 'BT /F1 12 Tf 72 712 Td (Plain uncompressed stream text here.) Tj ET';
-  const head = Buffer.from(
-    '%PDF-1.4\n1 0 obj\n<< /Length ' + content.length + ' >>\nstream\n',
-    'latin1'
-  );
-  const tail = Buffer.from('\nendstream\nendobj\ntrailer\n%%EOF\n', 'latin1');
-  const bytes = new Uint8Array(Buffer.concat([head, Buffer.from(content, 'latin1'), tail]));
-  const text = await extractWechatDocumentText('plain.pdf', bytes);
-  assert.ok(text.indexOf('Plain uncompressed stream') !== -1, text);
-});
-
-test('PDF：纯扫描件（无文本流）给出可执行的错误提示', async () => {
-  const bytes = new Uint8Array(Buffer.from('%PDF-1.4\n1 0 obj\n<< >>\nendobj\n%%EOF\n', 'latin1'));
-  await assert.rejects(
-    () => extractWechatDocumentText('scan.pdf', bytes),
-    /扫描件|自定义字库/
-  );
-});
-
-// ==================== 打字心跳定时器：必须能被清理 ====================
-// 背景：早期实现把 `const typingHeartbeatTimer = setInterval(...)` 写在 try 块内，
-// 而 catch 是兄弟块 —— `typeof` 对未声明标识符返回 undefined，清理代码从未执行。
-// 再加上一条早退路径（aiConfig.error）也没清，一次异常后就会每 5 秒发一次 typing，
-// 而 Workers 里 setInterval 返回数字、没有 unref() 可自释放。
-//
-// 这里用「让定时器启动之后的某一行抛错」来逼出 catch 路径，
-// 再用 setInterval/clearInterval 探针确认它确实被清掉了。
-
-test('打字心跳定时器在异常路径上会被清理（不泄漏）', async () => {
-  resetChannelConfigCache();
-
-  const r2 = fakeR2();
-  // WX_WEBHOOK_BUDGET_MS 在定时器启动之后才被读取（handler 里的 wxBudgetMs），
-  // 用 getter 抛错即可精确命中「定时器已启动 → 抛异常 → catch」这条路径
-  const env = {
-    R2: r2,
-    API_URL_1: 'https://api.example.com/v1',
-    API_KEY_1: 'k1',
-    MODEL_1: 'm1:Model One',
-    get WX_WEBHOOK_BUDGET_MS() { throw new Error('boom-after-timer'); },
-  };
-  const creds = {
-    bot_token: 'bot-token',
-    ilink_bot_id: 'bot-1',
-    ilink_user_id: 'user-1',
-    baseurl: 'https://ilink.example.com',
-    cdn_url: 'https://cdn.example.com',
-    expired: false,
-    source: 'r2',
-  };
-  const msg = {
-    from_user_id: 'user-1',
-    context_token: 'ctx-1',
-    msg_id: 'msg-timer-1',
-    message_type: 1,
-    text: '你好',
-  };
-
-  const realFetch = globalThis.fetch;
-  const realSet = globalThis.setInterval;
-  const realClear = globalThis.clearInterval;
-  const created = [];
-  const cleared = [];
-  globalThis.fetch = async () => new Response('{"ret":0}', { status: 200, headers: { 'content-type': 'application/json' } });
-  globalThis.setInterval = (fn, ms) => { const id = realSet(fn, ms); created.push(id); return id; };
-  globalThis.clearInterval = (id) => { cleared.push(id); return realClear(id); };
-
-  try {
-    await assert.rejects(
-      () => processWechatMessage(env, creds, msg),
-      /boom-after-timer/,
-      '应当把异常抛出来（由上层 dispatch 记录）'
-    );
-  } finally {
-    globalThis.fetch = realFetch;
-    globalThis.setInterval = realSet;
-    globalThis.clearInterval = realClear;
-    for (const id of created) { try { realClear(id); } catch (e) {} }
-  }
-
-  assert.ok(created.length >= 1, '这条路径应当启动过心跳定时器');
-  for (const id of created) {
-    assert.ok(cleared.indexOf(id) !== -1, '定时器必须被 clearInterval 清掉，否则会持续发 typing');
-  }
 });

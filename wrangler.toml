@@ -22,27 +22,6 @@ keep_vars = true
 binding = "R2"
 # bucket_name = "cloudflare-chat-r2"
 
-# 跨 isolate 的读改写锁与微信长轮询租约。每个逻辑锁名映射到一个 Durable Object。
-[durable_objects]
-bindings = [{ name = "COORDINATOR", class_name = "Coordination" }]
-
-# 注意：必须用 new_sqlite_classes，不能用 new_classes。
-# 免费计划的 Durable Object 只支持 SQLite 存储后端，用 new_classes（KV 后端）
-# 部署会直接报错 [code: 10097]。本项目的 Coordination 只用 state.storage 的
-# 基础 KV 接口（get/put/delete），SQLite 后端完全兼容，无需改动业务代码。
-[[migrations]]
-tag = "v1"
-new_sqlite_classes = ["Coordination"]
-
-# 若你的 Worker 历史上曾用 new_classes 成功部署过（即 v1 已生效、类已按 KV 后端创建），
-# 那么上面这条 v1 不能再改内容，需要换成新的迁移标签并改用新的类名（KV 后端无法原地
-# 转成 SQLite）：
-#   [[migrations]]
-#   tag = "v2"
-#   new_sqlite_classes = ["CoordinationV2"]
-# 同时把 [durable_objects] 的 class_name 和 _worker.js 的导出改成 CoordinationV2。
-# 首次部署（v1 从未生效）则无需理会这段，直接用上面的 v1 即可。
-
 # ============================================================
 # 定时触发器（Cron Triggers）：驱动微信 ClawBot (iLink) 后台长轮询收发消息
 # ============================================================

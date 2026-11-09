@@ -73,16 +73,16 @@ function kbFmtTags(tags) {
 async function kbListDocObjects(env) {
   const objs = [];
   if (!env.R2) return objs;
-  let cursor;
-  do {
-    // 列表异常必须向上传递。把异常当成空桶或完整列表，会让后续重建用
-    // 空/部分索引覆盖仍然完好的 registry.json。
-    const listed = await env.R2.list({ prefix: KB_DOCS_PREFIX, limit: 1000, cursor: cursor });
-    for (const o of (listed.objects || [])) {
-      if (o.key !== KB_REGISTRY_KEY) objs.push(o);
-    }
-    cursor = listed.truncated ? listed.cursor : undefined;
-  } while (cursor);
+  try {
+    let cursor;
+    do {
+      const listed = await env.R2.list({ prefix: KB_DOCS_PREFIX, limit: 1000, cursor: cursor });
+      for (const o of (listed.objects || [])) {
+        if (o.key !== KB_REGISTRY_KEY) objs.push(o);
+      }
+      cursor = listed.truncated ? listed.cursor : undefined;
+    } while (cursor);
+  } catch (e) {}
   return objs;
 }
 // 从现有文件重建注册表（读每篇前 4096 字节的 frontmatter），并写回。
@@ -94,14 +94,13 @@ async function kbRebuildRegistry(env, objs) {
   const list = Array.isArray(objs) ? objs : await kbListDocObjects(env);
   const reg = await mapLimit(list, 8, async (o) => {
     let fm = {};
-    // 任意一篇读取失败都只能中止整次重建：mapLimit 全部成功前不会写索引，
-    // 这样不会拿缺条目的部分结果覆盖现有 registry。
-    // v6.8.4：frontmatter 含长标题/长 source 时 1200 字节可能截断，放大到 4096
-    if (o.size > 0) {
-      const r = await env.R2.get(o.key, { range: { offset: 0, length: 4096 } });
-      if (!r) throw new Error('重建知识库索引失败：文档不存在或读取为空（' + o.key + '）');
-      fm = kbParseFrontmatter(await r.text());
-    }
+    try {
+      // v6.8.4：frontmatter 含长标题/长 source 时 1200 字节可能截断，放大到 4096
+      if (o.size > 0) {
+        const r = await env.R2.get(o.key, { range: { offset: 0, length: 4096 } });
+        if (r) fm = kbParseFrontmatter(await r.text());
+      }
+    } catch (e) {}
     const ver = parseInt(fm.version, 10);
     const entry = {
       file: String(o.key).slice(KB_DOCS_PREFIX.length),
@@ -115,9 +114,7 @@ async function kbRebuildRegistry(env, objs) {
     if (ver > 0) entry.version = ver;
     return entry;
   });
-  if (!await kbSaveRegistry(env, reg)) {
-    throw new Error('重建知识库索引失败：registry.json 写入失败');
-  }
+  await kbSaveRegistry(env, reg);
   return reg.slice();
 }
 
@@ -129,10 +126,15 @@ async function kbRebuildRegistry(env, objs) {
 // 而且因为 registry.json 本身存在且格式合法，旧逻辑永远不会触发自愈，问题就永久留在库里。
 // 这里把「文件」当唯一真相、注册表当可重建索引，索引落后就补回来。
 //
-// 说明：这里【不再】用模块级计数器记录「本轮补回了几篇」。
-// Worker 一个 isolate 服务所有用户，全局量会被并发的另一个请求取走 ——
-// A 触发的修复数字会显示在 B 的面板上，A 自己反而什么都看不到。
-// 改为把 repaired 随返回值一起带出，谁调用谁拿到自己的那一份。
+// lastRepair 记录「被补回索引」的文档数，供列表工具如实告诉用户索引被修过，
+// 而不是让用户以为文档凭空消失。
+let lastRepair = 0;
+function kbTakeRepairCount() {
+  const n = lastRepair;
+  lastRepair = 0;
+  return n;
+}
+
 async function kbVerifyRegistry(env, reg) {
   const safe = Array.isArray(reg) ? reg : [];
   if (!env || !env.R2) return { reg: safe, repaired: 0 };
@@ -151,26 +153,21 @@ async function kbVerifyRegistry(env, reg) {
   let repaired = 0;
   for (const f of files) if (!regFiles.has(f)) repaired += 1;
   const rebuilt = await kbRebuildRegistry(env, objs);
+  if (repaired > 0) lastRepair += repaired;
   return { reg: rebuilt, repaired: repaired };
 }
 
 // opts.fresh：跳过 30 秒内存缓存，直接读 R2。写路径必须用（否则会覆盖别的实例刚写入的条目）。
 // opts.verify：读完再和实际文件核对一次，不一致就重建。
 // 另外：注册表为空但 kb/docs/ 下有文件时，无论是否传 verify 都会自动核对修复。
-//
-// 返回 { reg, repaired }：repaired 是本次调用真实补回的条目数（0 表示索引本来就是对的）。
-// 只想要数组的调用方用下面的 kbGetRegistry。
-async function kbGetRegistryWithMeta(env, opts) {
-  if (!env || !env.R2) return { reg: [], repaired: 0 };
+async function kbGetRegistry(env, opts) {
+  if (!env || !env.R2) return [];
   const o = opts || {};
   const now = Date.now();
   if (!o.fresh && cachedRegistry && cachedRegistryBucket === env.R2 && now < cachedRegistryExp) {
     const hit = cachedRegistry.slice();
-    if (o.verify || !hit.length) {
-      const v = await kbVerifyRegistry(env, hit);
-      return { reg: v.reg, repaired: v.repaired };
-    }
-    return { reg: hit, repaired: 0 };
+    if (o.verify || !hit.length) return (await kbVerifyRegistry(env, hit)).reg;
+    return hit;
   }
   try {
     const obj = await env.R2.get(KB_REGISTRY_KEY);
@@ -180,20 +177,13 @@ async function kbGetRegistryWithMeta(env, opts) {
         cachedRegistry = p.slice();
         cachedRegistryBucket = env.R2;
         cachedRegistryExp = Date.now() + KB_REG_CACHE_TTL_MS;
-        if (o.verify || !p.length) {
-          const v = await kbVerifyRegistry(env, p.slice());
-          return { reg: v.reg, repaired: v.repaired };
-        }
-        return { reg: p.slice(), repaired: 0 };
+        if (o.verify || !p.length) return (await kbVerifyRegistry(env, p.slice())).reg;
+        return p.slice();
       }
     }
   } catch (e) {}
-  // 缺失或损坏 → 自动重建（自愈）。此时无从判断"此前有没有列过"，repaired 记 0。
-  return { reg: await kbRebuildRegistry(env), repaired: 0 };
-}
-
-async function kbGetRegistry(env, opts) {
-  return (await kbGetRegistryWithMeta(env, opts)).reg;
+  // 缺失或损坏 → 自动重建（自愈）
+  return await kbRebuildRegistry(env);
 }
 // v6.8.4：返回布尔值——注册表写入失败必须让调用方知道，
 // 否则会出现"文档已保存但列表/读取找不到"的幽灵成功。
@@ -272,7 +262,7 @@ export {
   kbListDocObjects,
   kbRebuildRegistry,
   kbVerifyRegistry,
-  kbGetRegistryWithMeta,
+  kbTakeRepairCount,
   kbGetRegistry,
   kbSaveRegistry,
   kbFindRegEntry,

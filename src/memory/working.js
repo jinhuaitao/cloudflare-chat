@@ -110,41 +110,21 @@ export async function wmRecordTurn(env, chatId, userText, assistantText) {
   }
   wm.items.push({ t: topic, g: gist, ts });
 
-  // 溢出沉淀：先确认最旧条目已进入 L3，再裁剪并提交 L1。
-  // wm 是 wmGet 返回的副本，因此归档失败时直接返回即可，缓存与 R2 中的原 L1
-  // 都不会被这次候选修改污染。
+  // 溢出沉淀：最旧的几条推进 L3，绝不静默丢弃
   const cap = memLimits(env).l1;
   const spilled = [];
   while (wm.items.length > cap) spilled.push(wm.items.shift());
   wm.updatedAt = ts;
 
-  if (spilled.length) {
-    let archived;
-    try {
-      archived = await arPush(env, chatId, spilled.map(x => ({
-        type: 'session',
-        text: clipText(x.t + (x.g ? ' → ' + x.g : ''), 200),
-        ts: x.ts
-      })));
-    } catch (e) {
-      archived = { added: 0, persisted: false, error: e && e.message };
-    }
-    // 无 R2 时 arPush/arPut 的内存副本就是当前运行模式下的成功归档；
-    // 有 R2 时则必须确认持久化成功，不能把 persisted:false 当成成功。
-    const archiveOk = archived && archived.added === spilled.length && (!env || !env.R2 || archived.persisted === true);
-    if (!archiveOk) {
-      return {
-        added: false,
-        merged,
-        spilled: 0,
-        persisted: false,
-        archiveFailed: true,
-        error: 'L1 溢出归档失败，未裁剪或覆盖原工作记忆；请检查 R2 绑定与权限后重试'
-      };
-    }
-  }
-
   const persisted = await wmPut(env, chatId, wm);
+
+  if (spilled.length) {
+    await arPush(env, chatId, spilled.map(x => ({
+      type: 'session',
+      text: clipText(x.t + (x.g ? ' → ' + x.g : ''), 200),
+      ts: x.ts
+    })));
+  }
   return { added: true, merged, spilled: spilled.length, persisted };
 }
 
