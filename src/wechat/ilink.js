@@ -1,3 +1,5 @@
+import { safeFetch } from '../net/safe-fetch.js';
+
 // 微信 ClawBot（腾讯官方 iLink Bot API / @tencent-weixin/openclaw-weixin 协议）底层通信与加解密层
 // 支持：
 // 1) 二维码获取（get_bot_qrcode）与扫码状态长轮询（get_qrcode_status，支持 scaned_but_redirect 跨区节点自动跳转与配对码）；
@@ -595,6 +597,41 @@ async function decryptAes128Ecb(cipherBytes, key16) {
   return out;
 }
 
+async function readResponseBytesWithinLimit(res, maxBytes) {
+  const limit = Math.max(1, parseInt(maxBytes, 10) || (4 * 1024 * 1024));
+  const declared = parseInt(res && res.headers && res.headers.get('content-length'), 10);
+  if (declared > limit) {
+    try { if (res.body) await res.body.cancel(); } catch (e) {}
+    throw new Error(`媒体文件超过大小限制（最大 ${Math.round(limit / 1024)} KB）`);
+  }
+  if (!res || !res.body) return new Uint8Array(0);
+  const reader = res.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || !value.byteLength) continue;
+      total += value.byteLength;
+      if (total > limit) {
+        try { await reader.cancel(); } catch (e) {}
+        throw new Error(`媒体文件超过大小限制（最大 ${Math.round(limit / 1024)} KB）`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    try { reader.releaseLock(); } catch (e) {}
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
 // 从微信 CDN 下载并解密媒体文件
 async function ilinkDownloadMediaBytes(cdnBaseUrl, encryptQueryParam, rawAesKey, maxBytes, timeoutMs) {
   const cdn = String(cdnBaseUrl || DEFAULT_ILINK_CDN_URL).trim().replace(/\/+$/, '');
@@ -603,16 +640,12 @@ async function ilinkDownloadMediaBytes(cdnBaseUrl, encryptQueryParam, rawAesKey,
   const url = /^https?:\/\//i.test(eqp)
     ? eqp
     : `${cdn}/download?encrypted_query_param=${encodeURIComponent(eqp)}`;
-  const res = await fetch(url, {
+  const { res } = await safeFetch(url, {
     method: 'GET',
     signal: AbortSignal.timeout(timeoutMs || 15000),
   });
   if (!res.ok) throw new Error(`CDN 下载失败 (HTTP ${res.status})`);
-  const buf = await res.arrayBuffer();
-  if (maxBytes && buf.byteLength > maxBytes) {
-    throw new Error(`媒体文件超过大小限制（最大 ${Math.round(maxBytes / 1024)} KB）`);
-  }
-  const encrypted = new Uint8Array(buf);
+  const encrypted = await readResponseBytesWithinLimit(res, maxBytes);
   const key16 = parseIlinkAesKey(rawAesKey);
   if (!key16) return encrypted;
   return (await decryptAes128Ecb(encrypted, key16)) || encrypted;
@@ -767,6 +800,19 @@ function decodeXmlEntities(s) {
     .replace(/&amp;/g, '&')
     .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10) || 32))
     .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCodePoint(parseInt(h, 16) || 32));
+}
+
+// 字节数组 → 二进制字符串（每字符 = 一字节，0x00-0xFF 全范围无损）。
+// 用于需要"按字符下标切字节"的场景（PDF 流定位）。不要用 TextDecoder('latin1') 替代，
+// 那个标签按标准映射到 windows-1252，0x80-0x9F 区间会有损。
+function bytesToBinaryString(bytes) {
+  const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || 0);
+  let out = '';
+  const CHUNK = 0x8000;
+  for (let i = 0; i < u8.length; i += CHUNK) {
+    out += String.fromCharCode.apply(null, u8.subarray(i, i + CHUNK));
+  }
+  return out;
 }
 
 async function inflateRawBytes(compData, format = 'raw') {
@@ -950,22 +996,42 @@ async function extractWechatDocumentText(fileName, rawBytes) {
 
   // 4) PDF (.pdf) 轻量级文本流提取
   if (ext === 'pdf') {
-    const latin = new TextDecoder('latin1').decode(bytes);
-    const streamRegex = /stream\r?\n([\s\S]*?)\r?\nendstream/g;
+    // 逐字节 1:1 映射成"二进制字符串"（每个字符恰好对应一个字节），后续按字符下标
+    // 直接切原始 bytes，全程不做字节↔字符往返。
+    //
+    // 不能用 TextDecoder('latin1')：按 WHATWG Encoding 标准该标签实际指向 windows-1252，
+    // 0x80–0x9F 会被映射成 U+20AC / U+0178 等码点，`charCodeAt & 0xff` 回写即有损
+    //（实测 0x80→0xac、0x9f→0x78）。而 PDF 内容流是 deflate 压缩的二进制，
+    // 字节分布均匀，落在这 32 个值上的概率约 12.5% —— 一旦被破坏 inflate 必然失败。
+    const latin = bytesToBinaryString(bytes);
     const extractedChunks = [];
-    let m;
+    let from = 0;
     let count = 0;
-    while ((m = streamRegex.exec(latin)) !== null && count < 120) {
-      count++;
-      const rawStr = m[1];
-      const chunkBytes = new Uint8Array(rawStr.length);
-      for (let i = 0; i < rawStr.length; i++) chunkBytes[i] = rawStr.charCodeAt(i) & 0xff;
+    while (count < 120) {
+      const sIdx = latin.indexOf('stream', from);
+      if (sIdx < 0) break;
+      // indexOf 也会命中 'endstream' 里的 'stream'，往回看 3 个字符排掉
+      if (sIdx >= 3 && latin.slice(sIdx - 3, sIdx) === 'end') { from = sIdx + 6; continue; }
+      let dataStart = sIdx + 6;
+      if (latin[dataStart] === '\r') dataStart += 1;
+      if (latin[dataStart] === '\n') dataStart += 1;
+      const eIdx = latin.indexOf('endstream', dataStart);
+      if (eIdx < 0) break;
+      let dataEnd = eIdx;
+      if (latin[dataEnd - 1] === '\n') dataEnd -= 1;
+      if (latin[dataEnd - 1] === '\r') dataEnd -= 1;
+      from = eIdx + 9;
+      if (dataEnd <= dataStart) continue;
+      count += 1;
+
+      const chunkBytes = bytes.subarray(dataStart, dataEnd);
       let decodedStream = '';
       const inflated = await inflateRawBytes(chunkBytes, 'zlib');
       if (inflated && inflated.byteLength) {
         decodedStream = decodeTextSmart(inflated);
       } else {
-        decodedStream = rawStr;
+        // 未压缩的流：直接用同一段字符下标取原文，不需要再拼一遍
+        decodedStream = latin.slice(dataStart, dataEnd);
       }
       const tjMatches = decodedStream.match(/\(([^()\\]|\\.)*\)\s*Tj|\[([^\]]*)\]\s*TJ/g) || [];
       for (const tj of tjMatches) {
@@ -1111,10 +1177,12 @@ export {
   parseIlinkAesKey,
   encryptAes128Ecb,
   decryptAes128Ecb,
+  readResponseBytesWithinLimit,
   ilinkDownloadMediaBytes,
   ilinkUploadAndSendImage,
   SUPPORTED_KB_FILE_EXT_RE,
   decodeTextSmart,
+  bytesToBinaryString,
   extractWechatDocumentText,
   extractWechatMessageContent,
 };

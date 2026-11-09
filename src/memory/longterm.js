@@ -11,12 +11,13 @@
 // 4) md 镜像照旧：每条记忆一个 Markdown 文件，供在 R2 控制台直接翻阅。
 
 import { mapSetBounded, mapGetBounded } from '../utils.js';
-import { storeGet, storePutChecked, storeDelete } from '../store/r2.js';
+import { withCoordinationLock } from '../coordination.js';
+import { storeGet, storePutChecked } from '../store/r2.js';
 import { agentMemKey, agentMemKeyLegacy, kbMemDir, kbNewMemFile, kbMemMarkdown,
   kbBackfillMd, kbDeleteKeys } from '../store/kb.js';
 import {
   ltKey, memNorm, memSubjectKey, memDecayScore, memTokens,
-  clampNum, clipText, memLimits, LT_MAX_ITEMS, MEM_KINDS, MEM_KIND_LABEL
+  clampNum, clipText, memLimits, memSafeId, LT_MAX_ITEMS, MEM_KINDS, MEM_KIND_LABEL
 } from './layers.js';
 import { arPush } from './archive.js';
 
@@ -24,6 +25,11 @@ const ltCache = new Map();
 const ltExp = new Map();
 const LT_CACHE_TTL_MS = 60 * 1000;
 const LT_CACHE_MAX = 500;
+
+// 与存储键使用同一份有界 chatId 归一化，避免任意长/特殊字符进入 DO 锁名。
+function ltLockName(chatId) {
+  return 'memory:l2:' + (memSafeId(chatId) || 'default');
+}
 
 function normalizeEntry(m) {
   if (!(m && typeof m.fact === 'string' && m.fact)) return null;
@@ -50,8 +56,10 @@ function cloneEntry(m) {
 function cloneList(arr) { return arr.map(cloneEntry); }
 
 // 读索引：新键 → kb/agent_mem_ → 根目录 agent_mem_（逐级回退，读到就迁移）
-export async function ltGet(env, chatId) {
-  const cached = mapGetBounded(ltCache, chatId, env && env.R2 ? ltExp : null);
+export async function ltGet(env, chatId, opts) {
+  // 持锁写路径必须重新读取持久化索引；其他 isolate 可能在上一轮读缓存后更新过它。
+  const fresh = !!(opts && opts.fresh && env && env.R2);
+  const cached = fresh ? null : mapGetBounded(ltCache, chatId, env && env.R2 ? ltExp : null);
   if (Array.isArray(cached)) return cloneList(cached);
 
   let arr = [];
@@ -133,11 +141,12 @@ async function ltPutIndex(env, chatId, arr) {
 }
 
 // 超容量时按衰减分淘汰，返回 { kept, dropped }
-function evictOverflow(arr, maxItems) {
+function evictOverflow(arr, maxItems, halflifeDays) {
   const cap = maxItems > 0 ? maxItems : LT_MAX_ITEMS;
   if (arr.length <= cap) return { kept: arr, dropped: [] };
   const now = Date.now();
-  const ranked = arr.slice().sort((a, b) => memDecayScore(a, now) - memDecayScore(b, now));
+  const ranked = arr.slice().sort((a, b) =>
+    memDecayScore(a, now, halflifeDays) - memDecayScore(b, now, halflifeDays));
   const dropSet = new Set(ranked.slice(0, arr.length - cap));
   const kept = [];
   const dropped = [];
@@ -146,13 +155,16 @@ function evictOverflow(arr, maxItems) {
 }
 
 export async function ltSave(env, chatId, fact, opts) {
-  const o = opts || {};
+  return await withCoordinationLock(env, ltLockName(chatId), () => doLtSave(env, chatId, fact, opts || {}));
+}
+
+async function doLtSave(env, chatId, fact, o) {
   const text = clipText(String(fact == null ? '' : fact).trim(), 200);
   if (!text) return '内容为空，未保存';
   const kind = MEM_KINDS.indexOf(o.kind) !== -1 ? o.kind : 'fact';
   const weight = Math.round(clampNum(o.weight, 1, 5, 3));
 
-  const arr = await ltGet(env, chatId);
+  const arr = await ltGet(env, chatId, { fresh: true });
   const norm = memNorm(text);
 
   // 完全重复：不新增条目，只提升命中次数（说明这件事被反复提起，重要性在上升）
@@ -192,19 +204,40 @@ export async function ltSave(env, chatId, fact, opts) {
   };
   arr.push(entry);
 
-  // 容量控制：淘汰最弱的，推进 L3 归档
-  const { kept, dropped } = evictOverflow(arr, memLimits(env).l2);
+  // 容量控制：淘汰排序与检索共用环境配置的半衰期。
+  const limits = memLimits(env);
+  const { kept, dropped } = evictOverflow(arr, limits.l2, limits.halflifeDays);
   const next = kept;
   const replNote = replaced ? '（本条自动覆盖了旧记忆《' + oldFact + '》）' : '';
 
-  // 未绑定 R2：只留内存，必须如实告知
+  // 先归档 dropped，再提交新索引或内存淘汰。归档失败时原索引、原缓存和 md
+  // 镜像全部保持不动，调用方可以安全重试，不会先丢掉长期记忆正文。
+  if (dropped.length) {
+    let archived;
+    try {
+      archived = await arPush(env, chatId, dropped.map(m => ({
+        type: 'memory',
+        text: clipText('[' + (MEM_KIND_LABEL[m.kind] || '事实') + '] ' + m.fact, 200),
+        ts: m.ts
+      })));
+    } catch (e) {
+      archived = { added: 0, persisted: false, error: e && e.message };
+    }
+    const archiveOk = archived && archived.added === dropped.length && (!env || !env.R2 || archived.persisted === true);
+    if (!archiveOk) {
+      return 'L2 淘汰归档失败，未更新长期记忆索引，也未淘汰任何记忆' + replNote
+        + '；请检查 R2 绑定与权限后重试：' + text;
+    }
+  }
+
+  // 未绑定 R2：归档与索引都只留内存，必须如实告知。
   if (!env || !env.R2) {
     mapSetBounded(ltCache, chatId, cloneList(next), LT_CACHE_MAX, ltExp, LT_CACHE_TTL_MS);
     return '已暂存于内存（R2 未绑定，Worker 重启后会丢失；按 README 第二步绑定 R2 后可永久记住）'
       + replNote + '：' + text;
   }
 
-  // md 镜像与 JSON 索引互不依赖，并行写入省掉一次往返
+  // md 镜像与 JSON 索引互不依赖，并行写入省掉一次往返。
   const [okMd, okIdx] = await Promise.all([
     storePutChecked(env, kbMemDir(chatId) + entry.file, kbMemMarkdown(chatId, text, entry.ts, { kind, weight })),
     storePutChecked(env, ltKey(chatId), JSON.stringify(next))
@@ -214,19 +247,8 @@ export async function ltSave(env, chatId, fact, opts) {
   if (!okMd || !okIdx) {
     return '记忆写入 R2 失败，已暂存于内存' + replNote + '；请检查 R2 绑定与权限后重试：' + text;
   }
-  // 索引落盘成功后才清理被覆盖条目的 md 镜像
+  // 索引落盘成功后才清理被覆盖条目的 md 镜像。
   if (replacedFiles.length) await kbDeleteKeys(env, replacedFiles);
-
-  // 淘汰的推进归档（失败不影响主流程：最坏情况是这几条暂时只存在于被覆盖的索引里）
-  if (dropped.length) {
-    try {
-      await arPush(env, chatId, dropped.map(m => ({
-        type: 'memory',
-        text: clipText('[' + (MEM_KIND_LABEL[m.kind] || '事实') + '] ' + m.fact, 200),
-        ts: m.ts
-      })));
-    } catch (e) {}
-  }
 
   const kindNote = kind !== 'fact' ? '（' + (MEM_KIND_LABEL[kind] || kind) + '·权重' + weight + '）' : '';
   const evictNote = dropped.length ? '；容量已满，' + dropped.length + ' 条最弱记忆已归档到 L3（可用 memory search 找回）' : '';
@@ -235,9 +257,13 @@ export async function ltSave(env, chatId, fact, opts) {
 }
 
 export async function ltForget(env, chatId, keyword) {
+  return await withCoordinationLock(env, ltLockName(chatId), () => doLtForget(env, chatId, keyword));
+}
+
+async function doLtForget(env, chatId, keyword) {
   const kw = String(keyword == null ? '' : keyword).trim();
   if (!kw) return { removed: 0 };
-  const arr = await ltGet(env, chatId);
+  const arr = await ltGet(env, chatId, { fresh: true });
   const kept = arr.filter(m => String(m.fact || '').indexOf(kw) < 0);
   const removed = arr.length - kept.length;
   if (!removed) return { removed: 0 };
@@ -315,14 +341,6 @@ export async function ltSearch(env, chatId, query, limit) {
   const hits = rankLongterm(arr, query, limit > 0 ? limit : 8, { halflifeDays: memLimits(env).halflifeDays });
   await ltTouch(env, chatId, hits.map(m => m.fact));
   return hits;
-}
-
-export async function ltClear(env, chatId) {
-  ltCache.delete(chatId);
-  ltExp.delete(chatId);
-  if (env && env.R2) {
-    try { await storeDelete(env, ltKey(chatId)); } catch (e) {}
-  }
 }
 
 export { LT_MAX_ITEMS, MEM_KIND_LABEL };

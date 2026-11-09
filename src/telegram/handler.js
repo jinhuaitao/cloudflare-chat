@@ -6,6 +6,7 @@
 import { APP_VERSION } from '../constants.js';
 import { mapSetBounded, mapGetBounded, parseCommaSeparated, safeEqual } from '../utils.js';
 import { storeGet, storePut, storePutChecked } from '../store/r2.js';
+import { withCoordinationLock } from '../coordination.js';
 import { getChannelConfig, buildAIRequest } from '../channel.js';
 import { tgTrimHistory, tgGetHistory, tgSaveHistory, tgClearHistory } from '../tg-history.js';
 import { agentForgetMemory } from '../agent/memory.js';
@@ -39,7 +40,6 @@ const tgUserModels = new Map();
 const tgUserModelsExp = new Map();
 // update_id 去重缓存（L1 内存）：
 const seenUpdateIds = new Map();
-let warnedNoWebhookSecret = false;
 
 // 缓存机器人自身信息（由 getMe 自动探测或环境变量 TG_BOT_USERNAME 提供）
 let cachedBotIdentity = null;
@@ -146,7 +146,14 @@ function inspectGroupTrigger(msg, botIdentity, replyAllInGroup) {
     const anyAtRe = new RegExp('@' + esc + '\\b', 'gi');
     if (mentionRe.test(rawText) || anyAtRe.test(rawText)) {
       mentioned = true;
-      cleaned = rawText.replace(anyAtRe, ' ').replace(/[ \t]{2,}/g, ' ').trim();
+      // 先删 @bot，再削掉因此暴露到句首的标点/空白。
+      // 否则「@bot，帮我查天气」会变成「，帮我查天气」——mentionRe 的 lookahead
+      // 允许 @ 后面直接跟中文标点，但替换只删了 @bot，那个标点会留在正文里。
+      cleaned = rawText
+        .replace(anyAtRe, ' ')
+        .replace(/^[\s，,。.！!？?：:；;、]+/, '')
+        .replace(/[ \t]{2,}/g, ' ')
+        .trim();
     }
   }
   const entities = (Array.isArray(msg.entities) ? msg.entities : []).concat(Array.isArray(msg.caption_entities) ? msg.caption_entities : []);
@@ -188,7 +195,10 @@ function splitTelegramMarkdown(text, maxLength = 3980) {
     }
     let sliceLength = maxLength;
     const lastNewline = remaining.lastIndexOf('\n', maxLength);
-    if (lastNewline > 3000) {
+    // 只有换行位置足够靠后（超过 75%）才按换行切，否则第一段会短得离谱。
+    // 用比例而不是写死的 3000：函数签名允许调用方改 maxLength，写死会让条件恒假、
+    // 切片退化成硬切（wechat/text.js 里同一件事用的是 0.7）。
+    if (lastNewline > Math.floor(maxLength * 0.75)) {
       sliceLength = lastNewline;
     }
     let chunk = remaining.slice(0, sliceLength);
@@ -240,14 +250,19 @@ function uint8ToBase64(bytes) {
 }
 
 export async function handleTgWebhook(request, env) {
+  if (env.TG_BOT_TOKEN && !String(env.TG_WEBHOOK_SECRET || '').trim()) {
+    return new Response('配置错误：设置 TG_BOT_TOKEN 后必须配置 TG_WEBHOOK_SECRET，并在 Telegram setWebhook 时使用同一个 secret_token；已拒绝不安全的 webhook。', { status: 503 });
+  }
   if (env.TG_WEBHOOK_SECRET) {
     const got = request.headers.get('X-Telegram-Bot-Api-Secret-Token') || '';
     if (!safeEqual(got, env.TG_WEBHOOK_SECRET)) {
       return new Response('Forbidden', { status: 403 });
     }
-  } else if (env.TG_BOT_TOKEN && !warnedNoWebhookSecret) {
-    warnedNoWebhookSecret = true;
-    console.log('⚠️ [cloudflare-chat] 未配置 TG_WEBHOOK_SECRET，/tg-webhook 处于开放状态；强烈建议配置 secret_token 并用 setWebhook 重新绑定，同时可配 TG_ALLOWED_CHAT_IDS 白名单只允许自己的聊天。');
+  }
+  const allowedChatIds = parseCommaSeparated(env.TG_ALLOWED_CHAT_IDS);
+  const allowPublic = String(env.TG_ALLOW_PUBLIC || '').trim().toLowerCase() === 'true';
+  if (env.TG_BOT_TOKEN && !allowedChatIds.length && !allowPublic) {
+    return new Response('配置错误：默认必须配置 TG_ALLOWED_CHAT_IDS 聊天白名单（例如 TG_ALLOWED_CHAT_IDS=123456789）；如确需公开机器人，请显式设置 TG_ALLOW_PUBLIC=true。', { status: 503 });
   }
 
   try {
@@ -269,8 +284,7 @@ export async function handleTgWebhook(request, env) {
         const { models: modelObjList } = getChannelConfig(env);
         if (modelObjList.length === 0) return;
 
-        const allowedChatIds = parseCommaSeparated(env.TG_ALLOWED_CHAT_IDS);
-        const isChatAllowed = (cid) => !allowedChatIds.length || allowedChatIds.indexOf(String(cid)) !== -1;
+        const isChatAllowed = (cid) => allowPublic || allowedChatIds.indexOf(String(cid)) !== -1;
 
         if (update.callback_query) {
           const cb = update.callback_query;
@@ -411,6 +425,16 @@ export async function handleTgWebhook(request, env) {
               await tgApi('sendMessage', { chat_id: chatId, text: '🔒 为保护你的微信账号隐私，请在与我的【私聊】窗口中使用微信 ClawBot 绑定命令。', ...replyExtra });
               return;
             }
+            const tgAdminIds = parseCommaSeparated(env.TG_ADMIN_IDS);
+            const actorId = msg.from && msg.from.id;
+            if (!tgAdminIds.length) {
+              await tgApi('sendMessage', { chat_id: chatId, text: '🔒 微信管理命令已锁定：请配置 TG_ADMIN_IDS（例如 TG_ADMIN_IDS=你的 Telegram 用户 ID）后重试。', ...replyExtra });
+              return;
+            }
+            if (actorId === undefined || tgAdminIds.indexOf(String(actorId)) === -1) {
+              await tgApi('sendMessage', { chat_id: chatId, text: '🔒 你不在 TG_ADMIN_IDS 管理员名单中，无权执行微信绑定、状态查看或解绑命令。', ...replyExtra });
+              return;
+            }
             const chanVer = String((env && env.WX_CHANNEL_VERSION) || DEFAULT_ILINK_CHANNEL_VERSION).trim();
             const defaultBase = normalizeBaseUrl((env && env.WX_BASE_URL) || DEFAULT_ILINK_BASE_URL);
 
@@ -450,7 +474,7 @@ export async function handleTgWebhook(request, env) {
 
             if (cmd.cmd === '/wxlogin') {
               const existing = await getWxCredentials(env, true);
-              if (existing && existing.bot_token && !existing.expired) {
+              if (existing && existing.bot_token) {
                 await tgApi('sendMessage', {
                   chat_id: chatId,
                   text: `🔒 当前已绑定微信账号（${existing.ilink_user_id || existing.ilink_bot_id}）。为防误覆盖，请先发送 /wxunbind 解绑后再执行 /wxlogin。`,
@@ -459,7 +483,13 @@ export async function handleTgWebhook(request, env) {
                 return;
               }
               try {
-                const qrData = await ilinkGetQrCode(defaultBase, chanVer, 12000);
+                const qrData = await withCoordinationLock(env, 'wx:binding', async () => {
+                  const current = await getWxCredentials(env, true);
+                  if (current && current.bot_token) {
+                    throw new Error('ALREADY_BOUND：当前已绑定微信账号，请先发送 /wxunbind 解绑。');
+                  }
+                  return await ilinkGetQrCode(defaultBase, chanVer, 12000);
+                }, { leaseMs: 30000, waitMs: 15000 });
                 if (!qrData || !qrData.qrcode) {
                   await tgApi('sendMessage', { chat_id: chatId, text: '⚠️ 获取微信二维码失败，请稍后重试。', ...replyExtra });
                   return;
@@ -483,20 +513,26 @@ export async function handleTgWebhook(request, env) {
                     pollBase = st.redirect_baseurl;
                   }
                   if (st && st.status === 'confirmed' && st.bot_token) {
-                    const newCreds = {
-                      bot_token: st.bot_token,
-                      ilink_bot_id: st.ilink_bot_id || 'wx_bot',
-                      ilink_user_id: st.ilink_user_id || '',
-                      baseurl: normalizeBaseUrl(st.redirect_baseurl || st.baseurl || pollBase || defaultBase),
-                      cdn_url: String((env && env.WX_CDN_BASE_URL) || DEFAULT_ILINK_CDN_URL).trim(),
-                      expired: false,
-                      errmsg: '',
-                      updated_at: new Date().toISOString(),
-                    };
-                    await saveWxCredentials(env, newCreds);
-                    newCreds.relay_origin = new URL(request.url).origin;
-                    await saveWxCredentials(env, newCreds);
-                    await saveWxCursor(env, newCreds.ilink_bot_id, '');
+                    const newCreds = await withCoordinationLock(env, 'wx:binding', async () => {
+                      const current = await getWxCredentials(env, true);
+                      if (current && current.bot_token) {
+                        throw new Error('ALREADY_BOUND：扫码 confirmed 也不能覆盖现有绑定，请先发送 /wxunbind 解绑。');
+                      }
+                      const nextCreds = {
+                        bot_token: st.bot_token,
+                        ilink_bot_id: st.ilink_bot_id || 'wx_bot',
+                        ilink_user_id: st.ilink_user_id || '',
+                        baseurl: normalizeBaseUrl(st.redirect_baseurl || st.baseurl || pollBase || defaultBase),
+                        cdn_url: String((env && env.WX_CDN_BASE_URL) || DEFAULT_ILINK_CDN_URL).trim(),
+                        expired: false,
+                        errmsg: '',
+                        updated_at: new Date().toISOString(),
+                        relay_origin: new URL(request.url).origin,
+                      };
+                      await saveWxCredentials(env, nextCreds);
+                      await saveWxCursor(env, nextCreds.ilink_bot_id, '');
+                      return nextCreds;
+                    }, { leaseMs: 30000, waitMs: 15000 });
                     await ilinkNotifyStart(newCreds.baseurl, newCreds.bot_token, chanVer, 6000);
                     kickWxAutoDaemon(env, null, newCreds.relay_origin);
                     const okText = `🎉 微信 ClawBot 绑定成功并已自动加锁！\n• 机器人 ID：${newCreds.ilink_bot_id}\n• 唯一授权微信用户：${newCreds.ilink_user_id}\n现在可以直接在手机微信 ClawBot 中与我对话了。`;

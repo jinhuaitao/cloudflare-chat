@@ -20,6 +20,7 @@
 //  6) 失败结果做 60 秒负缓存：模型同一轮里对同一 URL 反复重试时立即返回同一结论，不再每次空等十几秒。
 
 import { isBlockedFetchHost } from '../net/ssrf.js';
+import { safeFetch } from '../net/safe-fetch.js';
 import { mapSetBounded, mapGetBounded } from '../utils.js';
 
 const UA_BROWSER = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';
@@ -450,10 +451,10 @@ async function tryWaybackFallback(targetUrl, budgetMs) {
     if (!closest || !closest.available || !closest.url) return '';
     // id_ 后缀取「原始内容」，避免把 Wayback 的工具条一起抓进来
     const snapUrl = String(closest.url).replace(/\/web\/(\d+)\//, '/web/$1id_/');
-    const r2 = await fetch(snapUrl, {
+    // 快照地址来自 archive.org 的 JSON（内容受用户传入 URL 影响），同样逐跳校验
+    const { res: r2 } = await safeFetch(snapUrl, {
       headers: { 'User-Agent': UA_BROWSER, Accept: 'text/html,application/xhtml+xml' },
       signal: ctrl.signal,
-      redirect: 'follow'
     });
     if (!r2.ok) {
       try { if (r2.body) await r2.body.cancel(); } catch (e) {}
@@ -499,6 +500,10 @@ function sliceWebPageText(text, offset, pageSize) {
   return slice;
 }
 
+// ==================== 安全抓取：手动跟随重定向，逐跳校验目标 ====================
+// 实现已下沉到 src/net/safe-fetch.js（抓取是基础设施，微信通道下载生成图片也要用）。
+// 本文件保留 safeFetch 的 re-export，调用方与测试无需改动。
+
 async function fetchAndParseWebPage(url, customTimeoutMs) {
   const budget = Math.max(4000, parseInt(customTimeoutMs, 10) || 16000);
   const startedAt = Date.now();
@@ -509,31 +514,24 @@ async function fetchAndParseWebPage(url, customTimeoutMs) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), directBudget);
   try {
+    // 逐跳重定向 + 每跳 SSRF 校验统一收口在 safeFetch 里，
+    // 这里不再自己维护一份循环（历史上两份实现容易只改一处）
     let current = url;
     let res = null;
-    for (let hop = 0; hop <= 5; hop++) {
-      let fetchHost = '';
-      try { fetchHost = new URL(current).hostname; } catch (e) { return { err: 'URL 非法，仅支持 http/https' }; }
-      if (isBlockedFetchHost(fetchHost)) return { err: '该地址禁止抓取（内网 / 本机 / 云元数据地址）' };
-      res = await fetch(current, {
+    try {
+      const r = await safeFetch(url, {
         headers: {
           'User-Agent': UA_BROWSER,
           'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
           'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
         },
-        signal: ctrl.signal, redirect: 'manual'
+        signal: ctrl.signal,
       });
-      if (res.status >= 300 && res.status < 400) {
-        const loc = res.headers.get('location');
-        try { if (res.body) await res.body.cancel(); } catch (e) {}
-        if (!loc) return { err: '抓取失败：重定向缺少目标地址' };
-        try { current = new URL(loc, current).href; } catch (e) { return { err: '抓取失败：重定向地址非法' }; }
-        continue;
-      }
-      break;
+      res = r.res;
+      current = r.finalUrl;
+    } catch (e) {
+      return { err: (e && e.message) || '抓取失败' };
     }
-    if (res && res.status >= 300 && res.status < 400) return { err: '抓取失败：重定向次数过多（超过 5 跳），已停止抓取' };
-    if (!res) return { err: '抓取失败' };
 
     let text = '';
     if (!res.ok) {
@@ -611,7 +609,9 @@ async function fetchTextBudget(url, headers, maxChars, budgetMs) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), Math.max(800, budgetMs));
   try {
-    const res = await fetch(url, { headers, signal: ctrl.signal, redirect: 'follow' });
+    // 搜索后端地址虽是硬编码的，但仍统一走 safeFetch：
+    // 搜索源被劫持/302 到内网时同样不该放行，也免得两套抓取逻辑分叉
+    const { res } = await safeFetch(url, { headers, signal: ctrl.signal });
     const ct = res.headers.get('content-type') || '';
     if (!res.ok) {
       try { if (res.body) await res.body.cancel(); } catch (e) {}
@@ -938,6 +938,7 @@ async function toolWebFetch(url, offset, maxChars) {
 }
 
 export {
+  safeFetch,
   parseDuckDuckGo,
   parseDuckDuckGoLite,
   parseBingRss,

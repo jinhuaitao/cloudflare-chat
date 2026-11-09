@@ -6,6 +6,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  safeFetch,
   parseBingRss,
   parseBingHtml,
   unwrapBingHref,
@@ -312,4 +313,112 @@ test('抓取：批量 URL 全部失败时聚合结果可被判定为失败', asy
 
   assert.ok(result.indexOf('抓取失败') === 0, result.slice(0, 120));
   assert.equal(isToolFailureResult(result), true);
+});
+
+// ==================== 重定向逐跳校验（SSRF 防护） ====================
+// 背景：早期实现只校验用户输入的初始 host，随后用 redirect:'follow' 让运行时自己跟，
+// 于是一个公网 URL 返回 302 到 169.254.169.254 就能绕过全部防护。
+// 现在统一走 safeFetch：手动跟、每跳都查、落地再复核。
+
+test('safeFetch：正常 200 直接返回，且不额外发请求', async () => {
+  const { result, calls } = await withFetch(
+    () => new Response('hello', { status: 200, headers: { 'content-type': 'text/html' } }),
+    () => safeFetch('https://ok.example.com/a', {})
+  );
+  assert.equal(result.res.status, 200);
+  assert.equal(result.finalUrl, 'https://ok.example.com/a');
+  assert.equal(calls.length, 1);
+});
+
+test('safeFetch：公网 302 到内网地址时拒绝跟随', async () => {
+  const { result, calls } = await withFetch((url) => {
+    if (url === 'https://evil.example.com/r') {
+      return new Response(null, { status: 302, headers: { location: 'http://169.254.169.254/latest/meta-data/' } });
+    }
+    return new Response('leaked', { status: 200 });
+  }, async () => {
+    try {
+      await safeFetch('https://evil.example.com/r', {});
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, message: e.message };
+    }
+  });
+
+  assert.equal(result.ok, false, '不应成功');
+  assert.ok(result.message.indexOf('禁止抓取') !== -1, result.message);
+  // 关键：内网地址一次都不该被请求
+  assert.equal(calls.filter((u) => u.indexOf('169.254.169.254') !== -1).length, 0);
+});
+
+test('safeFetch：公网 → 公网 302 正常跟随，落地 URL 为最终地址', async () => {
+  const { result, calls } = await withFetch((url) => {
+    if (url === 'https://a.example.com/1') {
+      return new Response(null, { status: 301, headers: { location: 'https://b.example.com/2' } });
+    }
+    if (url === 'https://b.example.com/2') {
+      return new Response(null, { status: 307, headers: { location: '/3' } });
+    }
+    return new Response('done', { status: 200 });
+  }, () => safeFetch('https://a.example.com/1', {}));
+
+  assert.equal(result.res.status, 200);
+  assert.equal(result.finalUrl, 'https://b.example.com/3');
+  assert.equal(calls.length, 3);
+});
+
+test('safeFetch：相对 Location 按当前地址解析，逐跳仍然校验', async () => {
+  const { result } = await withFetch((url) => {
+    if (url === 'https://a.example.com/x') {
+      return new Response(null, { status: 302, headers: { location: '/y' } });
+    }
+    if (url === 'https://a.example.com/y') {
+      return new Response(null, { status: 302, headers: { location: 'http://127.0.0.1:8080/admin' } });
+    }
+    return new Response('should not reach', { status: 200 });
+  }, async () => {
+    try { await safeFetch('https://a.example.com/x', {}); return 'ok'; }
+    catch (e) { return e.message; }
+  });
+
+  assert.ok(String(result).indexOf('禁止抓取') !== -1, String(result));
+});
+
+test('safeFetch：重定向超过上限时停止，不无限跟', async () => {
+  const { result, calls } = await withFetch(
+    (url) => new Response(null, { status: 302, headers: { location: url + '?n=1' } }),
+    async () => {
+      try { await safeFetch('https://loop.example.com/a', {}, 3); return 'ok'; }
+      catch (e) { return e.message; }
+    }
+  );
+
+  assert.ok(String(result).indexOf('重定向次数过多') !== -1, String(result));
+  // 初始 + 3 跳 = 最多 4 次请求
+  assert.ok(calls.length <= 4, '请求次数=' + calls.length);
+});
+
+test('safeFetch：缺少 Location 的 3xx 报错而不是当成成功', async () => {
+  const { result } = await withFetch(
+    () => new Response('', { status: 302 }),
+    async () => {
+      try { await safeFetch('https://a.example.com/n', {}); return 'ok'; }
+      catch (e) { return e.message; }
+    }
+  );
+  assert.ok(String(result).indexOf('缺少目标地址') !== -1, String(result));
+});
+
+test('toolWebFetch：跟随重定向后落到内网时整条抓取判失败', async () => {
+  const { result, calls } = await withFetch((url) => {
+    if (url === 'https://short.example.com/r') {
+      return new Response(null, { status: 302, headers: { location: 'http://10.0.0.5/secret' } });
+    }
+    if (url.indexOf('r.jina.ai') !== -1) return new Response('forbidden', { status: 403 });
+    if (url.indexOf('archive.org/wayback/available') !== -1) return new Response('{"archived_snapshots":{}}', { status: 200 });
+    return new Response('leaked', { status: 200 });
+  }, () => toolWebFetch('https://short.example.com/r', 0, 3000));
+
+  assert.ok(result.indexOf('禁止抓取') !== -1, result.slice(0, 160));
+  assert.equal(calls.filter((u) => u.indexOf('10.0.0.5') !== -1).length, 0);
 });

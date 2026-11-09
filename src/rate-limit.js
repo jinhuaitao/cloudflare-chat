@@ -4,8 +4,20 @@
 // 环境变量 RATE_LIMIT_PER_MIN：每 IP 每分钟允许的 /api/chat 请求数，默认 60；设为 0 关闭。
 const rateLimitMap = new Map();
 function hitRateLimit(request, env) {
-  const perMin = parseInt(env.RATE_LIMIT_PER_MIN || '60', 10);
-  if (!(perMin > 0)) return false;
+  const raw = env && env.RATE_LIMIT_PER_MIN;
+  // 语义要分清「没配」「配错」「显式关闭」三种：
+  //   没配 / 配错 → 用默认 60（fail-safe：配置写错不该等于把限流关掉）
+  //   显式 0 或负数 → 主动关闭
+  // 旧写法 `parseInt(...) || '60'` 对 'abc' 会得到 NaN，随后 `!(NaN > 0)` 为真，
+  // 于是限流被静默关闭 —— 一个拼写错误就把防护整段失效，这是最不该出现的失败方向。
+  let perMin;
+  if (raw === undefined || raw === null || String(raw).trim() === '') {
+    perMin = 60;
+  } else {
+    perMin = parseInt(String(raw), 10);
+    if (!Number.isFinite(perMin)) perMin = 60;
+  }
+  if (perMin <= 0) return false;
   const ip = request.headers.get('CF-Connecting-IP')
     || (request.headers.get('X-Forwarded-For') || '').split(',')[0].trim()
     || 'unknown';

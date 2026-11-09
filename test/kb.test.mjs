@@ -5,7 +5,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { kbGetRegistry, kbFindRegEntry, kbParseTags, kbFmtTags } from '../src/kb/registry.js';
+import {
+  kbGetRegistry, kbGetRegistryWithMeta, kbFindRegEntry, kbParseTags, kbFmtTags,
+  kbListDocObjects, kbRebuildRegistry, kbVerifyRegistry,
+} from '../src/kb/registry.js';
 import { toolSaveDoc, toolReadDoc, toolListDocs, toolDeleteDoc } from '../src/kb/doc-tools.js';
 import { extractTagLine, cleanDocTitle, deriveFileDocTitle, autoOrganizeAndSaveKbDoc } from '../src/kb/organize.js';
 
@@ -47,6 +50,19 @@ function docBody(title, content, extra) {
     + (extra ? '\n' + extra : '') + '\n---\n\n' + content;
 }
 
+function expectedFingerprint(content) {
+  const text = String(content || '').replace(/\s+/g, ' ').trim();
+  let hash = 5381;
+  for (let i = 0; i < Math.min(text.length, 4000); i++) {
+    hash = ((hash << 5) + hash + text.charCodeAt(i)) >>> 0;
+  }
+  return text.length.toString(36) + '-' + hash.toString(36);
+}
+
+function storedBody(full) {
+  return String(full || '').replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '').trim();
+}
+
 test('kbGetRegistry 注册表缺失时自动重建并识别 frontmatter', async () => {
   const r2 = makeR2({
     'kb/docs/甲.md': docBody('甲文档', '内容甲', 'source: https://a.example'),
@@ -61,6 +77,41 @@ test('kbGetRegistry 注册表缺失时自动重建并识别 frontmatter', async 
   assert.equal(a.updated_at, '2026-01-01T00:00:00.000Z');
   assert.equal(b.title, '乙文档');
   assert.ok(r2.data.has('kb/docs/registry.json'), '重建结果必须写回注册表');
+});
+
+test('R2 list 异常显式抛出，校验失败时保留旧 registry', async () => {
+  const oldReg = [{ file: '甲.md', title: '旧索引', source: '', size: 10 }];
+  const r2 = makeR2({ 'kb/docs/registry.json': JSON.stringify(oldReg) });
+  r2.list = async () => { throw new Error('list unavailable'); };
+
+  await assert.rejects(kbListDocObjects({ R2: r2 }), /list unavailable/);
+  const got = await kbVerifyRegistry({ R2: r2 }, oldReg);
+  assert.deepEqual(got, { reg: oldReg, repaired: 0 });
+  assert.equal(r2.data.get('kb/docs/registry.json'), JSON.stringify(oldReg), '列表失败不能改写索引');
+});
+
+test('重建途中正文读取失败会中止，不用部分结果覆盖现有索引', async () => {
+  const oldReg = [{ file: '旧.md', title: '旧索引', source: '', size: 10 }];
+  const oldRaw = JSON.stringify(oldReg);
+  const r2 = makeR2({
+    'kb/docs/registry.json': oldRaw,
+    'kb/docs/新.md': docBody('新文档', '新正文'),
+  });
+  r2.get = async (key) => {
+    if (key === 'kb/docs/新.md') throw new Error('document read unavailable');
+    const text = r2.data.get(key);
+    return text == null ? null : { text: async () => String(text) };
+  };
+
+  await assert.rejects(kbVerifyRegistry({ R2: r2 }, oldReg), /document read unavailable/);
+  assert.equal(r2.data.get('kb/docs/registry.json'), oldRaw, '失败重建不得覆盖旧索引');
+});
+
+test('正常空桶可以显式重建为空注册表', async () => {
+  const r2 = makeR2();
+  const rebuilt = await kbRebuildRegistry({ R2: r2 }, []);
+  assert.deepEqual(rebuilt, []);
+  assert.deepEqual(JSON.parse(r2.data.get('kb/docs/registry.json')), []);
 });
 
 test('kbFindRegEntry 优先级：精确 > 包含 > slug 归一化 > 文件名', () => {
@@ -227,6 +278,74 @@ test('save_doc mode=prepend 把整理大纲放到原文之前，snapshot:false �
   assert.equal([...r2.data.keys()].filter(k => k.startsWith('kb/versions/')).length, 0);
 });
 
+test('旧正文读取失败时中止覆盖，正文与索引均保持不变', async () => {
+  const oldBody = docBody('读旧失败', '不能丢失的旧正文');
+  const oldReg = [{ file: '读旧失败.md', title: '读旧失败', source: '', size: oldBody.length }];
+  const r2 = makeR2({
+    'kb/docs/读旧失败.md': oldBody,
+    'kb/docs/registry.json': JSON.stringify(oldReg),
+  });
+  const originalGet = r2.get.bind(r2);
+  r2.get = async (key) => {
+    if (key === 'kb/docs/读旧失败.md') throw new Error('old body unavailable');
+    return await originalGet(key);
+  };
+
+  const out = await toolSaveDoc({ R2: r2 }, 'c1', { title: '读旧失败', content: '危险的新正文' });
+  assert.ok(out.includes('旧正文读取失败'), out);
+  assert.ok(out.includes('未覆盖原文'), out);
+  assert.equal(r2.data.get('kb/docs/读旧失败.md'), oldBody);
+  assert.deepEqual(JSON.parse(r2.data.get('kb/docs/registry.json')), oldReg);
+  assert.equal([...r2.data.keys()].some(k => k.startsWith('kb/versions/')), false);
+});
+
+test('要求的版本快照写入失败时中止覆盖', async () => {
+  const oldBody = docBody('快照失败', '需要先快照的旧正文');
+  const oldReg = [{ file: '快照失败.md', title: '快照失败', source: '', size: oldBody.length }];
+  const r2 = makeR2({
+    'kb/docs/快照失败.md': oldBody,
+    'kb/docs/registry.json': JSON.stringify(oldReg),
+  });
+  r2.put = async (key, value) => {
+    if (key.startsWith('kb/versions/')) throw new Error('snapshot put failed');
+    r2.data.set(key, String(value));
+  };
+
+  const out = await toolSaveDoc({ R2: r2 }, 'c1', { title: '快照失败', content: '不应落盘的新正文' });
+  assert.ok(out.includes('旧版快照保存失败'), out);
+  assert.ok(out.includes('未覆盖原文'), out);
+  assert.equal(r2.data.get('kb/docs/快照失败.md'), oldBody);
+  assert.deepEqual(JSON.parse(r2.data.get('kb/docs/registry.json')), oldReg);
+});
+
+test('append 与 prepend 的注册表和 frontmatter 指纹均按最终正文计算', async () => {
+  const r2 = makeR2();
+  const env = { R2: r2 };
+  await toolSaveDoc(env, 'c1', { title: '最终指纹', content: '原始正文' });
+
+  const appendedDelta = '追加部分';
+  await toolSaveDoc(env, 'c1', { title: '最终指纹', content: appendedDelta, mode: 'append' });
+  let full = r2.data.get('kb/docs/最终指纹.md');
+  let finalBody = storedBody(full);
+  let fp = JSON.parse(r2.data.get('kb/docs/registry.json'))[0].fp;
+  assert.equal(fp, expectedFingerprint(finalBody));
+  assert.notEqual(fp, expectedFingerprint(appendedDelta), '不能只对追加增量取指纹');
+  assert.equal(full.match(/^fp: (.+)$/m)[1], fp);
+
+  const prependedDelta = '前置大纲';
+  const beforePrepend = finalBody;
+  await toolSaveDoc(env, 'c1', {
+    title: '最终指纹', content: prependedDelta, mode: 'prepend', snapshot: false,
+  });
+  full = r2.data.get('kb/docs/最终指纹.md');
+  finalBody = storedBody(full);
+  fp = JSON.parse(r2.data.get('kb/docs/registry.json'))[0].fp;
+  assert.equal(finalBody, prependedDelta + '\n\n---\n\n' + beforePrepend);
+  assert.equal(fp, expectedFingerprint(finalBody));
+  assert.notEqual(fp, expectedFingerprint(prependedDelta), '不能只对前置增量取指纹');
+  assert.equal(full.match(/^fp: (.+)$/m)[1], fp);
+});
+
 test('版本快照最多保留最近 3 份，旧快照自动清理', async () => {
   const r2 = makeR2();
   const env = { R2: r2 };
@@ -302,6 +421,37 @@ test('并发保存多篇文档时注册表不丢条目（写操作已串行化�
   await Promise.all([1, 2, 3, 4, 5].map(i => toolSaveDoc(env, 'c1', { title: '并发' + i, content: '各自内容' + i })));
   const reg = JSON.parse(r2.data.get('kb/docs/registry.json'));
   assert.equal(reg.length, 5);
+});
+
+test('并发追加与删除共用全局写锁，不丢正文或注册表条目', async () => {
+  const original = docBody('并发追加', '初始正文', 'version: 1');
+  const r2 = makeR2({
+    'kb/docs/并发追加.md': original,
+    'kb/docs/registry.json': JSON.stringify([
+      { file: '并发追加.md', title: '并发追加', source: '', size: original.length, version: 1 },
+      { file: '待删.md', title: '待删', source: '', size: 20 },
+    ]),
+    'kb/docs/待删.md': docBody('待删', '删除我'),
+  });
+  const originalGet = r2.get.bind(r2);
+  r2.get = async (key) => {
+    await new Promise(resolve => setTimeout(resolve, 2));
+    return await originalGet(key);
+  };
+  const env = { R2: r2 };
+  const appends = [1, 2, 3, 4].map(i => toolSaveDoc(env, 'c1', {
+    title: '并发追加', content: '增量' + i, mode: 'append', snapshot: false,
+  }));
+  const results = await Promise.all([...appends, toolDeleteDoc(env, { query: '待删' })]);
+  assert.ok(results.every(x => x.startsWith('已保存') || x.startsWith('已删除')), results.join('\n'));
+
+  const full = r2.data.get('kb/docs/并发追加.md');
+  for (let i = 1; i <= 4; i++) assert.ok(full.includes('增量' + i), '并发追加不能丢增量' + i);
+  const reg = JSON.parse(r2.data.get('kb/docs/registry.json'));
+  assert.deepEqual(reg.map(e => e.file), ['并发追加.md']);
+  assert.equal(reg[0].version, 5);
+  assert.equal(reg[0].fp, expectedFingerprint(storedBody(full)));
+  assert.equal(r2.data.has('kb/docs/待删.md'), false);
 });
 
 test('extractTagLine 从 AI 整理结果里抽出检索标签', () => {
@@ -434,10 +584,34 @@ test('索引落后于实际文件时，/kb 列表自动修复并说明补回了�
   assert.equal(JSON.parse(r2.data.get('kb/docs/registry.json')).length, 2);
 });
 
-test('read_doc 标题未命中时先核对索引，不把库里的文档报成未找到', async () => {
+// 修复计数必须是「本次调用自己的」，不能是模块级全局量 ——
+// Worker 一个 isolate 服务所有用户，全局计数器会被并发请求取走，
+// 结果就是 A 触发的修复数字显示在 B 的面板上，A 自己什么都看不到。
+test('索引修复计数按调用返回，不会串到别的请求', async () => {
   const r2 = makeR2();
   const env = { R2: r2 };
   await toolSaveDoc(env, 'c1', { title: '甲', content: '甲的内容' });
+  externalAddDoc(r2, '乙.md', '乙', '乙的内容');
+
+  const first = await kbGetRegistryWithMeta(env, { verify: true });
+  assert.equal(first.repaired, 1, '本次调用补回 1 篇');
+  assert.equal(first.reg.length, 2);
+
+  // 索引已经修好了，再查一次就没有可补的
+  const second = await kbGetRegistryWithMeta(env, { verify: true });
+  assert.equal(second.repaired, 0, '第二次调用不应再报修复数');
+  assert.equal(second.reg.length, 2);
+
+  // 另一个"请求"（不同 env 但同 isolate）拿到的也是自己的 0，而不是残留的 1
+  const r2b = makeR2();
+  await toolSaveDoc({ R2: r2b }, 'c2', { title: '丙', content: '丙的内容' });
+  const other = await kbGetRegistryWithMeta({ R2: r2b }, { verify: true });
+  assert.equal(other.repaired, 0, '索引本来就是对的，不该报修复');
+});
+
+test('read_doc 标题未命中时先核对索引，不把库里的文档报成未找到', async () => {
+  const r2 = makeR2();
+  const env = { R2: r2 };  await toolSaveDoc(env, 'c1', { title: '甲', content: '甲的内容' });
   externalAddDoc(r2, '乙.md', '乙文档', '乙的正文内容');
 
   const out = await toolReadDoc(env, { query: '乙文档' });

@@ -8,11 +8,11 @@
 // 5) 注册表新增 chars（字符数）与准确的 size（字节数），列表按更新时间限流展示。
 
 import { mapSetBounded, mapGetBounded, mapLimit } from '../utils.js';
+import { withCoordinationLock } from '../coordination.js';
 import { storePutChecked } from '../store/r2.js';
 import { kbSafeChatId } from '../store/kb.js';
-import { KB_DOCS_PREFIX, kbDocSlug, kbNormSource, kbDocTitleOf, kbGetRegistry,
-  kbSaveRegistry, kbFindRegEntry, kbRegistryVersion, kbFmtSize, kbFmtDate,
-  kbTakeRepairCount } from './registry.js';
+import { KB_DOCS_PREFIX, kbDocSlug, kbNormSource, kbDocTitleOf, kbGetRegistry, kbGetRegistryWithMeta,
+  kbSaveRegistry, kbFindRegEntry, kbRegistryVersion, kbFmtSize, kbFmtDate } from './registry.js';
 
 // v7.1.0：知识库文档正文 L1 内存缓存（每桶最多 48 篇，TTL 120 秒），写入或删除时自动失效/更新
 const KB_DOC_CACHE_MAX = 48;
@@ -161,14 +161,9 @@ function looksLikeErrorPage(s) {
   return '';
 }
 
-// 注册表读改写串行化：Workers 单 isolate 内用一条 promise 链排队。
-// 跨 isolate 无法加锁（R2 没有事务），但至少同一实例里同时保存多篇不会互相覆盖。
-let saveChain = Promise.resolve();
-function withSaveLock(fn) {
-  const next = saveChain.catch(() => {}).then(fn);
-  saveChain = next.catch(() => {});
-  return next;
-}
+// 保存与删除共用同一把全局写锁。锁只放在公共写入口，内部 doSaveDoc、
+// 注册表重建与快照函数都不再获取它，避免同锁嵌套等待。
+const KB_WRITE_LOCK = 'kb:write';
 
 // 覆盖前把旧正文存档到 kb/versions/<slug>/<ts>.md，只保留最近 KB_VERSION_KEEP 份
 async function snapshotVersion(env, file, body) {
@@ -190,7 +185,7 @@ async function snapshotVersion(env, file, body) {
 }
 
 async function toolSaveDoc(env, chatId, args) {
-  return await withSaveLock(() => doSaveDoc(env, chatId, args || {}));
+  return await withCoordinationLock(env, KB_WRITE_LOCK, () => doSaveDoc(env, chatId, args || {}));
 }
 
 async function doSaveDoc(env, chatId, args) {
@@ -233,15 +228,6 @@ async function doSaveDoc(env, chatId, args) {
     }
   }
 
-  // 内容指纹去重：同一篇资料换了标题
-  const fp = contentFingerprint(content);
-  if (!existed) {
-    const fpDup = reg.find(e => e.file !== file && e.fp && e.fp === fp);
-    if (fpDup) {
-      return '相同内容已保存为《' + (fpDup.title || fpDup.file) + '》，未重复保存（内容指纹一致）。如需另存一份，请在标题上做区分，或先删除旧文档。';
-    }
-  }
-
   if (existed && mode === 'create') {
     return '同名文档《' + (prevEntry.title || file) + '》已存在（' + kbFmtSize(prevEntry.size) + '）。如需更新请改用 mode=overwrite 覆盖、mode=append 追加或 mode=prepend 前置整理，或换一个标题。';
   }
@@ -250,20 +236,37 @@ async function doSaveDoc(env, chatId, args) {
   let action = existed ? '已覆盖旧版' : '新建';
   let versionKey = '';
 
-  if (existed && mode !== 'create') {
+  if (existed) {
     const oldFull = await kbReadDocTextCached(env, key);
-    if (oldFull != null) {
-      // snapshot:false 供「先落盘原文、再前置整理大纲」这类两步写入使用，
-      // 避免同一次入库占掉两个版本槽位
-      if (args.snapshot !== false) versionKey = await snapshotVersion(env, file, oldFull);
-      const oldBody = stripFrontmatter(oldFull).trim();
-      if (mode === 'append') {
-        finalContent = oldBody + '\n\n' + content;
-        action = '已追加';
-      } else if (mode === 'prepend') {
-        finalContent = content + '\n\n---\n\n' + oldBody;
-        action = '已前置整理大纲';
+    // 读不到旧正文时不能用新内容直接覆盖，否则一次临时 R2 故障就会丢档。
+    if (oldFull === null) {
+      return '知识库文档更新已中止：旧正文读取失败（' + key + '），未覆盖原文，也未更新注册表；请稍后重试。';
+    }
+    // snapshot:false 供「先落盘原文、再前置整理大纲」这类两步写入使用，
+    // 避免同一次入库占掉两个版本槽位。要求快照但未成功时必须失败关闭。
+    if (args.snapshot !== false) {
+      versionKey = await snapshotVersion(env, file, oldFull);
+      if (!versionKey) {
+        return '知识库文档更新已中止：旧版快照保存失败（' + key + '），未覆盖原文，也未更新注册表；请检查 R2 权限后重试。';
       }
+    }
+    const oldBody = stripFrontmatter(oldFull).trim();
+    if (mode === 'append') {
+      finalContent = oldBody + '\n\n' + content;
+      action = '已追加';
+    } else if (mode === 'prepend') {
+      finalContent = content + '\n\n---\n\n' + oldBody;
+      action = '已前置整理大纲';
+    }
+  }
+
+  // 内容指纹始终对应实际落盘的 finalContent。append/prepend 若只对增量
+  // 计算，会让注册表与 frontmatter 都记录错误身份，后续去重与重建随之失真。
+  const fp = contentFingerprint(finalContent);
+  if (!existed) {
+    const fpDup = reg.find(e => e.file !== file && e.fp && e.fp === fp);
+    if (fpDup) {
+      return '相同内容已保存为《' + (fpDup.title || fpDup.file) + '》，未重复保存（内容指纹一致）。如需另存一份，请在标题上做区分，或先删除旧文档。';
     }
   }
 
@@ -315,8 +318,10 @@ async function toolListDocs(env, opts) {
   if (!env.R2) return 'R2 未绑定，无法读取知识库文档';
   // /kb 这类用户主动查看的入口传 verify:true —— 顺便把索引和实际文件核对一遍，
   // 免得「文档明明存进去了却不在列表里」。Agent 每轮的 list_docs 走缓存，不额外花 R2 操作。
-  const reg = await kbGetRegistry(env, { verify: !!(opts && opts.verify) });
-  const repaired = kbTakeRepairCount();
+  // 返回的 repaired 是本次调用自己的修复计数（不再读模块级全局量，避免多用户串号）
+  const got = await kbGetRegistryWithMeta(env, { verify: !!(opts && opts.verify) });
+  const reg = got.reg;
+  const repaired = got.repaired;
   const repairNote = repaired > 0
     ? '\n\n🔧 索引与实际文件不一致，已按文件自动修复，补回 ' + repaired + ' 篇此前未列出的文档。'
     : '';
@@ -533,7 +538,10 @@ async function kbSearchDocBody(env, entries, query) {
 }
 
 async function toolDeleteDoc(env, args) {
-  args = args || {};
+  return await withCoordinationLock(env, KB_WRITE_LOCK, () => doDeleteDoc(env, args || {}));
+}
+
+async function doDeleteDoc(env, args) {
   const query = String(args.query || '').trim();
   if (!query) return '请给出要删除的文档标题关键词';
   if (!env.R2) return 'R2 未绑定，无法删除知识库文档';
