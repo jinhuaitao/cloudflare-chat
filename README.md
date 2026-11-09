@@ -1,4 +1,4 @@
-# ⚡ Cloudflare-Chat `v7.14.0`
+# ⚡ Cloudflare-Chat `v7.13.0`
 
 > **基于 Cloudflare Workers + R2 的零依赖多通道 AI 对话前端 + 全能 Telegram 机器人 + 微信 ClawBot (iLink) 官方通道**  
 > `🌐 流式 Web + PWA` · `🤖 Telegram 私聊/群聊` · `🟢 微信 ClawBot 安全绑定` · `🧠 三层记忆（L1/L2/L3）` · `🛠 19 项零密钥 Agent 工具` · `📚 R2 知识库（写入模式/版本快照/标签检索）` · `🔄 多 Key 轮询容灾`
@@ -69,7 +69,7 @@ kb/docs/*.md                    知识库文档（用户主动保存的长文，
 - **版本快照**：任何覆盖前把旧正文存到 `kb/versions/<slug>/<ts>.md`，只保留最近 3 份。误覆盖可以在 R2 控制台直接捞回。整理入库的两步写入用 `snapshot:false`，不占两个槽位。
 - **内容指纹去重**：长度 + 前 4000 字的 djb2 哈希。同一篇资料换个标题重复入库会被挡住，提示「内容指纹一致」，并告诉你已存在哪一篇。
 - **错误页拒收**：整篇不到 1200 字且开头是 `404 Not Found` / `403 Forbidden` / Cloudflare 人机校验页的，直接拒绝写入并说明原因——避免把抓取失败的残渣当资料存进库。长文档里引用一句 404 不受影响。
-- **写操作串行化**：注册表是「读-改-写」，通过 Durable Object 在所有 isolate 间串行执行，避免并发保存互相覆盖；列表、旧正文或快照读取失败时中止写入并保留旧索引。
+- **写操作串行化**：注册表是「读-改-写」，同一 isolate 内用一条 promise 链排队，避免并发保存 5 篇互相覆盖、最后只剩 1 篇。
 
 **标签检索**：`tags` 写进 frontmatter（`tags: Kubernetes, 容器, 运维`），注册表自愈重建时仍能解析回来；`kbFindRegEntry` 的匹配优先级变为 **标题精确 > 标题包含 > 标签命中 > slug 归一化 > 文件名**，所以「读一下容器相关的文档」也能命中。
 
@@ -92,8 +92,6 @@ kb/versions/<标题>/<ts>.md       覆盖前的旧版快照（每篇保留 3 份
 3. **一次绑定防覆盖锁（Bind-Once Lock）**：一旦你扫码绑定成功（或通过环境变量 `WX_BOT_TOKEN` 固定绑定），通道立即进入加锁状态，禁止直接生成新二维码覆盖，彻底杜绝被他人顶号。
 4. **扫码人身份自动锁定（Owner Auto-Lock）**：扫码确认时，系统自动记录你的微信 `ilink_user_id` 为唯一合法主人（亦可手动配置 `WX_ALLOWED_USERS` 白名单），非本人微信号无法触发对话或污染知识库。
 
-绑定确认与二维码生成都在跨实例 Bind-Once 锁内复核，已绑定后不存在强制换绑入口。`bot_token` 使用管理员密钥派生的 AES-256-GCM 密钥加密后存入 R2；旧明文记录仍可读取，并会在下次保存时迁移。二维码在浏览器本地生成，绑定内容不会发送给第三方二维码服务。
-
 ## 🚀 快速部署与通道绑定
 
 ##### 方式一
@@ -103,7 +101,7 @@ kb/versions/<标题>/<ts>.md       覆盖前的旧版快照（每篇保留 3 份
 ##### 方式二
 
 1. **导入 Git 部署**：Cloudflare 控制台 → **Workers & Pages** → **连接到 Git** 选择本仓库（构建命令留空，部署命令 `npx wrangler deploy`）。
-   > 💡 `wrangler.toml` 已声明 **R2 自动置备**、**Durable Object 跨实例协调锁**、**Cron 定时触发器 (`* * * * *`)** 与 `keep_vars = true`，部署时会一并创建所需绑定。
+   > 💡 `wrangler.toml` 已开启 **R2 自动置备**、**Cron 定时触发器 (`* * * * *`)** 与 `keep_vars = true`，首次部署会自动创建并绑定 R2 存储桶。
 2. **配置模型通道**：进入 Worker **设置 → 变量和机密**，添加至少一组模型变量（多 Key 用英文逗号分隔，自动轮询）：
    ```ini
    API_URL_1 = https://api.openai.com/v1/chat/completions
@@ -115,7 +113,7 @@ kb/versions/<标题>/<ts>.md       覆盖前的旧版快照（每篇保留 3 份
    - 在手机微信中开启 **「我 → 设置 → 插件 → ClawBot」**；
    - 打开部署好的 Web 网页端，点击左下角侧边栏的 **🟢 微信气泡图标** → 输入管理员密钥点击 **「验证」** → 点击 **「📱 扫码绑定微信 ClawBot」**；
    - 用手机微信扫描二维码并确认连接，凭证与你本人的 `ilink_user_id` 将自动加密锁定至 R2（也可直接在环境变量中固定配置 `WX_BOT_TOKEN`）。
-4. **绑定 Telegram 机器人（可选）**：向 `@BotFather` 获取 Token，配置 `TG_BOT_TOKEN`、随机密钥 `TG_WEBHOOK_SECRET`、`TG_ALLOWED_CHAT_IDS` 与 `TG_ADMIN_IDS` 后重部署（公开机器人须显式设置 `TG_ALLOW_PUBLIC=true`），浏览器访问以下地址完成绑定：
+4. **绑定 Telegram 机器人（可选）**：向 `@BotFather` 获取 Token，配置 `TG_BOT_TOKEN` 与随机密钥 `TG_WEBHOOK_SECRET` 后重部署，浏览器访问以下地址完成绑定：
    ```text
    https://api.telegram.org/bot<TG_BOT_TOKEN>/setWebhook?url=https://<你的Worker域名>/tg-webhook&secret_token=<TG_WEBHOOK_SECRET>
    ```
@@ -145,7 +143,7 @@ kb/versions/<标题>/<ts>.md       覆盖前的旧版快照（每篇保留 3 份
 | `WX_BOT_TOKEN` | 🔵 自动 / 可选 | Web 扫码自动保存 | 微信 iLink `bot_token`（若填入环境变量则永久锁定，网页端无法解绑或覆盖） |
 | `WX_ALLOWED_USERS` | 🟠 推荐 | 自动锁定扫码人 | 允许对话的微信用户 `ilink_user_id` 白名单，逗号分隔（不填则自动仅允许扫码绑定人本人） |
 | `WX_WEBHOOK_SECRET` | 🟢 可选 | 不校验 | 当使用第三方 iLink 网关推送至 `/wx-webhook` 时的校验密钥 |
-| `WX_POLL_BUDGET_MS` | 🟢 可选 | `21000` | 单棒长轮询总预算（默认 18 秒拉取 + 3 秒收尾，上限 26 秒；自接力维持后台收发） |
+| `WX_POLL_BUDGET_MS` | 🟢 可选 | `52000` | Cron 定时触发单次长轮询窗口最大运行毫秒数（默认 52 秒） |
 | `WX_WEBHOOK_BUDGET_MS` | 🟢 可选 | `55000` | 微信单轮 Agent 运行预算（毫秒）；超时自动存档，微信发「继续」即可续做 |
 | `WX_BASE_URL` | 🟢 可选 | `https://ilinkai.weixin.qq.com` | 微信 iLink 网关地址（扫码后会自动使用服务端下发的专属 `baseurl`） |
 | `WX_CHANNEL_VERSION` | 🟢 可选 | `2.4.10` | 模拟 `@tencent-weixin/openclaw-weixin` 协议版本号（自动计算 `iLink-App-ClientVersion`） |
@@ -155,10 +153,8 @@ kb/versions/<标题>/<ts>.md       覆盖前的旧版快照（每篇保留 3 份
 | 变量名 | 级别 | 默认值 | 说明 |
 | :--- | :---: | :---: | :--- |
 | `TG_BOT_TOKEN` | 🔴 必填 | — | `@BotFather` 机器人 Token（启用 Telegram 机器人必填） |
-| `TG_WEBHOOK_SECRET` | 🔴 启用必填 | — | Webhook 签名校验密钥（可用 `openssl rand -hex 24` 生成）；启用 Bot 但未配置时请求会被拒绝 |
-| `TG_ALLOWED_CHAT_IDS` | 🔴 默认必填 | — | 允许使用的私聊 `user_id` 或群组 `chat_id` 白名单，逗号分隔；显式 `TG_ALLOW_PUBLIC=true` 才可公开 |
-| `TG_ADMIN_IDS` | 🔴 管理必填 | — | 允许执行 `/wxstatus`、`/wxlogin`、`/wxunbind` 的 Telegram 用户 ID，逗号分隔 |
-| `TG_ALLOW_PUBLIC` | 🟢 可选 | `false` | 设为 `true` 时允许白名单外的普通聊天；不影响管理命令的 `TG_ADMIN_IDS` 强制校验 |
+| `TG_WEBHOOK_SECRET` | 🟠 推荐 | 不校验 | Webhook 签名校验密钥（可用 `openssl rand -hex 24` 生成，防伪造请求） |
+| `TG_ALLOWED_CHAT_IDS` | 🟠 推荐 | 全部放行 | 允许使用的私聊 `user_id` 或群组 `chat_id` 白名单，逗号分隔（发 `/help` 可查当前 ID） |
 | `TG_HISTORY_ROUNDS` | 🟢 可选 | `10` | 多轮对话保留轮数（上限 `30` 轮，Telegram 与微信共用，受 12,000 字符上下文安全预算保护） |
 | `TG_BOT_USERNAME` | 🔵 自动 | `getMe` 探测 | 机器人用户名（不含 `@`），用于群聊识别 `@提及`，默认自动获取无需手填 |
 | `TG_GROUP_REPLY_ALL` | 🟢 可选 | 仅提及响应 | 群聊模式：默认仅响应 `@机器人`、引用回复与 `/命令`；设为 `1` 则群内每条消息均回复 |
@@ -234,7 +230,7 @@ kb/versions/<标题>/<ts>.md       覆盖前的旧版快照（每篇保留 3 份
 ## 🧪 本地回归测试
 
 ```bash
-npm test                  # 全部离线回归：内核、Worker 路由、分布式租约、故障注入、知识库/记忆、机器人、SSRF 与前端约束
+npm test                  # 283 个用例：内核纯函数 + mock 上游的端到端循环 + 流式读取 + 知识库存读/写入模式/索引自愈 + 三层记忆 + 运行期性能 + 输入边界与容错 + SSRF + 微信加解密与排版 + 通道配置 + 前端分片约束（不联网）
 npm run build:tts-demo    # 从 src/ui/speech.js 重新生成 tts-demo.html（改了朗读规则才需要跑）
 ```
 

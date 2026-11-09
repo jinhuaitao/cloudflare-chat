@@ -17,8 +17,6 @@
 import { APP_VERSION, CORS_HEADERS } from '../constants.js';
 import { mapSetBounded, mapGetBounded, mapLimit, parseCommaSeparated, safeEqual } from '../utils.js';
 import { storeGet, storePut, storePutChecked, storeDelete } from '../store/r2.js';
-import { safeFetch } from '../net/safe-fetch.js';
-import { acquireCoordinationLease, renewCoordinationLease, releaseCoordinationLease, withCoordinationLock } from '../coordination.js';
 import { getChannelConfig, resolveModelKey, buildAIRequest } from '../channel.js';
 import { tgTrimHistory, tgGetHistory, tgSaveHistory, tgClearHistory } from '../tg-history.js';
 import { agentForgetMemory } from '../agent/memory.js';
@@ -47,7 +45,6 @@ import {
   formatWechatText,
   md5Hex,
   ilinkDownloadMediaBytes,
-  readResponseBytesWithinLimit,
   ilinkUploadAndSendImage,
   SUPPORTED_KB_FILE_EXT_RE,
   extractWechatDocumentText,
@@ -119,19 +116,6 @@ const wxDiagMem = {
   events: [],
 };
 
-// 静默失败的计数器。
-// 这条链路上有大量 `catch {}` —— 游标写失败、context_token 写失败、去重窗口写失败，
-// 都不该让整条消息处理挂掉，所以吞异常是对的。但"吞掉且不留痕"会让
-// 「消息收到了却不回复」「绑定成功了却像没绑」这类问题完全无从排查。
-// 这里只计数不打日志（Worker 里 console 也会计费），通过 /api/wx/status 的 diag 暴露。
-const wxSilentFails = { creds: 0, cursor: 0, ctxToken: 0, dedup: 0 };
-function noteWxSilentFail(kind) {
-  if (wxSilentFails[kind] !== undefined) wxSilentFails[kind] += 1;
-}
-function wxSilentFailSnapshot() {
-  return Object.assign({}, wxSilentFails);
-}
-
 async function wxRecordDiag(env, kind, detail, userId = '', persist = false) {
   const now = Date.now();
   if (kind === 'poll') {
@@ -195,8 +179,6 @@ async function getWxDiagSummary(env) {
     totalPolls: wxDiagMem.totalPolls,
     totalProcessed: wxDiagMem.totalProcessed,
     events: wxDiagMem.events.slice(0, 12),
-    // 各类静默写入的累计失败次数：全 0 才说明持久化真的正常
-    silentFails: wxSilentFailSnapshot(),
   };
 }
 
@@ -234,7 +216,8 @@ function base64ToUint8(b64) {
 function checkWxAdminAuth(env, request, url) {
   const adminSecret = String((env && env.WX_ADMIN_SECRET) || '').trim();
   const accessPwd = String((env && env.ACCESS_PASSWORD) || '').trim();
-  const requiredSecret = adminSecret || accessPwd;
+  const webhookSecret = String((env && env.WX_WEBHOOK_SECRET) || '').trim();
+  const requiredSecret = adminSecret || accessPwd || webhookSecret;
 
   if (!requiredSecret) {
     return {
@@ -246,15 +229,17 @@ function checkWxAdminAuth(env, request, url) {
 
   const providedAdmin = (request && request.headers && request.headers.get('X-Wx-Admin-Token')) || '';
   const providedAccess = (request && request.headers && request.headers.get('X-Access-Token')) || '';
+  const providedWebhook = (request && request.headers && (request.headers.get('X-Wechat-Webhook-Secret') || request.headers.get('X-Webhook-Secret'))) || '';
   const authHeader = ((request && request.headers && request.headers.get('Authorization')) || '').replace(/^Bearer\s+/i, '').trim();
   const reqUrl = url || (request && request.url ? new URL(request.url) : null);
   const queryKey = (reqUrl && reqUrl.searchParams && reqUrl.searchParams.get('key')) || '';
 
-  const inputs = [providedAdmin, providedAccess, authHeader, queryKey].filter(Boolean);
+  const candidates = [requiredSecret, adminSecret, accessPwd, webhookSecret].filter(Boolean);
+  const inputs = [providedAdmin, providedAccess, providedWebhook, authHeader, queryKey].filter(Boolean);
 
   for (const inp of inputs) {
     for (const cand of candidates) {
-      if (safeEqual(inp, requiredSecret)) {
+      if (safeEqual(inp, cand)) {
         return { authorized: true, noSecretConfigured: false };
       }
     }
@@ -270,43 +255,6 @@ function checkWxAdminAuth(env, request, url) {
 }
 
 // ================= 1. 微信 ClawBot 凭证存取 =================
-function wxCredentialEncryptionSecret(env) {
-  return String((env && env.WX_ADMIN_SECRET) || (env && env.ACCESS_PASSWORD) || '').trim();
-}
-
-async function wxCredentialCryptoKey(env) {
-  const secret = wxCredentialEncryptionSecret(env);
-  if (!secret) {
-    throw new Error('配置错误：R2 微信凭证加密需要 WX_ADMIN_SECRET（未配置时使用 ACCESS_PASSWORD），已拒绝明文写入 bot_token。');
-  }
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(secret));
-  return await crypto.subtle.importKey('raw', digest, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
-}
-
-async function encryptWxBotToken(env, token) {
-  const key = await wxCredentialCryptoKey(env);
-  const iv = new Uint8Array(12);
-  crypto.getRandomValues(iv);
-  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(String(token || '')));
-  return { version: 1, iv: uint8ToBase64(iv), ciphertext: uint8ToBase64(new Uint8Array(ciphertext)) };
-}
-
-async function decryptWxBotToken(env, parsed) {
-  if (!parsed || parsed.version !== 1 || !parsed.iv || !parsed.ciphertext) {
-    throw new Error('微信凭证加密格式不受支持');
-  }
-  const iv = base64ToUint8(parsed.iv);
-  if (iv.byteLength !== 12) throw new Error('微信凭证 IV 长度无效');
-  try {
-    const key = await wxCredentialCryptoKey(env);
-    const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, base64ToUint8(parsed.ciphertext));
-    return new TextDecoder().decode(plain);
-  } catch (e) {
-    if (/配置错误/.test(String(e && e.message))) throw e;
-    throw new Error('微信凭证解密失败：密文已损坏或加密密钥不匹配');
-  }
-}
-
 async function getWxCredentials(env, forceRefresh) {
   const now = Date.now();
   if (!forceRefresh && cachedWxCreds && now < cachedWxCredsExp) {
@@ -332,35 +280,28 @@ async function getWxCredentials(env, forceRefresh) {
   }
 
   if (env && env.R2) {
-    const raw = await storeGet(env, WX_CREDS_KEY);
-    if (raw) {
-      let parsed = null;
-      try { parsed = JSON.parse(raw); } catch (e) { return null; }
-      const encrypted = !!(parsed && parsed.version !== undefined);
-      const botToken = encrypted
-        ? await decryptWxBotToken(env, parsed)
-        : String(parsed && parsed.bot_token || '').trim();
-      if (parsed && botToken) {
-        cachedWxCreds = {
-          bot_token: botToken,
-          ilink_bot_id: String(parsed.ilink_bot_id || 'default_bot').trim(),
-          ilink_user_id: String(parsed.ilink_user_id || '').trim(),
-          baseurl: normalizeBaseUrl(parsed.baseurl || (env && env.WX_BASE_URL) || DEFAULT_ILINK_BASE_URL),
-          cdn_url: String(parsed.cdn_url || (env && env.WX_CDN_BASE_URL) || DEFAULT_ILINK_CDN_URL).trim(),
-          expired: !!parsed.expired,
-          errmsg: parsed.errmsg || '',
-          updated_at: parsed.updated_at || '',
-          relay_origin: String(parsed.relay_origin || ''),
-          source: 'r2',
-        };
-        cachedWxCredsExp = Date.now() + 30 * 1000;
-        // 老版本 plaintext 只在读取时兼容；有密钥就立即原地迁移为 AES-GCM。
-        if (!encrypted && wxCredentialEncryptionSecret(env)) {
-          try { await saveWxCredentials(env, cachedWxCreds); } catch (e) { noteWxSilentFail('creds'); }
+    try {
+      const raw = await storeGet(env, WX_CREDS_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && parsed.bot_token) {
+          cachedWxCreds = {
+            bot_token: String(parsed.bot_token).trim(),
+            ilink_bot_id: String(parsed.ilink_bot_id || 'default_bot').trim(),
+            ilink_user_id: String(parsed.ilink_user_id || '').trim(),
+            baseurl: normalizeBaseUrl(parsed.baseurl || (env && env.WX_BASE_URL) || DEFAULT_ILINK_BASE_URL),
+            cdn_url: String(parsed.cdn_url || (env && env.WX_CDN_BASE_URL) || DEFAULT_ILINK_CDN_URL).trim(),
+            expired: !!parsed.expired,
+            errmsg: parsed.errmsg || '',
+            updated_at: parsed.updated_at || '',
+            relay_origin: String(parsed.relay_origin || ''),
+            source: 'r2',
+          };
+          cachedWxCredsExp = Date.now() + 30 * 1000;
+          return cachedWxCreds;
         }
-        return cachedWxCreds;
       }
-    }
+    } catch (e) {}
   }
 
   return null;
@@ -379,19 +320,11 @@ async function saveWxCredentials(env, creds) {
     relay_origin: String(creds.relay_origin || lastKnownPublicOrigin || ''),
     source: 'r2',
   };
-  if (env && env.R2) {
-    const encrypted = await encryptWxBotToken(env, clean.bot_token);
-    const persisted = Object.assign({}, clean, encrypted);
-    delete persisted.bot_token;
-    delete persisted.source;
-    const ok = await storePutChecked(env, WX_CREDS_KEY, JSON.stringify(persisted));
-    if (!ok) {
-      noteWxSilentFail('creds');
-      return false;
-    }
-  }
   cachedWxCreds = clean;
   cachedWxCredsExp = Date.now() + 30 * 1000;
+  if (env && env.R2) {
+    return await storePutChecked(env, WX_CREDS_KEY, JSON.stringify(clean));
+  }
   return true;
 }
 
@@ -404,11 +337,10 @@ async function markWxSessionExpired(env, creds, errmsg) {
     errmsg: msg,
     updated_at: new Date().toISOString(),
   });
+  cachedWxCreds = updated;
+  cachedWxCredsExp = Date.now() + 30 * 1000;
   if (env && env.R2 && creds.source !== 'env') {
-    await saveWxCredentials(env, updated);
-  } else {
-    cachedWxCreds = updated;
-    cachedWxCredsExp = Date.now() + 30 * 1000;
+    await storePut(env, WX_CREDS_KEY, JSON.stringify(updated));
   }
   if (creds.ilink_bot_id) {
     wxCursors.delete(creds.ilink_bot_id);
@@ -445,16 +377,10 @@ async function saveWxCursor(env, botId, buf) {
   const key = wxSafeId(botId || 'default_bot');
   const s = String(buf);
   const prev = mapGetBounded(wxCursors, key);
-  if (s !== prev && env && env.R2) {
-    // 游标写失败时保留旧缓存并让调用方知道本次不能 ack，下一轮从旧位置重试。
-    const ok = await storePutChecked(env, 'wx_cursor_' + key, s);
-    if (!ok) {
-      noteWxSilentFail('cursor');
-      return false;
-    }
-  }
   mapSetBounded(wxCursors, key, s, 100, wxCursorsExp, 60 * 1000);
-  return true;
+  if (s !== prev) {
+    await storePut(env, 'wx_cursor_' + key, s);
+  }
 }
 
 async function getWxContextToken(env, userId) {
@@ -477,13 +403,12 @@ async function saveWxContextToken(env, userId, contextToken) {
   const prev = mapGetBounded(wxContextTokens, key);
   mapSetBounded(wxContextTokens, key, ct, 500, wxContextTokensExp, 5 * 60 * 1000);
   if (ct !== prev) {
-    const okCtx = await storePutChecked(env, 'wx_ctx_' + key, ct);
-    const okPeer = await storePutChecked(env, 'wx_last_peer', JSON.stringify({
+    await storePut(env, 'wx_ctx_' + key, ct);
+    await storePut(env, 'wx_last_peer', JSON.stringify({
       user_id: String(userId),
       context_token: ct,
       ts: Date.now(),
     }));
-    if ((!okCtx || !okPeer) && env && env.R2) noteWxSilentFail('ctxToken');
   }
 }
 
@@ -507,40 +432,24 @@ async function loadWxDedupWindow(env) {
   return [];
 }
 
-async function hasWxMsgSeen(env, msgKey) {
-  if (!msgKey) return false;
-  const now = Date.now();
-  const localTs = seenWxMsgIds.get(msgKey);
-  if (localTs && now - localTs < WX_DEDUP_WINDOW_MS) return true;
-  if (localTs) seenWxMsgIds.delete(msgKey);
-  const win = await loadWxDedupWindow(env);
-  const found = win.some(e => e && e.id === msgKey && now - (e.ts || 0) < WX_DEDUP_WINDOW_MS);
-  if (found) seenWxMsgIds.set(msgKey, now);
-  return found;
-}
-
 async function markWxMsgSeen(env, msgKey) {
   if (!msgKey) return false;
-  return await withCoordinationLock(env, 'wx:dedup-window', async () => {
-    if (await hasWxMsgSeen(env, msgKey)) return true;
-    const now = Date.now();
-    const win = await loadWxDedupWindow(env);
-    const fresh = win.filter(e => e && e.id && now - (e.ts || 0) < WX_DEDUP_WINDOW_MS);
-    fresh.push({ id: msgKey, ts: now });
-    if (fresh.length > WX_DEDUP_MAX) fresh.splice(0, fresh.length - WX_DEDUP_MAX);
-    if (env && env.R2) {
-      const ok = await storePutChecked(env, WX_DEDUP_KEY, JSON.stringify(fresh));
-      if (!ok) {
-        noteWxSilentFail('dedup');
-        throw new Error('微信消息完成标记写入失败，本条消息不能确认');
-      }
-    }
+  const now = Date.now();
+  if (seenWxMsgIds.has(msgKey)) return true;
+  const win = await loadWxDedupWindow(env);
+  const fresh = win.filter(e => e && e.id && now - (e.ts || 0) < WX_DEDUP_WINDOW_MS);
+  if (fresh.some(e => e.id === msgKey)) {
     seenWxMsgIds.set(msgKey, now);
-    for (const [k, t] of seenWxMsgIds) {
-      if (now - t > WX_DEDUP_WINDOW_MS) seenWxMsgIds.delete(k);
-    }
-    return false;
-  });
+    return true;
+  }
+  fresh.push({ id: msgKey, ts: now });
+  if (fresh.length > WX_DEDUP_MAX) fresh.splice(0, fresh.length - WX_DEDUP_MAX);
+  try { await storePutChecked(env, WX_DEDUP_KEY, JSON.stringify(fresh)); } catch (e) {}
+  seenWxMsgIds.set(msgKey, now);
+  for (const [k, t] of seenWxMsgIds) {
+    if (now - t > WX_DEDUP_WINDOW_MS) seenWxMsgIds.delete(k);
+  }
+  return false;
 }
 
 async function releaseWxMsgForRetry(env, msgKey) {
@@ -590,11 +499,9 @@ async function sendWechatImageFromSource(env, creds, userId, contextToken, sourc
     if (s.startsWith('data:image/')) {
       imgBytes = base64ToUint8(s);
     } else if (/^https?:\/\//i.test(s)) {
-      // 图片地址来自上游生图接口的响应（或模型输出里的 Markdown 图片），同样不可信：
-      // 之前这里用 redirect:'follow' 且完全不校验 host，等于给了一条无保护的出网通道。
-      const { res: r } = await safeFetch(s, { signal: AbortSignal.timeout(20000) });
+      const r = await fetch(s, { signal: AbortSignal.timeout(20000), redirect: 'follow' });
       if (!r.ok) throw new Error(`下载生成图片失败 (HTTP ${r.status})`);
-      imgBytes = await readResponseBytesWithinLimit(r, 5 * 1024 * 1024);
+      imgBytes = new Uint8Array(await r.arrayBuffer());
     } else if (s.length > 100 && !s.includes(' ')) {
       imgBytes = base64ToUint8(s);
     }
@@ -654,36 +561,6 @@ async function loadAllKbDocsForSync(env) {
 // ================= 6. 单条微信入站消息核心处理 =================
 async function processWechatMessage(env, creds, rawMsg) {
   const parsed = extractWechatMessageContent(rawMsg);
-  if (!parsed.isUserMsg || !parsed.fromUserId) {
-    return { skipped: true, ack: true, reason: 'not_user_msg' };
-  }
-  const dedupKey = parsed.msgId
-    ? `id:${parsed.msgId}`
-    : `hash:${parsed.fromUserId}:${String(parsed.contextToken || '').slice(-24)}:${(parsed.text || '').slice(0, 48)}`;
-  if (await hasWxMsgSeen(env, dedupKey)) {
-    return { skipped: true, ack: true, reason: 'duplicate' };
-  }
-  try {
-    return await withCoordinationLock(env, 'wx:message:' + dedupKey, async () => {
-      // 正式处理前只做完成标记检查；拿到消息锁后必须再读一次，避免双实例同时回复。
-      if (await hasWxMsgSeen(env, dedupKey)) {
-        return { skipped: true, ack: true, reason: 'duplicate' };
-      }
-      const result = await processWechatMessageLocked(env, creds, rawMsg);
-      const ack = !!(result && (result.processed || (result.skipped && !result.retry)));
-      if (ack) await markWxMsgSeen(env, dedupKey);
-      return Object.assign({}, result, { ack });
-    }, { leaseMs: 30000, waitMs: 0 });
-  } catch (e) {
-    if (/等待协调锁超时：wx:message:/.test(String(e && e.message))) {
-      return { skipped: true, retry: true, ack: false, reason: 'in_progress' };
-    }
-    throw e;
-  }
-}
-
-async function processWechatMessageLocked(env, creds, rawMsg) {
-  const parsed = extractWechatMessageContent(rawMsg);
   if (!parsed.isUserMsg || !parsed.fromUserId) return { skipped: true, reason: 'not_user_msg' };
 
   const userId = parsed.fromUserId;
@@ -714,6 +591,13 @@ async function processWechatMessageLocked(env, creds, rawMsg) {
   if (!contextToken) {
     await wxRecordDiag(env, 'error', '入站消息缺少 context_token', userId, false);
     return { skipped: true, reason: 'missing_context_token' };
+  }
+
+  const dedupKey = parsed.msgId
+    ? `id:${parsed.msgId}`
+    : `hash:${userId}:${contextToken.slice(-24)}:${(parsed.text || '').slice(0, 48)}`;
+  if (await markWxMsgSeen(env, dedupKey)) {
+    return { skipped: true, reason: 'duplicate' };
   }
 
   const chatId = wxSessionChatId(userId);
@@ -754,20 +638,6 @@ async function processWechatMessageLocked(env, creds, rawMsg) {
     await wxRecordDiag(env, 'reply', cleanText.slice(0, 120), userId, true);
   };
 
-  // 「对方正在输入…」心跳定时器。
-  // ⚠️ 必须声明在 try 之外：此前它写成 try 块内的 const，而 catch 是兄弟块，
-  //    那里 typeof 取到的是 undefined（未声明标识符），清理代码从未执行过一次 ——
-  //    一次异常后定时器会一直每 5 秒发 typing，Workers 里 setInterval 返回数字、
-  //    没有 unref() 可自释放，只能靠这里显式清。
-  //    统一走 stopTypingHeartbeat()，保证「正常结束 / 早退 / 抛异常」三条路径都清得掉。
-  let typingHeartbeatTimer = null;
-  const stopTypingHeartbeat = () => {
-    if (typingHeartbeatTimer) {
-      try { clearInterval(typingHeartbeatTimer); } catch (e) {}
-      typingHeartbeatTimer = null;
-    }
-  };
-
   try {
     const { models: modelObjList } = getChannelConfig(env);
     if (modelObjList.length === 0) {
@@ -792,13 +662,8 @@ async function processWechatMessageLocked(env, creds, rawMsg) {
             15000
           );
         } else if (parsed.imageMedia.url) {
-          imgBytes = await ilinkDownloadMediaBytes(
-            creds.cdn_url,
-            parsed.imageMedia.url,
-            parsed.imageMedia.aesKey,
-            3 * 1024 * 1024,
-            15000
-          );
+          const r = await fetch(parsed.imageMedia.url, { signal: AbortSignal.timeout(15000) });
+          if (r.ok) imgBytes = new Uint8Array(await r.arrayBuffer());
         }
         if (imgBytes && imgBytes.byteLength > 0) {
           const dataUrl = 'data:image/jpeg;base64,' + uint8ToBase64(imgBytes);
@@ -1153,7 +1018,7 @@ async function processWechatMessageLocked(env, creds, rawMsg) {
 
     // 异步非阻塞触发“对方正在输入…”并启动 5s 自动续期心跳，确保长推理/生图期间手机端提示不中断
     sendWxTypingStatus(env, creds, userId, contextToken, 1).catch(() => {});
-    typingHeartbeatTimer = setInterval(() => {
+    const typingHeartbeatTimer = setInterval(() => {
       sendWxTypingStatus(env, creds, userId, contextToken, 1).catch(() => {});
     }, 5000);
     if (typingHeartbeatTimer && typeof typingHeartbeatTimer.unref === 'function') {
@@ -1256,8 +1121,6 @@ async function processWechatMessageLocked(env, creds, rawMsg) {
     } else {
       const aiConfig = buildAIRequest(env, activeModelId, history, false);
       if (aiConfig.error) {
-        // 早退路径也必须停掉心跳，否则定时器会留到请求结束
-        stopTypingHeartbeat();
         await sendWxTypingStatus(env, creds, userId, contextToken, 2);
         await sendReply('⚠️ ' + aiConfig.error, true);
         return { processed: true };
@@ -1318,7 +1181,7 @@ async function processWechatMessageLocked(env, creds, rawMsg) {
       }
     }
 
-    stopTypingHeartbeat();
+    clearInterval(typingHeartbeatTimer);
     sendWxTypingStatus(env, creds, userId, contextToken, 2).catch(() => {});
 
     if (agentErr) {
@@ -1359,7 +1222,8 @@ async function processWechatMessageLocked(env, creds, rawMsg) {
     }
     return { processed: true };
   } catch (err) {
-    stopTypingHeartbeat();
+    try { if (typeof typingHeartbeatTimer !== 'undefined') clearInterval(typingHeartbeatTimer); } catch (e) {}
+    await releaseWxMsgForRetry(env, dedupKey);
     sendWxTypingStatus(env, creds, userId, contextToken, 2).catch(() => {});
     await wxRecordDiag(env, 'error', err && err.message ? err.message : String(err), userId, true);
     throw err;
@@ -1386,50 +1250,61 @@ const WX_MIN_FULL_POLL_MS = 8000;
 const WX_DEFAULT_LONGPOLL_MS = 18000;
 let lastNotifyStartAt = 0;
 
-const WX_POLL_LOCK_NAME = 'wx:poll';
-const WX_POLL_OWNER = (() => {
-  const bytes = new Uint8Array(16);
-  crypto.getRandomValues(bytes);
-  return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
-})();
-
-function pollLeaseMs(ttlMs) {
-  return Math.min(Math.max(parseInt(ttlMs, 10) || WX_LOCK_DEFAULT_TTL_MS, 10000), 25000);
-}
-
-async function isPollLockHeld() {
-  return activePollInIsolate;
+async function isPollLockHeld(env) {
+  if (activePollInIsolate) return true;
+  if (!env || !env.R2) return false;
+  try {
+    const now = Date.now();
+    const raw = await storeGet(env, WX_POLL_LOCK_KEY);
+    if (raw) {
+      const lock = JSON.parse(raw);
+      if (lock && lock.exp > now && lock.exp - now <= 26000) {
+        return true;
+      }
+    }
+  } catch (e) {}
+  return false;
 }
 
 async function acquirePollLock(env, ttlMs, force) {
-  // force 形参仅为旧调用兼容；租约绝不允许被强制绕过。
-  if (activePollInIsolate) return false;
-  try {
-    const lease = await acquireCoordinationLease(env, WX_POLL_LOCK_NAME, WX_POLL_OWNER, { leaseMs: pollLeaseMs(ttlMs) });
-    activePollInIsolate = !!(lease && lease.ok);
-  } catch (e) {
-    activePollInIsolate = false;
+  if (activePollInIsolate && !force) return false;
+  if (!env || !env.R2) {
+    activePollInIsolate = true;
+    return true;
   }
-  return activePollInIsolate;
+  try {
+    const now = Date.now();
+    if (!force) {
+      const raw = await storeGet(env, WX_POLL_LOCK_KEY);
+      if (raw) {
+        const lock = JSON.parse(raw);
+        if (lock && lock.exp > now && lock.exp - now <= 26000) {
+          return false;
+        }
+      }
+    }
+    activePollInIsolate = true;
+    const leaseMs = Math.min(Math.max(parseInt(ttlMs, 10) || WX_LOCK_DEFAULT_TTL_MS, 10000), 25000);
+    await storePut(env, WX_POLL_LOCK_KEY, JSON.stringify({ exp: now + leaseMs, ts: now }));
+  } catch (e) {
+    activePollInIsolate = true;
+  }
+  return true;
 }
 
 async function renewPollLock(env, ttlMs) {
-  if (!activePollInIsolate) return false;
+  if (!env || !env.R2) return;
   try {
-    const ok = await renewCoordinationLease(env, WX_POLL_LOCK_NAME, WX_POLL_OWNER, { leaseMs: pollLeaseMs(ttlMs) });
-    if (!ok) activePollInIsolate = false;
-    return ok;
-  } catch (e) {
-    activePollInIsolate = false;
-    return false;
-  }
+    const now = Date.now();
+    const leaseMs = Math.min(Math.max(parseInt(ttlMs, 10) || WX_LOCK_DEFAULT_TTL_MS, 10000), 25000);
+    await storePut(env, WX_POLL_LOCK_KEY, JSON.stringify({ exp: now + leaseMs, ts: now }));
+  } catch (e) {}
 }
 
 async function releasePollLock(env) {
-  try {
-    await releaseCoordinationLease(env, WX_POLL_LOCK_NAME, WX_POLL_OWNER);
-  } catch (e) {} finally {
-    activePollInIsolate = false;
+  activePollInIsolate = false;
+  if (env && env.R2) {
+    try { await storeDelete(env, WX_POLL_LOCK_KEY); } catch (e) {}
   }
 }
 
@@ -1447,49 +1322,54 @@ function maybeSendPeriodicNotifyStart(creds, chanVer, ctx) {
 }
 
 // 若当前轮询实例已消耗较多时间，优先将入站消息交由全新的 `/wx-webhook?process=1` HTTP 请求实例处理（满血 60~120s 预算），失败则原地处理
-async function dispatchOrProcessMessages(env, creds, pendingMsgs, effOrigin, elapsedMs, ctx, nextCursor) {
-  if (!pendingMsgs || !pendingMsgs.length) return { processed: 0, acknowledged: true, retry: false };
+async function dispatchOrProcessMessages(env, creds, pendingMsgs, effOrigin, elapsedMs, ctx) {
+  let processedCount = 0;
+  if (!pendingMsgs || !pendingMsgs.length) return 0;
 
   if (elapsedMs >= 6000 && isRealPublicOrigin(effOrigin)) {
     try {
       const relayToken = computeWxRelayToken(creds.bot_token);
       const procUrl = `${effOrigin}/wx-webhook?process=1`;
-      // 必须等处理端给出明确 ack；1.2 秒仍在后台运行不等于消息已成功。
-      const procRes = await fetch(procUrl, {
+      const procFetch = fetch(procUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'X-Wx-Relay-Token': relayToken,
         },
-        body: JSON.stringify({ action: 'process', msgs: pendingMsgs, get_updates_buf: nextCursor || '' }),
+        body: JSON.stringify({ action: 'process', msgs: pendingMsgs }),
         signal: AbortSignal.timeout(55000),
       });
-      if (procRes && procRes.ok) {
-        const data = await procRes.json().catch(() => ({}));
-        return {
-          processed: typeof data.processed === 'number' ? data.processed : 0,
-          acknowledged: data.acknowledged === true,
-          retry: data.retry === true || data.acknowledged !== true,
-        };
+
+      const earlyRes = await Promise.race([
+        procFetch,
+        new Promise(r => { const t = setTimeout(() => r('IN_FLIGHT'), 1200); if (t && typeof t.unref === 'function') t.unref(); }),
+      ]);
+
+      if (earlyRes === 'IN_FLIGHT') {
+        const bgProc = procFetch.then(r => (r ? r.text().catch(() => '') : '')).catch(() => '');
+        if (ctx && typeof ctx.waitUntil === 'function') {
+          try { ctx.waitUntil(bgProc); } catch (e) {}
+        }
+        return pendingMsgs.length;
+      }
+      if (earlyRes && earlyRes.ok) {
+        const data = await earlyRes.json().catch(() => ({}));
+        return typeof data.processed === 'number' ? data.processed : pendingMsgs.length;
       }
     } catch (e) {
-      // 传输结果未知时回退本地处理；完成标记与每消息锁会抑制重复执行。
+      // 回退到当前实例直接处理
     }
   }
 
-  let processedCount = 0;
-  let acknowledged = true;
   for (const m of pendingMsgs) {
     try {
       const r = await processWechatMessage(env, creds, m);
       if (r && r.processed) processedCount += 1;
-      if (!r || r.ack !== true) acknowledged = false;
     } catch (err) {
-      acknowledged = false;
       console.log('处理微信 ClawBot 消息异常:', err);
     }
   }
-  return { processed: processedCount, acknowledged, retry: !acknowledged };
+  return processedCount;
 }
 
 async function runWechatPollCycle(env, opts) {
@@ -1529,28 +1409,16 @@ async function runWechatPollCycle(env, opts) {
   let totalReceived = 0;
   let totalProcessed = 0;
   let cursor = await getWxCursor(env, creds.ilink_bot_id);
-  let nextCursor = cursor;
-  let acknowledged = true;
   let lockReleased = false;
   let relayTaskPromise = null;
-  let pollHeartbeat = null;
-  let pollRenewing = null;
   const effOrigin = isRealPublicOrigin(opts.origin)
     ? opts.origin
     : (isRealPublicOrigin(creds.relay_origin) ? creds.relay_origin : lastKnownPublicOrigin);
   const currentHop = parseInt(opts.relayHop, 10) || 0;
-  pollHeartbeat = setInterval(() => {
-    if (lockReleased || pollRenewing) return;
-    pollRenewing = renewPollLock(env, longPollTimeoutMs + 4000).finally(() => { pollRenewing = null; });
-  }, Math.max(1000, Math.floor(pollLeaseMs(longPollTimeoutMs + 4000) / 3)));
-  if (pollHeartbeat && typeof pollHeartbeat.unref === 'function') pollHeartbeat.unref();
 
   const startUnlockAndRelay = async (shouldRelay) => {
     if (!lockReleased) {
       lockReleased = true;
-      if (pollHeartbeat) clearInterval(pollHeartbeat);
-      pollHeartbeat = null;
-      if (pollRenewing) await pollRenewing;
       await releasePollLock(env);
     }
     if (shouldRelay && opts.autoRelay && !relayTaskPromise) {
@@ -1572,8 +1440,8 @@ async function runWechatPollCycle(env, opts) {
         ? longPollTimeoutMs
         : Math.min(longPollTimeoutMs, Math.max(WX_MIN_FULL_POLL_MS, remainMs - 500));
 
-      if (round > 0 && !(await renewPollLock(env, pollTimeout + 4000))) {
-        throw new Error('微信轮询租约已丢失，本轮结果不能确认');
+      if (round > 0) {
+        await renewPollLock(env, pollTimeout + 4000);
       }
 
       const resp = await ilinkGetUpdates(creds.baseurl, creds.bot_token, cursor, chanVer, pollTimeout);
@@ -1591,8 +1459,8 @@ async function runWechatPollCycle(env, opts) {
       }
 
       if (resp && typeof resp.get_updates_buf === 'string' && resp.get_updates_buf) {
-        nextCursor = resp.get_updates_buf;
-        cursor = nextCursor;
+        cursor = resp.get_updates_buf;
+        await saveWxCursor(env, creds.ilink_bot_id, cursor);
       }
 
       const msgs = (resp && Array.isArray(resp.msgs)) ? resp.msgs : [];
@@ -1619,12 +1487,7 @@ async function runWechatPollCycle(env, opts) {
 
     if (pendingMsgs.length > 0) {
       const elapsedMs = Date.now() - cycleStartAt;
-      const dispatchResult = await dispatchOrProcessMessages(env, creds, pendingMsgs, effOrigin, elapsedMs, opts.ctx, nextCursor);
-      totalProcessed += dispatchResult.processed;
-      acknowledged = dispatchResult.acknowledged;
-    }
-    if (acknowledged && nextCursor !== (await getWxCursor(env, creds.ilink_bot_id))) {
-      acknowledged = await saveWxCursor(env, creds.ilink_bot_id, nextCursor);
+      totalProcessed += await dispatchOrProcessMessages(env, creds, pendingMsgs, effOrigin, elapsedMs, opts.ctx);
     }
 
     if (relayTaskPromise) {
@@ -1635,8 +1498,6 @@ async function runWechatPollCycle(env, opts) {
       ok: true,
       received: totalReceived,
       processed: totalProcessed,
-      acknowledged,
-      retry: !acknowledged,
       botId: creds.ilink_bot_id,
       userId: creds.ilink_user_id,
       lastPollAt: wxDiagMem.lastPollAt,
@@ -1657,9 +1518,7 @@ async function runWechatPollCycle(env, opts) {
       processed: totalProcessed,
     };
   } finally {
-    if (pollHeartbeat) clearInterval(pollHeartbeat);
     if (!lockReleased) {
-      if (pollRenewing) await pollRenewing;
       await releasePollLock(env);
     }
   }
@@ -1932,27 +1791,25 @@ async function handleWxWebhook(request, env, url, ctx) {
       });
     }
 
+    if (payload && typeof payload.get_updates_buf === 'string' && payload.get_updates_buf) {
+      await saveWxCursor(env, creds.ilink_bot_id, payload.get_updates_buf);
+    }
+
     const msgs = Array.isArray(payload && payload.msgs)
       ? payload.msgs
       : (payload && (payload.from_user_id || payload.user_id || payload.msg) ? [payload.msg || payload] : []);
 
     let processed = 0;
-    let acknowledged = true;
     for (const m of msgs) {
       try {
         const r = await processWechatMessage(env, creds, m);
         if (r && r.processed) processed += 1;
-        if (!r || r.ack !== true) acknowledged = false;
       } catch (e) {
-        acknowledged = false;
         console.log('Webhook 处理微信消息异常:', e);
       }
     }
-    if (acknowledged && payload && typeof payload.get_updates_buf === 'string' && payload.get_updates_buf) {
-      acknowledged = await saveWxCursor(env, creds.ilink_bot_id, payload.get_updates_buf);
-    }
 
-    return new Response(JSON.stringify({ ok: true, received: msgs.length, processed, acknowledged, retry: !acknowledged }), {
+    return new Response(JSON.stringify({ ok: true, received: msgs.length, processed }), {
       status: 200,
       headers: CORS_HEADERS,
     });
@@ -2061,34 +1918,38 @@ async function handleWxApi(request, env, url, ctx) {
   }
 
   if (request.method === 'POST' && path === '/api/wx/qrcode') {
+    const existing = await getWxCredentials(env, true);
+    if (existing && existing.source === 'env') {
+      return new Response(JSON.stringify({
+        ok: false,
+        error: '当前已通过环境变量 WX_BOT_TOKEN 固定绑定，Web 端扫码已锁定，无法覆盖。',
+      }), { status: 409, headers: CORS_HEADERS });
+    }
+    let body = {};
+    try { body = await request.json(); } catch (e) { body = {}; }
+    if (existing && existing.bot_token && !existing.expired && !body.force) {
+      return new Response(JSON.stringify({
+        ok: false,
+        code: 'ALREADY_BOUND',
+        error: '当前已绑定微信账号（' + (existing.ilink_user_id || existing.ilink_bot_id) + '）。为防误覆盖，请先点击「解绑」后再重新扫码。',
+      }), { status: 409, headers: CORS_HEADERS });
+    }
     try {
-      return await withCoordinationLock(env, 'wx:binding', async () => {
-        const existing = await getWxCredentials(env, true);
-        if (existing && existing.bot_token) {
-          return new Response(JSON.stringify({
-            ok: false,
-            code: 'ALREADY_BOUND',
-            error: existing.source === 'env'
-              ? '当前已通过环境变量 WX_BOT_TOKEN 固定绑定，Web 端扫码已锁定，无法覆盖。'
-              : '当前已绑定微信账号（' + (existing.ilink_user_id || existing.ilink_bot_id) + '）。Bind-Once 已启用，请先点击「解绑」后再重新扫码。',
-          }), { status: 409, headers: CORS_HEADERS });
-        }
-        const qrData = await ilinkGetQrCode(defaultBase, chanVer, 12000);
-        if (!qrData || !qrData.qrcode) {
-          return new Response(JSON.stringify({
-            ok: false,
-            error: '微信 iLink 未返回有效二维码：' + JSON.stringify(qrData || {}),
-          }), { status: 502, headers: CORS_HEADERS });
-        }
-        wxQrRedirectNodes.set(qrData.qrcode, defaultBase);
+      const qrData = await ilinkGetQrCode(defaultBase, chanVer, 12000);
+      if (!qrData || !qrData.qrcode) {
         return new Response(JSON.stringify({
-          ok: true,
-          qrcode: qrData.qrcode,
-          qrcode_img_content: qrData.qrcode_img_content || '',
-          base_url: defaultBase,
-          ret: qrData.ret ?? 0,
-        }), { status: 200, headers: CORS_HEADERS });
-      }, { leaseMs: 30000, waitMs: 15000 });
+          ok: false,
+          error: '微信 iLink 未返回有效二维码：' + JSON.stringify(qrData || {}),
+        }), { status: 502, headers: CORS_HEADERS });
+      }
+      wxQrRedirectNodes.set(qrData.qrcode, defaultBase);
+      return new Response(JSON.stringify({
+        ok: true,
+        qrcode: qrData.qrcode,
+        qrcode_img_content: qrData.qrcode_img_content || '',
+        base_url: defaultBase,
+        ret: qrData.ret ?? 0,
+      }), { status: 200, headers: CORS_HEADERS });
     } catch (e) {
       return new Response(JSON.stringify({
         ok: false,
@@ -2133,45 +1994,35 @@ async function handleWxApi(request, env, url, ctx) {
           }), { status: 403, headers: CORS_HEADERS });
         }
 
-        return await withCoordinationLock(env, 'wx:binding', async () => {
-          const existing = await getWxCredentials(env, true);
-          if (existing && existing.bot_token) {
-            return new Response(JSON.stringify({
-              ok: false,
-              status: 'rejected',
-              code: 'ALREADY_BOUND',
-              error: '当前已绑定微信账号，confirmed 状态也不能覆盖；请先解绑再重新扫码。',
-            }), { status: 409, headers: CORS_HEADERS });
-          }
-          const finalBaseUrl = normalizeBaseUrl(st.redirect_baseurl || st.baseurl || targetBase || defaultBase);
-          const newCreds = {
-            bot_token: st.bot_token,
-            ilink_bot_id: st.ilink_bot_id || (st.bot_token.includes(':') ? st.bot_token.split(':')[0] : 'wx_bot'),
-            ilink_user_id: st.ilink_user_id || '',
-            baseurl: finalBaseUrl,
-            cdn_url: String((env && env.WX_CDN_BASE_URL) || DEFAULT_ILINK_CDN_URL).trim(),
-            expired: false,
-            errmsg: '',
-            updated_at: new Date().toISOString(),
-            relay_origin: origin,
-          };
-          const savedOk = await saveWxCredentials(env, newCreds);
-          await saveWxCursor(env, newCreds.ilink_bot_id, '');
-          await ilinkNotifyStart(newCreds.baseurl, newCreds.bot_token, chanVer, 6000);
-          await wxRecordDiag(env, 'login', `扫码绑定成功 (${newCreds.ilink_user_id || newCreds.ilink_bot_id})，后台自接力守护已启动`, newCreds.ilink_user_id, true);
-          wxQrRedirectNodes.delete(qrcode);
-          kickWxAutoDaemon(env, ctx, origin);
-          return new Response(JSON.stringify({
-            ok: true,
-            status: 'confirmed',
-            persisted: savedOk,
-            r2Bound: !!(env && env.R2),
-            botId: newCreds.ilink_bot_id,
-            userId: newCreds.ilink_user_id,
-            baseUrl: newCreds.baseurl,
-            maskedToken: maskToken(newCreds.bot_token),
-          }), { status: 200, headers: CORS_HEADERS });
-        }, { leaseMs: 30000, waitMs: 15000 });
+        const finalBaseUrl = normalizeBaseUrl(st.redirect_baseurl || st.baseurl || targetBase || defaultBase);
+        const newCreds = {
+          bot_token: st.bot_token,
+          ilink_bot_id: st.ilink_bot_id || (st.bot_token.includes(':') ? st.bot_token.split(':')[0] : 'wx_bot'),
+          ilink_user_id: st.ilink_user_id || '',
+          baseurl: finalBaseUrl,
+          cdn_url: String((env && env.WX_CDN_BASE_URL) || DEFAULT_ILINK_CDN_URL).trim(),
+          expired: false,
+          errmsg: '',
+          updated_at: new Date().toISOString(),
+        };
+        const savedOk = await saveWxCredentials(env, newCreds);
+        await saveWxCursor(env, newCreds.ilink_bot_id, '');
+        newCreds.relay_origin = origin;
+        await saveWxCredentials(env, newCreds);
+        await ilinkNotifyStart(newCreds.baseurl, newCreds.bot_token, chanVer, 6000);
+        await wxRecordDiag(env, 'login', `扫码绑定成功 (${newCreds.ilink_user_id || newCreds.ilink_bot_id})，后台自接力守护已启动`, newCreds.ilink_user_id, true);
+        wxQrRedirectNodes.delete(qrcode);
+        kickWxAutoDaemon(env, ctx, origin);
+        return new Response(JSON.stringify({
+          ok: true,
+          status: 'confirmed',
+          persisted: savedOk,
+          r2Bound: !!(env && env.R2),
+          botId: newCreds.ilink_bot_id,
+          userId: newCreds.ilink_user_id,
+          baseUrl: newCreds.baseurl,
+          maskedToken: maskToken(newCreds.bot_token),
+        }), { status: 200, headers: CORS_HEADERS });
       }
       return new Response(JSON.stringify({
         ok: true,

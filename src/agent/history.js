@@ -13,48 +13,9 @@
 const HISTORY_MAX_MSGS = 40;
 const HISTORY_MSG_MAX_CHARS = 20000;
 const HISTORY_TOTAL_MAX_CHARS = 60000;
-// 图片按 data URL / 远程 URL 的实际字符数计量，不能用固定估值绕过总预算。
-// 这些常量同时供主线程在解析请求体前做 payload 硬限制。
-const HISTORY_MAX_IMAGES = 4;
-const HISTORY_IMAGE_MAX_CHARS = 24000;
-const HISTORY_IMAGE_TOTAL_MAX_CHARS = 40000;
-const HISTORY_IMAGE_URL_MAX_CHARS = 2048;
 
-function imageUrlOf(part) {
-  const value = part && part.image_url;
-  if (typeof value === 'string') return value.trim();
-  if (value && typeof value === 'object' && typeof value.url === 'string') return value.url.trim();
-  return '';
-}
-
-// 返回规范化后的 URL；非法协议、畸形 base64 或超限图片一律返回空串。
-function sanitizeImageUrl(part) {
-  const url = imageUrlOf(part);
-  if (!url) return '';
-  if (/^data:/i.test(url)) {
-    if (url.length > HISTORY_IMAGE_MAX_CHARS) return '';
-    const comma = url.indexOf(',');
-    if (comma < 0) return '';
-    const head = url.slice(0, comma);
-    const payload = url.slice(comma + 1);
-    if (!/^data:image\/[a-z0-9.+-]+;base64$/i.test(head)) return '';
-    if (!payload || payload.length % 4 !== 0 || !/^[a-z0-9+/]*={0,2}$/i.test(payload)) return '';
-    return url;
-  }
-  if (url.length > HISTORY_IMAGE_URL_MAX_CHARS) return '';
-  try {
-    const parsed = new URL(url);
-    if (parsed.protocol !== 'https:') return '';
-  } catch (e) {
-    return '';
-  }
-  return url;
-}
-
-// 多模态片段白名单：只放行文本与图片，其余（audio / file / 未知 type）一律丢弃。
-// budget 在一次 sanitizeHistory 中共享，因此数量与累计长度限制覆盖整段历史，而非仅单条消息。
-function sanitizeContent(content, budget) {
-  const imageBudget = budget || { count: 0, chars: 0 };
+// 多模态片段白名单：只放行文本与图片，其余（audio / file / 未知 type）一律丢弃
+function sanitizeContent(content) {
   if (Array.isArray(content)) {
     const parts = [];
     for (const p of content) {
@@ -62,19 +23,8 @@ function sanitizeContent(content, budget) {
       if (p.type === 'text' && typeof p.text === 'string') {
         const t = p.text.length > HISTORY_MSG_MAX_CHARS ? p.text.slice(0, HISTORY_MSG_MAX_CHARS) : p.text;
         if (t.trim()) parts.push({ type: 'text', text: t });
-      } else if (p.type === 'image_url') {
-        if (imageBudget.count >= HISTORY_MAX_IMAGES) continue;
-        const url = sanitizeImageUrl(p);
-        if (!url || url.length > HISTORY_IMAGE_MAX_CHARS) continue;
-        if (imageBudget.chars + url.length > HISTORY_IMAGE_TOTAL_MAX_CHARS) continue;
-        const imageUrl = { url };
-        const raw = p.image_url;
-        if (raw && typeof raw === 'object' && /^(auto|low|high)$/.test(raw.detail || '')) {
-          imageUrl.detail = raw.detail;
-        }
-        parts.push({ type: 'image_url', image_url: imageUrl });
-        imageBudget.count += 1;
-        imageBudget.chars += url.length;
+      } else if (p.type === 'image_url' && p.image_url) {
+        parts.push(p);
       }
     }
     return parts.length ? parts : null;
@@ -90,30 +40,17 @@ function sanitizeContent(content, budget) {
   return s;
 }
 
-function contentChars(content) {
-  if (typeof content === 'string') return content.length;
-  if (!Array.isArray(content)) return 0;
-  let total = 0;
-  for (const p of content) {
-    if (!p || typeof p !== 'object') continue;
-    if (p.type === 'text' && typeof p.text === 'string') total += p.text.length;
-    else if (p.type === 'image_url') total += imageUrlOf(p).length;
-  }
-  return total;
-}
-
 // 清洗外部历史。返回可直接拼进 Agent 上下文的消息数组（不含 system）。
 function sanitizeHistory(history, opts) {
   const maxMsgs = (opts && opts.maxMsgs > 0) ? opts.maxMsgs : HISTORY_MAX_MSGS;
   const list = Array.isArray(history) ? history : [];
   const out = [];
-  const imageBudget = { count: 0, chars: 0 };
   for (const m of list) {
     if (!m || typeof m !== 'object') continue;
     // 角色白名单：system 一律丢弃（Agent 的系统提示只能由服务端构造），tool 也不行
     const role = m.role === 'user' ? 'user' : (m.role === 'assistant' ? 'assistant' : '');
     if (!role) continue;
-    const content = sanitizeContent(m.content, imageBudget);
+    const content = sanitizeContent(m.content);
     if (content === null) continue;
     const prev = out.length ? out[out.length - 1] : null;
     if (prev && prev.role === role) {
@@ -145,12 +82,15 @@ function sanitizeHistory(history, opts) {
   // 裁完可能又从 assistant 开头，再修一次
   while (trimmed.length && trimmed[0].role !== 'user') trimmed.shift();
 
-  // 总字符上限：图片也按保留下来的完整 URL 实际长度计费，从最旧的一轮开始丢。
+  // 总字符上限：从最旧的一轮开始丢，保持「user 开头、按轮交替」
   let total = 0;
-  for (const m of trimmed) total += contentChars(m.content);
+  for (const m of trimmed) {
+    total += typeof m.content === 'string' ? m.content.length : 256;
+  }
   let cut = 0;
   while (cut < trimmed.length && total > HISTORY_TOTAL_MAX_CHARS) {
-    total -= contentChars(trimmed[cut].content);
+    const m = trimmed[cut];
+    total -= typeof m.content === 'string' ? m.content.length : 256;
     cut += 1;
   }
   if (cut > 0) {
@@ -180,10 +120,6 @@ export {
   HISTORY_MAX_MSGS,
   HISTORY_MSG_MAX_CHARS,
   HISTORY_TOTAL_MAX_CHARS,
-  HISTORY_MAX_IMAGES,
-  HISTORY_IMAGE_MAX_CHARS,
-  HISTORY_IMAGE_TOTAL_MAX_CHARS,
-  HISTORY_IMAGE_URL_MAX_CHARS,
   sanitizeHistory,
   sanitizeContent,
   lastUserText,

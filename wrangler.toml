@@ -22,14 +22,6 @@ keep_vars = true
 binding = "R2"
 # bucket_name = "cloudflare-chat-r2"
 
-# 跨 isolate 的读改写锁与微信长轮询租约。每个逻辑锁名映射到一个 Durable Object。
-[durable_objects]
-bindings = [{ name = "COORDINATOR", class_name = "Coordination" }]
-
-[[migrations]]
-tag = "v1"
-new_classes = ["Coordination"]
-
 # ============================================================
 # 定时触发器（Cron Triggers）：驱动微信 ClawBot (iLink) 后台长轮询收发消息
 # ============================================================

@@ -204,37 +204,3 @@ test('expandIPv6Groups 对非法输入返回 null', () => {
   assert.equal(expandIPv6Groups('gggg::1'), null);
   assert.equal(expandIPv6Groups('2001:db8::1/64'), null); // 带前缀长度
 });
-
-// ==================== 全项目不得出现 redirect: 'follow' ====================
-// 这是一条"卫生"断言，但它挡住的是一个真实发生过的问题：
-// tools-web 已经改成手动逐跳校验了，wechat/handler 下载生成图片那条路径却还留着
-// redirect:'follow' 且完全不校验 host —— 而那条路径的 URL 来自上游生图接口的响应，
-// 同样不可信。人眼逐个文件 grep 会漏，所以让测试替我们盯着。
-test('源码中不存在 redirect: follow（所有对外抓取必须逐跳校验）', async () => {
-  const fs = await import('node:fs');
-  const path = await import('node:path');
-
-  const walk = (dir, out = []) => {
-    for (const name of fs.readdirSync(dir)) {
-      const p = path.join(dir, name);
-      const st = fs.statSync(p);
-      if (st.isDirectory()) walk(p, out);
-      else if (name.endsWith('.js')) out.push(p);
-    }
-    return out;
-  };
-
-  const root = path.resolve(import.meta.dirname, '..');
-  const files = walk(path.join(root, 'src')).concat([path.join(root, '_worker.js')]);
-  const offenders = [];
-  for (const f of files) {
-    const src = fs.readFileSync(f, 'utf8');
-    // 只看真实代码：排除注释行
-    for (const line of src.split('\n')) {
-      const trimmed = line.trim();
-      if (trimmed.startsWith('//') || trimmed.startsWith('*')) continue;
-      if (/redirect:\s*'follow'/.test(line)) offenders.push(path.relative(root, f) + ' → ' + trimmed);
-    }
-  }
-  assert.deepEqual(offenders, [], '以下位置仍在使用 redirect:follow：\n' + offenders.join('\n'));
-});

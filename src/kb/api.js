@@ -12,7 +12,7 @@
 //    有各自的文案（前者指向"去控制台绑 R2"，后者才是"读取失败"），不要混成一条。
 import { denyUnauthorized } from '../auth.js';
 import { CORS_HEADERS } from '../constants.js';
-import { kbGetRegistryWithMeta } from './registry.js';
+import { kbGetRegistry, kbTakeRepairCount } from './registry.js';
 
 // 与 toolListDocs 的上限保持一致：按更新时间倒序取最近 60 篇。
 // 前端会显示"共 N 篇（按更新时间显示最近 60 篇）"，不会让人误以为库里只有这些。
@@ -45,16 +45,12 @@ async function handleKbList(request, env) {
   }
 
   let reg = [];
-  let repaired = 0;
   try {
-    // repaired 由本次调用自己返回，不读模块级计数器 ——
-    // 后者在多用户共用 isolate 时会把别人的修复数字显示给你
-    const got = await kbGetRegistryWithMeta(env, { verify: true });
-    reg = got.reg;
-    repaired = got.repaired;
+    reg = await kbGetRegistry(env, { verify: true });
   } catch (e) {
     return kbJson({ ok: false, error: (e && e.message) || '读取知识库索引失败' }, 500);
   }
+  const repaired = kbTakeRepairCount();
 
   const ordered = reg.slice().sort((a, b) => {
     const ta = Date.parse(a.updated_at || '') || 0;
