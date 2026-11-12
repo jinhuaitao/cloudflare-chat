@@ -19,6 +19,7 @@
 
 import { memTokens as memoryTokens } from '../memory/layers.js';
 import { memoryPromptBlock } from '../memory/index.js';
+import { personaPromptBlock } from './personas.js';
 
 // Intl.DateTimeFormat 在 Workers 里构造较慢，按实例缓存复用
 let cachedFmt = null;
@@ -47,13 +48,14 @@ function factTokens(fact) {
   return set;
 }
 
-// 稳定前缀只取决于三个开关量：是否只读端 / 是否有知识库文档 / 知识库列表是否已知，
-// 一共 8 种组合。按组合缓存后：每轮省掉约 2.5KB 的重复字符串拼接，
+// 稳定前缀只取决于四个开关量：是否只读端 / 是否有知识库文档 / 知识库列表是否已知 / 专家人格，
+// 组合数有限。按组合缓存后：每轮省掉约 2.5KB 的重复字符串拼接，
 // 同时保证同一端发往上游的 system 前缀字节级稳定（上游前缀缓存命中的前提）。
 const stablePrefixCache = new Map();
 
-function buildStablePrefix(kbReadOnly, hasKb, kbListKnown) {
-  const cacheKey = (kbReadOnly ? '1' : '0') + (hasKb ? '1' : '0') + (kbListKnown ? '1' : '0');
+function buildStablePrefix(kbReadOnly, hasKb, kbListKnown, persona) {
+  const personaKey = persona && persona.prompt ? persona.id : '';
+  const cacheKey = (kbReadOnly ? '1' : '0') + (hasKb ? '1' : '0') + (kbListKnown ? '1' : '0') + '|' + personaKey;
   const hit = stablePrefixCache.get(cacheKey);
   if (hit) return hit;
 
@@ -65,6 +67,10 @@ function buildStablePrefix(kbReadOnly, hasKb, kbListKnown) {
     + '3. 不编造：工具没给的信息一律说"未查到"；数字、日期、价格、版本号、链接只能来自工具结果或知识库原文。关键数字与结论尽量用两个独立来源交叉印证；来源冲突时取更权威或更新的，并在回答中说明分歧。\n'
     + '4. 不空转：同一工具同一参数不要反复调用；失败就换关键词或换工具，换过一次仍失败就停止调用、基于已有信息作答。\n'
     + '5. 不暴露实现：最终回答里不出现函数名、参数 JSON、调用标记或"我将调用…"之类的过程描述。\n\n';
+
+  // 专家人格：只注入一段工作方式与输出契约。
+  // 放在铁律之后、工具速查之前 —— 人格只调侧重点，不能覆盖上面的硬约束。
+  p += personaPromptBlock(persona);
 
   const lines = [];
   // 搜索关键词策略：英文技术词在主流搜索引擎的召回质量明显更好，时效词带年份能压住旧文
@@ -108,13 +114,14 @@ function buildStablePrefix(kbReadOnly, hasKb, kbListKnown) {
 // 构建 Agent 系统提示词
 // memoryBundle 为三层记忆的加载结果（memory/index.js 的 memoryLoad 返回值）。
 // 传入时走三层渲染；不传时退回旧版单层「长期记忆」渲染——老调用方与老测试不受影响。
-function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly, memoryBundle) {
+// persona 为 personas.js 的人格对象；不传或传通用人格时不注入角色段（与旧版字节一致）。
+function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly, memoryBundle, persona) {
   const kbList = Array.isArray(kbDocs) ? kbDocs.filter(e => e && (e.title || e.file)) : [];
   const hasKb = kbList.length > 0;
   const hasMemory = !!memoryBundle;
 
-  // ---------- 稳定前缀：同一模型、同一端、同一轮里字节不变 ----------
-  let p = buildStablePrefix(kbReadOnly, hasKb, Array.isArray(kbDocs));
+  // ---------- 稳定前缀：同一模型、同一端、同一人格、同一轮里字节不变 ----------
+  let p = buildStablePrefix(kbReadOnly, hasKb, Array.isArray(kbDocs), persona);
 
   // ---------- 动态尾部：以下内容逐轮变化，放在最后以免影响前缀复用 ----------
   if (hasKb) {

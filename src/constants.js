@@ -19,6 +19,10 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json 与 README.md 的版本号，
 // CI 会用 npm run check 校验三处一致，防止文档与代码再次脱节）
+// 7.13.0：专家人格层（7 个角色：研究/编程/写作/分析/运维/教学/通用，各自带工作方式、输出契约、
+//         工具白名单与步数/上下文预算；关键词+结构特征确定性路由，零额外往返且可单测；
+//         显式 /agent <id> 固定、/agent auto 自动、/agent list 查看，微信支持中文口令；
+//         人格段按桶缓存保住上游前缀缓存，断点存档携带 personaId；工具首次失败附确定性替代路径）。
 // 7.12.1：Agent 准确率专项（铁律新增关键数字双源交叉印证与来源冲突取舍规则、搜索关键词
 //         语言/年份策略进提示词与工具描述、AGENT_TEMPERATURE 可选低温采样仅对 Agent 步骤生效、
 //         收尾作答强制原样引用工具数字并说明来源分歧、搜索结果按归一化 URL 去重防伪多源）。
@@ -47,7 +51,7 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 //        断点起点修正、流式读取不阻塞、抓取失败语义统一）。
 // 7.5.0：Agent 内核加固（工具并发闸门、预算感知超时、步数感知收束、双保险空转熔断、
 //        历史轮次压缩）+ 工具箱新增 JSON/正则动作 + 全量回归测试。
-const APP_VERSION = '7.12.1';
+const APP_VERSION = '7.13.0';
 const PNG_HEADERS = {
   'Content-Type': 'image/png',
   'Cache-Control': 'public, max-age=86400',

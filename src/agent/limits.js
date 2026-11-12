@@ -5,11 +5,16 @@
 // 环境变量写错（负数、超大值）也没有兜底。现在所有 Agent 预算只有一个入口。
 
 // ==================== Telegram Agent：主循环限制与工具描述 ====================
-function agentLimits(env) {
+// persona 可选：只提供「默认预算」，显式配置的环境变量永远优先。
+// 调研类要多跑几步多读几篇，写作类给多了只会增加发散风险，预算跟着任务形态走。
+function agentLimits(env, persona) {
   env = env || {};
 
-  let maxSteps = parseInt(env.AGENT_MAX_STEPS || '6', 10);
-  if (!(maxSteps > 0)) maxSteps = 6;
+  let maxSteps = parseInt(env.AGENT_MAX_STEPS, 10);
+  if (!(maxSteps > 0)) {
+    maxSteps = parseInt(persona && persona.maxSteps, 10);
+    if (!(maxSteps > 0)) maxSteps = 6;
+  }
   if (maxSteps > 12) maxSteps = 12;
 
   let timeoutMs = parseInt(env.AGENT_TIMEOUT_MS || '240000', 10);
@@ -28,8 +33,11 @@ function agentLimits(env) {
   if (toolConcurrency > 8) toolConcurrency = 8;
 
   // 单轮上下文字符预算：超出后自动折叠早期工具输出并压缩更早的历史轮次
-  let ctxBudget = parseInt(env.AGENT_CONTEXT_BUDGET || '24000', 10);
-  if (!(ctxBudget > 0)) ctxBudget = 24000;
+  let ctxBudget = parseInt(env.AGENT_CONTEXT_BUDGET, 10);
+  if (!(ctxBudget > 0)) {
+    ctxBudget = parseInt(persona && persona.ctxBudget, 10);
+    if (!(ctxBudget > 0)) ctxBudget = 24000;
+  }
   if (ctxBudget < 6000) ctxBudget = 6000;
   if (ctxBudget > 200000) ctxBudget = 200000;
 

@@ -62,6 +62,18 @@ function parseWxCommand(text) {
   if (/^(模式|切换模式|智能体|智能体模式|普通模式)$/.test(s)) {
     return { cmd: '/agent', rest: '' };
   }
+  // 专家人格（v7.13.0）：单独口令查看列表，带参口令切换角色。
+  // 「专家」整串单独出现时给列表而不是切模式——用户说专家，想看的肯定是角色清单。
+  if (/^(专家|专家列表|角色|角色列表|人格|人格列表)$/.test(s)) {
+    return { cmd: '/agent', rest: 'list' };
+  }
+  const expertMatch = /^(?:切换专家|使用专家|换个专家|专家切换|切换角色)[:：\s]+(.+)$/.exec(s);
+  if (expertMatch && expertMatch[1].trim()) {
+    return { cmd: '/agent', rest: expertMatch[1].trim() };
+  }
+  if (/^(自动选择专家|专家自动选择|专家自动|自动选专家)$/.test(s)) {
+    return { cmd: '/agent', rest: 'auto' };
+  }
   if (/^(清空|清空上下文|新对话|重置|重置对话|清空记忆上下文)$/.test(s)) {
     return { cmd: '/clear', rest: '' };
   }

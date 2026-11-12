@@ -39,12 +39,14 @@ import { truncateToolResult, readErrorBody, parseToolArguments, toolCallSignatur
 import { agentLimits, describeToolCall, toolResultCap } from './limits.js';
 import { agentSaveResumeState } from './resume.js';
 import { readUpstreamMessage } from './upstream.js';
-import { getAgentTools, execAgentTool, isToolFailureResult } from './tools.js';
+import { getAgentTools, execAgentTool, isToolFailureResult, failureRecoveryHint } from './tools.js';
 import { memoryLoad, memoryRecordTurn } from '../memory/index.js';
 import { buildAgentSystemPrompt } from './prompt.js';
 import { kbGetRegistry } from '../kb/registry.js';
 import { mapLimit } from '../utils.js';
 import { sanitizeHistory, lastUserText } from './history.js';
+import { agentGetPersona } from './mode.js';
+import { resolvePersona, personaById, personaAllowsTool, formatPersonaBadge, DEFAULT_PERSONA_ID } from './personas.js';
 
 const WRITE_TOOLS_SET = new Set(['remember', 'forget_memory', 'save_doc', 'delete_doc']);
 
@@ -162,19 +164,23 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
   }
   const query = lastUserText(safeHistory);
   const kbReadOnly = !!(opts && opts.kbReadOnly);
-  // 并发加载三层记忆与知识库文档注册表（各带兜底超时：R2 抖动不该拖住首字）。
+  // 并发加载三层记忆、知识库文档注册表与人格选择（各带兜底超时：R2 抖动不该拖住首字）。
   // v7.10.0：原来是"一次读长期记忆 + 一次读注册表"，现在 L1/L2/L3 三层在 memoryLoad
   // 内部并行读取，外层仍然只占一个等待位——多读两层不等于多等两轮。
+  // v7.13.0：人格也走同一个等待位，命中 L1 缓存时零成本，冷缓存时与另外两读重叠。
   const r2BudgetMs = Math.max(500, Math.min(3000, (opts && opts.r2BudgetMs) || 1500));
-  const [memoryBundle, kbDocs] = await Promise.all([
+  const [memoryBundle, kbDocs, savedPersona] = await Promise.all([
     withTimeout(memoryLoad(env, chatId, query, { readOnly: kbReadOnly }), r2BudgetMs, null),
-    withTimeout(kbGetRegistry(env), r2BudgetMs, null)
+    withTimeout(kbGetRegistry(env), r2BudgetMs, null),
+    withTimeout(agentGetPersona(env, chatId), r2BudgetMs, 'auto')
   ]);
   const hasKbDocs = Array.isArray(kbDocs) ? kbDocs.length > 0 : undefined;
+  // 显式指定（Web 请求体 / 本次调用参数）优先，其次是用户固定的人格，最后按提问自动路由
+  const persona = resolvePersona((opts && opts.persona) || savedPersona, query).persona;
   const systemPrompt = buildAgentSystemPrompt(
-    memoryBundle ? memoryBundle.longterm : [], query, kbDocs, kbReadOnly, memoryBundle
+    memoryBundle ? memoryBundle.longterm : [], query, kbDocs, kbReadOnly, memoryBundle, persona
   );
-  const tools = allowTools ? getAgentTools(kbReadOnly, { hasKbDocs }) : null;
+  const tools = allowTools ? getAgentTools(kbReadOnly, { hasKbDocs, persona }) : null;
   const messages = [{ role: 'system', content: systemPrompt }];
   for (const m of safeHistory) messages.push(m);
 
@@ -183,7 +189,9 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
   const result = await tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline,
     (opts && opts.resumeKey) || null, false, undefined,
     (opts && opts.onDelta) || null, (opts && opts.onReset) || null, kbReadOnly, origUserText,
-    hasKbDocs);
+    hasKbDocs, persona);
+  // 回传本次实际使用的人格：调用方可据此在回复里标一个角色徽标（Web 端也可选用）
+  if (result && typeof result === 'object') result.personaId = persona.id;
   await recordWorkingMemory(env, chatId, origUserText, result, opts);
   return result;
 }
@@ -212,22 +220,26 @@ async function recordWorkingMemory(env, chatId, userText, result, opts) {
 async function tgAgentResume(env, tgApi, chatId, saved, onProgress, opts) {
   const allowTools = !!saved.allowTools;
   const kbReadOnly = !!saved.kbReadOnly;
-  const tools = allowTools ? getAgentTools(kbReadOnly, { hasKbDocs: saved.hasKbDocs }) : null;
+  // 人格跟着存档走：恢复后不能因为自动路由换了个角色，导致工具集与提示词口径不一致。
+  // 旧存档没有 personaId，回落通用人格（与旧版行为一致）。
+  const persona = personaById(saved.personaId);
+  const tools = allowTools ? getAgentTools(kbReadOnly, { hasKbDocs: saved.hasKbDocs, persona }) : null;
   const deadline = tgAgentDeadline(env, opts);
   const baseLoopStartIdx = (typeof saved.loopStartIdx === 'number' && saved.loopStartIdx >= 0) ? saved.loopStartIdx : undefined;
   const result = await tgAgentRunLoop(env, tgApi, chatId, saved.targetModelId, saved.messages, tools, allowTools, onProgress, deadline,
     (opts && opts.resumeKey) || null, true, baseLoopStartIdx,
     (opts && opts.onDelta) || null, (opts && opts.onReset) || null, kbReadOnly, saved.origUserText || '',
-    saved.hasKbDocs);
+    saved.hasKbDocs, persona);
   await recordWorkingMemory(env, chatId, saved.origUserText || '', result, opts);
   return result;
 }
 
-async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume, baseLoopStartIdx, onDelta, onReset, kbReadOnly, origUserText, hasKbDocs) {
+async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume, baseLoopStartIdx, onDelta, onReset, kbReadOnly, origUserText, hasKbDocs, persona) {
   // 不原地修改调用方数组：断点存档的 messages 被 push 后就被污染了，
   // 同一份存档再跑一次（如 fallback 重试）会带着上一轮的 assistant/tool 消息，序列直接错乱
   messages = Array.isArray(messages) ? messages.slice() : [];
-  const limits = agentLimits(env);
+  persona = persona || personaById(DEFAULT_PERSONA_ID);
+  const limits = agentLimits(env, persona);
   const maxSteps = limits.maxSteps;
   const ctxBudget = limits.ctxBudget;
   const useUpstreamStream = env.AGENT_STREAM_UPSTREAM !== '0';
@@ -275,6 +287,8 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       v: 2, savedAt: Date.now(), chatId, targetModelId, allowTools,
       kbReadOnly: !!kbReadOnly,
       hasKbDocs: hasKbDocs,
+      // 人格跟着存档：恢复后工具集与提示词口径必须与暂停前一致
+      personaId: persona.id,
       messages: trimmed.messages,
       loopStartIdx: trimmed.loopStartIdx,
       origUserText: origUserText || ''
@@ -324,7 +338,8 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
     if (!debugStats) return;
     try {
       console.log('[agent-stats] ' + JSON.stringify({
-        model: targetModelId, steps: stats.steps, tools: stats.tools, fails: stats.fails,
+        model: targetModelId, persona: persona.id,
+        steps: stats.steps, tools: stats.tools, fails: stats.fails,
         ctxChars: stats.ctxChars, ctxMsgs: stats.ctxMsgs, toolsChars: toolsChars,
         ms: Date.now() - loopStartedAt, maxSteps: maxSteps, ctxBudget: ctxBudget
       }));
@@ -334,6 +349,7 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
   const callSigHistory = [];
   const sigCount = new Map();   // sig -> 本轮累计出现次数
   const turnToolMemo = new Map(); // sig -> { step, preview } 同轮只读工具记忆化去重
+  const hintedTools = new Set(); // 本轮已给过失败建议的工具（每个工具只提示一次，避免污染上下文）
   let toolFailStreak = 0;
   let failStreakNotified = false;
 
@@ -344,7 +360,8 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       return await pauseForResume();
     }
     const elapsedSec = Math.max(1, Math.round((Date.now() - loopStartedAt) / 1000));
-    const stepLabel = '🤖 Agent 思考中' + (isResume ? '（继续）' : '')
+    const who = persona.id === DEFAULT_PERSONA_ID ? '🤖 Agent' : formatPersonaBadge(persona);
+    const stepLabel = who + ' 思考中' + (isResume ? '（继续）' : '')
       + '（第 ' + (step + 1) + '/' + maxSteps + ' 步 · ' + elapsedSec + 's）…';
     fireProgress(stepLabel, false);
     try { tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {}); } catch (e) {}
@@ -564,6 +581,17 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
     const toolResults = await mapLimit(toolCalls, limits.toolConcurrency, async (tc, tcIdx) => {
       const fn = (tc && tc.function) || {};
       if (!fn.name) return { tc, result: '工具调用缺少名称，已跳过', failed: true, ms: 0 };
+      // 白名单是双向的：既决定 schema 发什么，也拦住模型凭记忆硬编出来的越界调用。
+      // 否则写作角色仍可能调用 net_lookup 之类不在上下文里的工具，白烧一次外部请求。
+      if (!personaAllowsTool(persona, fn.name)) {
+        return {
+          tc,
+          result: '工具 ' + fn.name + ' 不适用于当前专家角色（' + persona.emoji + ' ' + persona.name + '）。'
+            + '请改用当前可用工具，或直接基于已有信息作答。',
+          failed: true,
+          ms: 0
+        };
+      }
       // 参数先修复再执行：被截断的 JSON 修不好时直接判失败并告诉模型怎么改，
       // 避免拿 {} 去跑一次必然失败的工具，白烧一步与一份上下文
       const parsed = parseToolArguments(fn.arguments);
@@ -597,7 +625,16 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
         { timeoutMs: toolTimeoutCap, maxChars: Math.max(600, perToolCap - 160) });
       const ms = Math.max(1, Date.now() - t0);
       const failed = isToolFailureResult(result);
-      const truncated = truncateToolResult(result, perToolCap);
+      let truncated = truncateToolResult(result, perToolCap);
+      // 同一个工具本轮第一次失败时附一条确定性替代路径：模型看到「搜索失败」往往换个词原地再撞，
+      // 给一句「改用 wiki/github 直查」能把一次失败变成一次转向。只加一次，不撑上下文。
+      if (failed && !hintedTools.has(fn.name)) {
+        const hint = failureRecoveryHint(fn.name);
+        if (hint) {
+          hintedTools.add(fn.name);
+          truncated = truncated + '\n\n' + hint;
+        }
+      }
       if (isMemoizable && !failed) {
         turnToolMemo.set(sig, {
           step: step + 1,

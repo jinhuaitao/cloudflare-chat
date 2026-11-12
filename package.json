@@ -1,12 +1,12 @@
 {
   "name": "cloudflare-chat",
-  "version": "7.12.1",
+  "version": "7.13.0",
   "private": true,
   "type": "module",
   "engines": {
     "node": ">=22"
   },
-  "description": "Cloudflare Worker 上的多通道 AI 对话前端 + Telegram & 微信 ClawBot (iLink) 机器人（三层记忆 + 19 项零密钥 Agent 工具 + R2 知识库：写入模式/版本快照/标签检索）",
+  "description": "Cloudflare Worker 上的多通道 AI 对话前端 + Telegram & 微信 ClawBot (iLink) 机器人（7 位专家人格 + 三层记忆 + 19 项零密钥 Agent 工具 + R2 知识库：写入模式/版本快照/标签检索）",
   "scripts": {
     "test": "node --test \"test/**/*.test.mjs\"",
     "check": "node scripts/check-consistency.mjs",

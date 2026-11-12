@@ -21,7 +21,8 @@ import { getChannelConfig, resolveModelKey, buildAIRequest } from '../channel.js
 import { tgTrimHistory, tgGetHistory, tgSaveHistory, tgClearHistory } from '../tg-history.js';
 import { agentForgetMemory } from '../agent/memory.js';
 import { memoryReport, memoryClearSession, memoryStats } from '../memory/index.js';
-import { agentGetMode, agentSetMode } from '../agent/mode.js';
+import { agentGetMode, agentSetMode, agentGetPersona, agentSetPersona } from '../agent/mode.js';
+import { formatPersonaList, formatPersonaBadge, getPersona, personaById } from '../agent/personas.js';
 import { agentLoadResumeState, agentClearResumeState, tgAgentResumeKey } from '../agent/resume.js';
 import { tgAgentChat, tgAgentResume } from '../agent/loop.js';
 import { readErrorBody } from '../agent/stability.js';
@@ -850,6 +851,9 @@ async function processWechatMessage(env, creds, rawMsg) {
         + `• 「模型 2」或 /model 2 —— 切换到第 2 个模型\n`
         + `• 「画 宇航员猫咪」或 /draw —— 生成图片并直发微信原图\n`
         + `• 「模式」或 /agent —— 切换 Agent / 普通对话模式\n`
+        + `• 「专家列表」或 /agent list —— 查看 7 位专家人格\n`
+        + `• 「切换专家 编程」或 /agent coder —— 固定专家（研究/编程/写作/分析/运维/教学）\n`
+        + `• 「自动选择专家」或 /agent auto —— 恢复按问题自动匹配\n`
         + `• 「清空」或 /clear —— 清空对话上下文\n`
         + `• 「记忆」或 /memory —— 查看长期记忆（平时说「记住…」即可保存）\n`
         + `• 「忘掉 关键词」或 /forget —— 删除指定记忆\n`
@@ -871,6 +875,7 @@ async function processWechatMessage(env, creds, rawMsg) {
 
     if (cmd && cmd.cmd === '/status') {
       const useAgentNow = await agentGetMode(env, chatId);
+      const curPersona = await agentGetPersona(env, chatId);
       const st = await memoryStats(env, chatId);
       const hist = await tgGetHistory(env, chatId);
       await sendReply(
@@ -879,6 +884,7 @@ async function processWechatMessage(env, creds, rawMsg) {
         + `• 连接状态：🟢 在线正常\n`
         + `• 当前模型：${activeModelObj.name} (${activeModelObj.id})\n`
         + `• 对话模式：${useAgentNow ? '🤖 Agent 智能体模式' : '💬 普通对话模式'}\n`
+        + `• 当前专家：${curPersona === 'auto' ? '自动选择' : formatPersonaBadge(personaById(curPersona))}\n`
         + `• 上下文轮数：${Math.floor(hist.length / 2)} 轮（${hist.length} 条消息）\n`
         + `• L1 工作记忆：${st.l1Items} 个话题 / ${st.l1Pins} 条固定\n`
         + `• L2 长期记忆：${st.l2} 条｜L3 归档：${st.l3} 条\n`
@@ -963,12 +969,65 @@ async function processWechatMessage(env, creds, rawMsg) {
     }
 
     if (cmd && cmd.cmd === '/agent') {
-      const cur = await agentGetMode(env, chatId);
-      await agentSetMode(env, chatId, !cur);
+      const arg = String(cmd.rest || '').trim();
+      const argLower = arg.toLowerCase();
+
+      if (!arg) {
+        const cur = await agentGetMode(env, chatId);
+        await agentSetMode(env, chatId, !cur);
+        const curPersona = await agentGetPersona(env, chatId);
+        await sendReply(
+          !cur
+            ? '🤖 Agent 智能体模式已开启\n\n我会自主规划并调用 19 项工具（🔍 联网搜索、📄 网页抓取、🌐 维基百科、🐙 GitHub、📑 arXiv、📰 HN 热榜、💱 汇率/币价、🛰️ DNS、🧮 计算、🧰 工具箱、🌤 天气、🕐 时间），并支持 🧠 三层记忆（会话要点/长期事实/历史归档）与 📚 知识库文档读写。\n\n🧭 当前专家：' + formatPersonaBadge(personaById(curPersona)) + '\n发送「专家列表」查看全部，或「切换专家 编程」。'
+            : '💬 已切换为普通对话模式\n\n单轮直接问答，不调用工具、不使用长期记忆。如需切回请再发「模式」或 /agent。',
+          true
+        );
+        return { processed: true };
+      }
+
+      if (argLower === 'list' || argLower === '列表' || argLower === 'ls') {
+        const curPersona = await agentGetPersona(env, chatId);
+        await sendReply(formatPersonaList(curPersona, { auto: curPersona === 'auto' }), true);
+        return { processed: true };
+      }
+
+      if (argLower === 'auto' || argLower === '自动') {
+        const prev = await agentGetPersona(env, chatId);
+        await agentSetPersona(env, chatId, 'auto');
+        await sendReply(
+          '🧭 已恢复自动选择专家' + (prev !== 'auto' ? '（原为 ' + formatPersonaBadge(personaById(prev)) + '）' : '')
+            + '\n\n之后每轮按提问自动匹配，拿不准时用通用助手。发送「专家列表」查看全部。',
+          true
+        );
+        return { processed: true };
+      }
+
+      if (argLower === 'status' || argLower === '状态') {
+        const curPersona = await agentGetPersona(env, chatId);
+        const on = await agentGetMode(env, chatId);
+        await sendReply(
+          '🧭 Agent 模式：' + (on ? '已开启' : '已关闭（发「模式」开启）')
+            + '\n当前专家：' + (curPersona === 'auto' ? '自动选择' : formatPersonaBadge(personaById(curPersona))),
+          true
+        );
+        return { processed: true };
+      }
+
+      const picked = getPersona(argLower);
+      if (!picked) {
+        const curPersona = await agentGetPersona(env, chatId);
+        await sendReply('🤔 没有「' + arg + '」这个专家。\n\n' + formatPersonaList(curPersona, { auto: curPersona === 'auto' }), true);
+        return { processed: true };
+      }
+
+      await agentSetPersona(env, chatId, picked.id);
+      const wasOn = await agentGetMode(env, chatId);
+      if (!wasOn) await agentSetMode(env, chatId, true);
       await sendReply(
-        !cur
-          ? '🤖 Agent 智能体模式已开启\n\n我会自主规划并调用 19 项工具（🔍 联网搜索、📄 网页抓取、🌐 维基百科、🐙 GitHub、📑 arXiv、📰 HN 热榜、💱 汇率/币价、🛰️ DNS、🧮 计算、🧰 工具箱、🌤 天气、🕐 时间），并支持 🧠 三层记忆（会话要点/长期事实/历史归档）与 📚 知识库文档读写。'
-          : '💬 已切换为普通对话模式\n\n单轮直接问答，不调用工具、不使用长期记忆。如需切回请再发「模式」或 /agent。',
+        '✅ 已切换到 ' + picked.emoji + ' ' + picked.name + '（' + picked.id + '）'
+          + (wasOn ? '' : '，并已开启 Agent 模式')
+          + '\n\n' + picked.tagline + '。' + picked.useWhen + '。'
+          + '\n\n工具与预算已按该角色收敛；发「自动选择专家」可恢复自动。',
         true
       );
       return { processed: true };

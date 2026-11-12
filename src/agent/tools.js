@@ -359,13 +359,16 @@ const TOOL_DEFS = [
 const WRITE_TOOL_NAMES = ['remember', 'forget_memory', 'save_doc', 'delete_doc'];
 const KB_READ_TOOL_NAMES = ['list_docs', 'read_doc'];
 
-// 按「权限位 + 知识库是否为空」缓存过滤结果：Agent 一轮里每步都会用到它，
+// 按「权限位 + 知识库是否为空 + 专家人格」缓存过滤结果：Agent 一轮里每步都会用到它，
 // 反复重建 18 个对象纯属浪费；共享同一份也让发往上游的 tools 字节完全一致。
+// 人格白名单同时是省 token 的手段：写文案的那一轮不需要 DNS 诊断与汇率 schema。
 const toolsCache = new Map();
 
 function getAgentTools(kbReadOnly, opts) {
   const hasKbDocs = opts && typeof opts.hasKbDocs === 'boolean' ? (opts.hasKbDocs ? 'y' : 'n') : 'u';
-  const cacheKey = (kbReadOnly ? 'ro' : 'rw') + '|' + hasKbDocs;
+  const persona = opts && opts.persona ? opts.persona : null;
+  const personaKey = persona && Array.isArray(persona.tools) ? persona.id : '';
+  const cacheKey = (kbReadOnly ? 'ro' : 'rw') + '|' + hasKbDocs + '|' + personaKey;
   const hit = toolsCache.get(cacheKey);
   if (hit) return hit;
 
@@ -376,9 +379,34 @@ function getAgentTools(kbReadOnly, opts) {
   if (hasKbDocs === 'n') {
     filtered = filtered.filter(t => KB_READ_TOOL_NAMES.indexOf(t.function.name) === -1);
   }
+  if (personaKey) {
+    filtered = filtered.filter(t => persona.tools.indexOf(t.function.name) !== -1);
+  }
   toolsCache.set(cacheKey, filtered);
   return filtered;
 }
+
+// 失败后的下一步建议：模型看到一句「搜索失败」往往原地换个词再撞一次，
+// 给出确定性的替代路径能把一次失败变成一次转向，少烧一步与一份上下文。
+const FAILURE_HINTS = {
+  web_search: '下一步：把关键词改短、改具体（技术类用英文），或改用 wiki_lookup / github_lookup / arxiv_search 直查；仍失败就基于已有信息作答。',
+  web_fetch: '下一步：换一个可访问的来源（官方站、镜像、文档站），或先用 web_search 拿摘要再决定是否深读；不要对同一 URL 反复重试。',
+  wiki_lookup: '下一步：换用英文词条或 web_search；百科没有的实时信息本来就查不到，不要纠缠。',
+  github_lookup: '下一步：确认仓库名是 owner/repo 形式；不确定全名时改用 mode=search 按关键词搜。',
+  arxiv_search: '下一步：改用英文关键词或论文标题片段；仍无结果就用 web_search 找综述。',
+  exchange_rate: '下一步：确认货币代码是标准三位码（USD/CNY/BTC）；仍失败就说明实时行情暂不可用。',
+  net_lookup: '下一步：确认目标是域名或公网 IP；私网地址查不到归属属正常，直接说明即可。',
+  get_weather: '下一步：换成「城市名」而非区县/简称；仍失败就说明天气源暂不可用。',
+  calculate: '下一步：检查表达式是否含中文符号或未闭合括号；复杂式子拆成多条用 ; 分隔。',
+  toolkit: '下一步：核对 action 名称与必填参数（如 unit_convert 需要 value/from_unit/to_unit）。',
+  read_doc: '下一步：先用 list_docs 看准确标题，或换更短的关键词重读。',
+  save_doc: '下一步：确认 title 与 content 都不为空；写入失败要如实告诉用户，不要说已保存。',
+};
+
+function failureRecoveryHint(name) {
+  return FAILURE_HINTS[String(name || '')] || '';
+}
+
 
 async function execAgentTool(name, args, env, chatId, kbReadOnly, opts) {
   args = args || {};
@@ -474,4 +502,5 @@ export {
   isToolFailureResult,
   getAgentTools,
   execAgentTool,
+  failureRecoveryHint,
 };
