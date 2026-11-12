@@ -271,7 +271,7 @@ function uint8ToBase64(bytes) {
   return btoa(binary);
 }
 
-export async function handleTgWebhook(request, env) {
+export async function handleTgWebhook(request, env, ctx) {
   if (env.TG_WEBHOOK_SECRET) {
     const got = request.headers.get('X-Telegram-Bot-Api-Secret-Token') || '';
     if (!safeEqual(got, env.TG_WEBHOOK_SECRET)) {
@@ -865,7 +865,7 @@ export async function handleTgWebhook(request, env) {
           let webhookBudgetMs = parseInt(env.TG_WEBHOOK_BUDGET_MS || '55000', 10);
           if (!(webhookBudgetMs >= 10000)) webhookBudgetMs = 55000;
           if (webhookBudgetMs > 240000) webhookBudgetMs = 240000;
-          const agentOpts = { maxRuntimeMs: webhookBudgetMs, resumeKey: tgAgentResumeKey(chatId), origUserText: historyUserText };
+          const agentOpts = { maxRuntimeMs: webhookBudgetMs, resumeKey: tgAgentResumeKey(chatId), origUserText: historyUserText, ctx: ctx || null };
 
           if (useAgent) {
             let lastProgressEdit = 0;

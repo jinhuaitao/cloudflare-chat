@@ -33,11 +33,16 @@ function wordMatcher(word) {
   return re;
 }
 
-function hitWord(text, word) {
-  const w = String(word || '').toLowerCase();
-  if (!w) return false;
-  const re = wordMatcher(w);
-  return re ? re.test(text) : text.indexOf(w) !== -1;
+// 词表在模块加载时预编译一次：每条消息路由时要过 ~150 个词，
+// 旧版每个词都重复 String().toLowerCase() + Map 查找，纯属浪费
+function compileWords(list) {
+  const out = [];
+  for (const raw of list || []) {
+    const w = String(raw || '').toLowerCase();
+    if (!w) continue;
+    out.push({ w, re: wordMatcher(w) });
+  }
+  return out;
 }
 
 // ==================== 人格定义 ====================
@@ -205,6 +210,12 @@ const DEFAULT_PERSONA_ID = 'general';
 const PERSONA_IDS = PERSONAS.map(p => p.id);
 const PERSONA_MAP = new Map(PERSONAS.map(p => [p.id, p]));
 
+// 词表预编译挂到人格定义上（下划线前缀，外部不应读取）
+for (const p of PERSONAS) {
+  p._strong = compileWords(p.strong);
+  p._weak = compileWords(p.weak);
+}
+
 // 硬技术名词：出现时认为提问对象是具体技术栈，而非通识概念
 const HARD_TECH_WORDS = new Set(['python', 'javascript', 'typescript', 'node', 'golang', 'rust',
   'java', 'kotlin', 'swift', 'php', 'sql', 'react', 'vue', 'css', 'html', 'npm', 'git',
@@ -241,17 +252,18 @@ function listPersonas() {
   return PERSONAS.slice();
 }
 
-// 打分：强信号 3 分 / 弱信号 1 分 / 结构特征按权重加
-function scorePersona(persona, text) {
-  const t = String(text || '').toLowerCase();
+// 打分（t 必须已转小写）：强信号 3 分 / 弱信号 1 分 / 结构特征按权重加
+function scorePersonaLower(persona, t) {
   if (!t) return { score: 0, matched: [] };
   let score = 0;
   const matched = [];
-  for (const w of persona.strong || []) {
-    if (hitWord(t, w)) { score += 3; matched.push(w); }
+  const strong = persona._strong || compileWords(persona.strong);
+  const weak = persona._weak || compileWords(persona.weak);
+  for (const cw of strong) {
+    if (cw.re ? cw.re.test(t) : t.indexOf(cw.w) !== -1) { score += 3; matched.push(cw.w); }
   }
-  for (const w of persona.weak || []) {
-    if (hitWord(t, w)) { score += 1; matched.push(w); }
+  for (const cw of weak) {
+    if (cw.re ? cw.re.test(t) : t.indexOf(cw.w) !== -1) { score += 1; matched.push(cw.w); }
   }
   for (const p of persona.patterns || []) {
     if (p && p.re && p.re.test(t)) { score += p.score || 0; matched.push(p.why || 'pattern'); }
@@ -259,12 +271,22 @@ function scorePersona(persona, text) {
   return { score, matched };
 }
 
-// 自动路由：命中不足或前两名同分（意图不明确）时回落通用人格
-function routePersona(text) {
-  const ranked = PERSONAS
+// 对外打分入口（测试与调试用）：内部转小写后走共享实现
+function scorePersona(persona, text) {
+  return scorePersonaLower(persona, String(text || '').toLowerCase());
+}
+
+// 全部非通用人格一次性打分并降序排列；提问只转一次小写（旧版每个角色转一次）
+function rankPersonas(text) {
+  const t = String(text || '').toLowerCase();
+  return PERSONAS
     .filter(p => p.id !== DEFAULT_PERSONA_ID)
-    .map(p => ({ persona: p, ...scorePersona(p, text) }))
+    .map(p => ({ persona: p, ...scorePersonaLower(p, t) }))
     .sort((a, b) => b.score - a.score);
+}
+
+// 从已排序的打分明细出裁决：命中不足或前两名同分（意图不明确）时回落通用人格
+function decideRoute(ranked) {
   const top = ranked[0];
   const second = ranked[1];
   if (!top || top.score < MIN_SCORE) {
@@ -284,6 +306,11 @@ function routePersona(text) {
   return { persona: top.persona, source: 'auto', score: top.score, matched: top.matched, reason: 'matched' };
 }
 
+// 自动路由：命中不足或前两名同分（意图不明确）时回落通用人格
+function routePersona(text) {
+  return decideRoute(rankPersonas(text));
+}
+
 // 统一入口：显式指定（manual）优先，'auto'/空值走路由
 function resolvePersona(explicitId, text) {
   const raw = String(explicitId || '').trim().toLowerCase();
@@ -298,13 +325,11 @@ function resolvePersona(explicitId, text) {
 // 路由器是确定性的：同一句话任何时候重算结果都一样，所以「为什么这么选」
 // 不需要存状态——把最后一句话重新打一遍分就能完整复盘，调词表时也能直接验证。
 
-// 完整打分明细：每个角色得分 + 命中词，外加最终裁决与阈值
+// 完整打分明细：每个角色得分 + 命中词，外加最终裁决与阈值。
+// 与 routePersona 共享同一份打分（旧版打两遍，纯浪费）
 function explainRoute(text) {
-  const ranked = PERSONAS
-    .filter(p => p.id !== DEFAULT_PERSONA_ID)
-    .map(p => ({ persona: p, ...scorePersona(p, text) }))
-    .sort((a, b) => b.score - a.score);
-  return { ranked, decision: routePersona(text), minScore: MIN_SCORE };
+  const ranked = rankPersonas(text);
+  return { ranked, decision: decideRoute(ranked), minScore: MIN_SCORE };
 }
 
 const ROUTE_REASON_TEXT = {

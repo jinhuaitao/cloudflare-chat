@@ -218,7 +218,15 @@ async function recordWorkingMemory(env, chatId, userText, result, opts) {
   try {
     // 900ms 上限：一次 wmGet（通常命中内存缓存）+ 一次 R2 put，正常 50ms 内完成。
     // 超时就让写入在后台继续，绝不为了记一条要点把用户的首字/尾字拖慢。
-    await withTimeout(memoryRecordTurn(env, chatId, userText || '', text), 900, null);
+    const write = withTimeout(memoryRecordTurn(env, chatId, userText || '', text), 900, null);
+    // v7.13.1：拿到执行上下文就挂到 waitUntil —— 记忆写入与「把最终答案发给用户」彻底解耦，
+    // 每轮省掉一次 R2 写入的串行等待（TG/微信/webhook 均适用）；没有 ctx 时（如单测）保持原样串行。
+    const ctx = opts && opts.ctx;
+    if (ctx && typeof ctx.waitUntil === 'function') {
+      try { ctx.waitUntil(write); } catch (e) {}
+      return;
+    }
+    await write;
   } catch (e) {}
 }
 

@@ -465,6 +465,44 @@ test('主循环首步进度带路由命中词，结果回传路由依据', async
   }
 });
 
+// ==================== v7.13.1 性能 ====================
+test('拿到 ctx 时记忆写入挂 waitUntil，不在返回前串行等待', async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => sse([{ choices: [{ delta: { content: '好的。' } }] }]);
+  try {
+    resetChannelConfigCache();
+    const waited = [];
+    const ctx = { waitUntil(p) { waited.push(p); } };
+    const r = await tgAgentChat(ENV, noopTgApi, 'p_chat7', 'mock-model',
+      [{ role: 'user', content: '你好' }], true, null,
+      { maxRuntimeMs: 30000, ctx, workingMemory: true });
+    assert.ok(r.text.includes('好的'));
+    assert.equal(waited.length, 1, '记忆写入应被托管给运行时（waitUntil），而不是阻塞返回');
+    await waited[0]; // 收尾，避免悬挂 promise
+    // 不传 ctx 时保持串行语义（老调用方与单测依赖这个行为）
+    const r2 = await tgAgentChat(ENV, noopTgApi, 'p_chat8', 'mock-model',
+      [{ role: 'user', content: '你好' }], true, null, { maxRuntimeMs: 30000, workingMemory: true });
+    assert.ok(r2.text.includes('好的'));
+  } finally {
+    globalThis.fetch = original;
+    resetChannelConfigCache();
+  }
+});
+
+test('路由打分性能护栏：预编译词表 + 单次小写，1000 次路由应远在 300ms 内', () => {
+  const q = '帮我用 Python 写一个脚本读取 CSV 文件并画出折线图，服务器上跑 '.repeat(3);
+  routePersona(q); // 预热
+  const t0 = performance.now();
+  for (let i = 0; i < 1000; i++) routePersona(q);
+  const ms = performance.now() - t0;
+  assert.ok(ms < 300, '1000 次路由耗时 ' + ms.toFixed(0) + 'ms，超出性能护栏（预编译词表可能失效）');
+  // explainRoute 与 routePersona 共享打分，不应再出现 2 倍开销
+  const t1 = performance.now();
+  for (let i = 0; i < 1000; i++) explainRoute(q);
+  const ms2 = performance.now() - t1;
+  assert.ok(ms2 < 600, '1000 次 explainRoute 耗时 ' + ms2.toFixed(0) + 'ms，超出性能护栏（疑似重复打分）');
+});
+
 test('断点续做沿用存档里的人格与工具白名单', async () => {
   const original = globalThis.fetch;
   const captured = [];

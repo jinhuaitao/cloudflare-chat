@@ -103,7 +103,7 @@ async function routeRequest(request, env, ctx) {
         // v6.6.0: Web 端 Agent 模式 —— 复用 Telegram 同一套 ReAct 循环 + 工具链，
         // 进度通过 SSE 事件推送。Web 端对知识库只读（kbReadOnly: true），优先检索知识库文档。
         if (body.agent === true && !isImageAPI) {
-          return await handleWebAgent(env, body);
+          return await handleWebAgent(env, body, ctx);
         }
 
         const upstreamResponse = await fetch(apiUrl, {
@@ -181,8 +181,9 @@ async function routeRequest(request, env, ctx) {
     }
 
     // Telegram Bot Webhook：命令、Agent 对话与回复发送都在该模块内处理
+    // ctx 一路传下去：记忆写入等收尾工作挂 waitUntil，不再拖住最终回复
     if (request.method === 'POST' && url.pathname === '/tg-webhook') {
-      return await handleTgWebhook(request, env);
+      return await handleTgWebhook(request, env, ctx);
     }
 
     // 微信 ClawBot (iLink) Webhook：支持第三方 iLink 网关推送消息

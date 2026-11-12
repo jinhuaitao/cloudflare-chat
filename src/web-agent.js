@@ -8,7 +8,8 @@ import { tgAgentChat } from './agent/loop.js';
 // Web 端对知识库只读（kbReadOnly: true），不暴露写入工具，也不再读取/产生 Web 会话记忆。
 // 进度通过 SSE 自定义事件推送：{"agent_progress": "..."} / {"agent_error": "..."}，
 // 正文走标准 OpenAI delta 事件，最后 data: [DONE] 结束。
-async function handleWebAgent(env, body) {
+// ctx（Workers 执行上下文）可选：传入后记忆写入挂 waitUntil，不拖住 SSE 收尾
+async function handleWebAgent(env, body, ctx) {
   const sid = String(body.session_id || 'default').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'default';
   const webChatId = 'web_' + sid;
   const history = Array.isArray(body.messages) ? body.messages : [];
@@ -64,6 +65,7 @@ async function handleWebAgent(env, body) {
       const webOpts = {
         maxRuntimeMs: webBudgetMs,
         persona: personaId,
+        ctx: ctx || null,
         // v6.9.3：Web 端对知识库只读——写入（remember / save_doc / delete_doc）
         // 仅 Telegram / 微信端开放，Web 访客无法污染全局知识库
         kbReadOnly: true,

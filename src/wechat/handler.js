@@ -578,7 +578,8 @@ async function loadAllKbDocsForSync(env) {
 }
 
 // ================= 6. 单条微信入站消息核心处理 =================
-async function processWechatMessage(env, creds, rawMsg) {
+// ctx（Workers 执行上下文）可选：传入后 Agent 收尾的记忆写入挂 waitUntil，不拖住回复
+async function processWechatMessage(env, creds, rawMsg, ctx) {
   const parsed = extractWechatMessageContent(rawMsg);
   if (!parsed.isUserMsg || !parsed.fromUserId) return { skipped: true, reason: 'not_user_msg' };
 
@@ -1180,6 +1181,7 @@ async function processWechatMessage(env, creds, rawMsg) {
         maxRuntimeMs: wxBudgetMs,
         resumeKey: tgAgentResumeKey(chatId),
         origUserText: historyUserText,
+        ctx: ctx || null,
       };
       const runAgentTurn = (allowTools) => {
         if (resumeState) {
@@ -1470,7 +1472,7 @@ async function dispatchOrProcessMessages(env, creds, pendingMsgs, effOrigin, ela
 
   for (const m of pendingMsgs) {
     try {
-      const r = await processWechatMessage(env, creds, m);
+      const r = await processWechatMessage(env, creds, m, ctx);
       if (r && r.processed) processedCount += 1;
     } catch (err) {
       console.log('处理微信 ClawBot 消息异常:', err);
@@ -1909,7 +1911,7 @@ async function handleWxWebhook(request, env, url, ctx) {
     let processed = 0;
     for (const m of msgs) {
       try {
-        const r = await processWechatMessage(env, creds, m);
+        const r = await processWechatMessage(env, creds, m, ctx);
         if (r && r.processed) processed += 1;
       } catch (e) {
         console.log('Webhook 处理微信消息异常:', e);
