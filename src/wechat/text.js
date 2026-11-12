@@ -74,6 +74,14 @@ function parseWxCommand(text) {
   if (/^(自动选择专家|专家自动选择|专家自动|自动选专家)$/.test(s)) {
     return { cmd: '/agent', rest: 'auto' };
   }
+  // 路由复盘：「为什么选这个专家」复盘上一句；「复盘一下 XX」复盘指定文本
+  if (/^(为什么选这个专家|为什么这么选|为什么是这个专家|路由复盘|专家复盘)$/.test(s)) {
+    return { cmd: '/agent', rest: 'why' };
+  }
+  const whyMatch = /^(?:复盘一下|复盘|分析一下路由)[:：\s]+(.+)$/.exec(s);
+  if (whyMatch && whyMatch[1].trim()) {
+    return { cmd: '/agent', rest: 'why ' + whyMatch[1].trim() };
+  }
   if (/^(清空|清空上下文|新对话|重置|重置对话|清空记忆上下文)$/.test(s)) {
     return { cmd: '/clear', rest: '' };
   }

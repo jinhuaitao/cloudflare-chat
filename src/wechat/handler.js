@@ -22,7 +22,8 @@ import { tgTrimHistory, tgGetHistory, tgSaveHistory, tgClearHistory } from '../t
 import { agentForgetMemory } from '../agent/memory.js';
 import { memoryReport, memoryClearSession, memoryStats } from '../memory/index.js';
 import { agentGetMode, agentSetMode, agentGetPersona, agentSetPersona } from '../agent/mode.js';
-import { formatPersonaList, formatPersonaBadge, getPersona, personaById } from '../agent/personas.js';
+import { formatPersonaList, formatPersonaBadge, formatRouteWhy, getPersona, personaById } from '../agent/personas.js';
+import { lastUserText } from '../agent/history.js';
 import { agentLoadResumeState, agentClearResumeState, tgAgentResumeKey } from '../agent/resume.js';
 import { tgAgentChat, tgAgentResume } from '../agent/loop.js';
 import { readErrorBody } from '../agent/stability.js';
@@ -854,6 +855,7 @@ async function processWechatMessage(env, creds, rawMsg) {
         + `• 「专家列表」或 /agent list —— 查看 7 位专家人格\n`
         + `• 「切换专家 编程」或 /agent coder —— 固定专家（研究/编程/写作/分析/运维/教学）\n`
         + `• 「自动选择专家」或 /agent auto —— 恢复按问题自动匹配\n`
+        + `• 「为什么选这个专家」或 /agent why —— 复盘上一次的路由依据\n`
         + `• 「清空」或 /clear —— 清空对话上下文\n`
         + `• 「记忆」或 /memory —— 查看长期记忆（平时说「记住…」即可保存）\n`
         + `• 「忘掉 关键词」或 /forget —— 删除指定记忆\n`
@@ -1007,9 +1009,22 @@ async function processWechatMessage(env, creds, rawMsg) {
         const on = await agentGetMode(env, chatId);
         await sendReply(
           '🧭 Agent 模式：' + (on ? '已开启' : '已关闭（发「模式」开启）')
-            + '\n当前专家：' + (curPersona === 'auto' ? '自动选择' : formatPersonaBadge(personaById(curPersona))),
+            + '\n当前专家：' + (curPersona === 'auto' ? '自动选择' : formatPersonaBadge(personaById(curPersona)))
+            + '\n发「为什么选这个专家」可复盘上一次的路由依据。',
           true
         );
+        return { processed: true };
+      }
+
+      // /agent why [任意文本]：复盘上一次（或任意一句话）的路由决策
+      if (argLower === 'why' || argLower === '为什么' || argLower.startsWith('why ') || argLower.startsWith('为什么 ')) {
+        const curPersona = await agentGetPersona(env, chatId);
+        let q = arg.replace(/^(why|为什么)\s*/i, '').trim();
+        if (!q) {
+          const hist = await tgGetHistory(env, chatId);
+          q = lastUserText(hist);
+        }
+        await sendReply(formatRouteWhy(q, curPersona), true);
         return { processed: true };
       }
 

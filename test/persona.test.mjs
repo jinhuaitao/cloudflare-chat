@@ -8,9 +8,11 @@ import assert from 'node:assert/strict';
 import {
   PERSONAS, PERSONA_IDS, DEFAULT_PERSONA_ID,
   normalizePersonaId, getPersona, personaById, listPersonas,
-  routePersona, resolvePersona, personaAllowsTool, personaPromptBlock,
+  routePersona, resolvePersona, explainRoute, formatRouteHit, formatRouteWhy,
+  personaAllowsTool, personaPromptBlock,
   formatPersonaList, formatPersonaBadge,
 } from '../src/agent/personas.js';
+import { resetChannelConfigCache } from '../src/channel.js';
 import { getAgentTools, failureRecoveryHint } from '../src/agent/tools.js';
 import { agentLimits } from '../src/agent/limits.js';
 import { buildAgentSystemPrompt } from '../src/agent/prompt.js';
@@ -352,6 +354,114 @@ test('网页端固定自动选择：忽略请求体 persona，按提问路由', 
     assert.equal(sys.includes('✍️ 写作编辑'), false, '网页端不应被请求体固定成写作人格');
   } finally {
     globalThis.fetch = original;
+  }
+});
+
+// ==================== 路由复盘（/agent why） ====================
+test('explainRoute 打分明细降序，且裁决与 routePersona 一致', () => {
+  const text = '服务器 502 怎么排查';
+  const { ranked, decision, minScore } = explainRoute(text);
+  for (let i = 1; i < ranked.length; i++) {
+    assert.ok(ranked[i - 1].score >= ranked[i].score, '打分明细必须降序');
+  }
+  const direct = routePersona(text);
+  assert.equal(decision.persona.id, direct.persona.id);
+  assert.equal(decision.reason, direct.reason);
+  assert.equal(minScore, 3);
+  const ops = ranked.find(r => r.persona.id === 'ops');
+  assert.ok(ops.score >= 3 && ops.matched.length > 0, '运维应得分并列出命中词');
+});
+
+test('formatRouteHit 只在自动选中非通用角色时给命中词', () => {
+  assert.equal(formatRouteHit(resolvePersona('auto', '服务器 502 怎么排查'), 3).startsWith('命中：'), true);
+  assert.equal(formatRouteHit(resolvePersona('auto', '你好'), 3), '', '回落通用时没有命中词');
+  assert.equal(formatRouteHit(resolvePersona('coder', '今天天气'), 3), '', '手动固定时没有命中词');
+});
+
+test('formatRouteWhy 输出完整复盘：得分、命中词、结论与固定提示', () => {
+  const why = formatRouteWhy('服务器 502 怎么排查', 'auto');
+  assert.ok(why.includes('路由复盘') && why.includes('🛠️ 运维排障'));
+  assert.ok(why.includes('结论：🛠️ 运维排障'));
+  assert.ok(why.includes('阈值 3 分'));
+  const pinned = formatRouteWhy('服务器 502 怎么排查', 'writer');
+  assert.ok(pinned.includes('你已固定 ✍️ 写作编辑'), '固定人格时要提示实际用的是固定角色');
+  const empty = formatRouteWhy('', 'auto');
+  assert.ok(empty.includes('还没有可复盘的内容'));
+  const lowWhy = formatRouteWhy('随便聊聊', 'auto');
+  assert.ok(lowWhy.includes('通用助手'), '低分回落要说清去向');
+});
+
+test('微信口令映射到 /agent why', () => {
+  assert.deepEqual(parseWxCommand('为什么选这个专家'), { cmd: '/agent', rest: 'why' });
+  assert.deepEqual(parseWxCommand('路由复盘'), { cmd: '/agent', rest: 'why' });
+  assert.deepEqual(parseWxCommand('复盘一下 服务器 502'), { cmd: '/agent', rest: 'why 服务器 502' });
+});
+
+// ==================== 网页端输入收口 ====================
+test('网页端忽略 body.model 固定默认通道，WEB_AGENT_ALLOW_MODEL=1 时放开白名单', async () => {
+  const original = globalThis.fetch;
+  const captured = [];
+  globalThis.fetch = async (url, init) => {
+    captured.push({ url: String(url), body: JSON.parse(init.body) });
+    return sse([{ choices: [{ delta: { content: '好。' } }] }]);
+  };
+  const ENV2 = {
+    API_URL_1: 'https://a.local/v1/chat/completions', API_KEY_1: 'k1', MODEL_1: 'model-a:默认',
+    API_URL_2: 'https://b.local/v1/chat/completions', API_KEY_2: 'k2', MODEL_2: 'model-b:备选',
+  };
+  try {
+    resetChannelConfigCache();
+    const r1 = await handleWebAgent(ENV2, {
+      model: 'model-b', session_id: 'lock1',
+      messages: [{ role: 'user', content: '你好' }],
+    });
+    await r1.text();
+    assert.equal(captured[0].body.model, 'model-a', '默认应锁到第一个已配置通道');
+    assert.ok(captured[0].url.includes('a.local'));
+
+    resetChannelConfigCache();
+    const r2 = await handleWebAgent({ ...ENV2, WEB_AGENT_ALLOW_MODEL: '1' }, {
+      model: 'model-b', session_id: 'lock2',
+      messages: [{ role: 'user', content: '你好' }],
+    });
+    await r2.text();
+    assert.equal(captured[1].body.model, 'model-b', '放开后应 honored 白名单内的合法选择');
+    assert.ok(captured[1].url.includes('b.local'));
+
+    resetChannelConfigCache();
+    const r3 = await handleWebAgent({ ...ENV2, WEB_AGENT_ALLOW_MODEL: '1' }, {
+      model: 'not-configured', session_id: 'lock3',
+      messages: [{ role: 'user', content: '你好' }],
+    });
+    await r3.text();
+    assert.equal(captured[2].body.model, 'model-a', '非法模型仍兜底默认通道');
+  } finally {
+    globalThis.fetch = original;
+    resetChannelConfigCache();
+  }
+});
+
+test('主循环首步进度带路由命中词，结果回传路由依据', async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => sse([{ choices: [{ delta: { content: '先看 nginx 错误日志。' } }] }]);
+  const progress = [];
+  try {
+    resetChannelConfigCache();
+    const r = await tgAgentChat(ENV, noopTgApi, 'p_chat6', 'mock-model',
+      [{ role: 'user', content: '服务器 502 怎么排查' }], true,
+      async (text) => { progress.push(String(text)); },
+      { maxRuntimeMs: 30000 });
+    assert.equal(r.personaId, 'ops');
+    assert.ok(r.personaRoute && r.personaRoute.reason === 'matched');
+    assert.ok(r.personaRoute.matched.length > 0);
+    const first = progress.find(t => t.includes('第 1/'));
+    assert.ok(first && first.includes('命中：'), '首步进度应带命中词，实际：' + first);
+    // 第二步起不再重复命中词（保持进度条简短）
+    const later = progress.filter(t => t.includes('第 2/'));
+    for (const t of later) assert.equal(t.includes('命中：'), false);
+  } finally {
+    globalThis.fetch = original;
+    resetChannelConfigCache();
   }
 });
 

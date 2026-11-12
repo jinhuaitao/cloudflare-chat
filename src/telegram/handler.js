@@ -11,7 +11,8 @@ import { tgTrimHistory, tgGetHistory, tgSaveHistory, tgClearHistory } from '../t
 import { agentForgetMemory } from '../agent/memory.js';
 import { memoryReport, memoryClearSession, memoryStats } from '../memory/index.js';
 import { agentGetMode, agentSetMode, agentGetPersona, agentSetPersona } from '../agent/mode.js';
-import { formatPersonaList, formatPersonaBadge, getPersona, personaById } from '../agent/personas.js';
+import { formatPersonaList, formatPersonaBadge, formatRouteWhy, getPersona, personaById } from '../agent/personas.js';
+import { lastUserText } from '../agent/history.js';
 import { agentLoadResumeState, agentClearResumeState, tgAgentResumeKey } from '../agent/resume.js';
 import { tgAgentChat, tgAgentResume } from '../agent/loop.js';
 import { readErrorBody } from '../agent/stability.js';
@@ -590,6 +591,7 @@ export async function handleTgWebhook(request, env) {
                 + "/agent list —— 查看全部专家人格\n"
                 + "/agent <id> —— 固定专家（research｜coder｜writer｜analyst｜ops｜tutor）\n"
                 + "/agent auto —— 恢复按问题自动选择专家\n"
+                + "/agent why —— 复盘上一次为什么选这位专家（可带文本单独复盘）\n"
                 + "/clear —— 清空当前对话上下文（含 L1 工作记忆，保留长期记忆与归档）\n"
                 + "/memory —— 查看三层记忆（L1 会话要点 / L2 长期事实 / L3 归档）\n"
                 + "/forget 关键词 —— 删除包含关键词的长期记忆\n"
@@ -762,7 +764,24 @@ export async function handleTgWebhook(request, env) {
                 chat_id: chatId,
                 text: '🧭 Agent 模式：' + (useAgent ? '已开启' : '已关闭（/agent 开启）')
                   + '\n当前专家：' + (curPersona === 'auto' ? '自动选择' : formatPersonaBadge(personaById(curPersona)))
-                  + '\n发送 /agent list 查看全部。',
+                  + '\n发送 /agent list 查看全部，/agent why 复盘上一次为什么选这位专家。',
+                ...replyExtra
+              });
+              return;
+            }
+
+            // /agent why [任意文本]：复盘路由决策。路由器是确定性的，
+            // 把最后一句提问重新打分即可还原「为什么选 TA」，不需要存任何状态。
+            if (argLower === 'why' || argLower === '为什么' || argLower.startsWith('why ') || argLower.startsWith('为什么 ')) {
+              const curPersona = await agentGetPersona(env, chatId);
+              let q = arg.replace(/^(why|为什么)\s*/i, '').trim();
+              if (!q) {
+                const hist = await tgGetHistory(env, chatId);
+                q = lastUserText(hist);
+              }
+              await tgApi('sendMessage', {
+                chat_id: chatId,
+                text: formatRouteWhy(q, curPersona),
                 ...replyExtra
               });
               return;

@@ -46,7 +46,7 @@ import { kbGetRegistry } from '../kb/registry.js';
 import { mapLimit } from '../utils.js';
 import { sanitizeHistory, lastUserText } from './history.js';
 import { agentGetPersona } from './mode.js';
-import { resolvePersona, personaById, personaAllowsTool, formatPersonaBadge, DEFAULT_PERSONA_ID } from './personas.js';
+import { resolvePersona, personaById, personaAllowsTool, formatPersonaBadge, formatRouteHit, DEFAULT_PERSONA_ID } from './personas.js';
 
 const WRITE_TOOLS_SET = new Set(['remember', 'forget_memory', 'save_doc', 'delete_doc']);
 
@@ -176,7 +176,10 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
   ]);
   const hasKbDocs = Array.isArray(kbDocs) ? kbDocs.length > 0 : undefined;
   // 显式指定（Web 请求体 / 本次调用参数）优先，其次是用户固定的人格，最后按提问自动路由
-  const persona = resolvePersona((opts && opts.persona) || savedPersona, query).persona;
+  const route = resolvePersona((opts && opts.persona) || savedPersona, query);
+  const persona = route.persona;
+  // 路由「为什么」：自动选中非通用角色时，首步进度里带一句「命中：xx、xx」，让用户看得见依据
+  const routeWhy = formatRouteHit(route, 3);
   const systemPrompt = buildAgentSystemPrompt(
     memoryBundle ? memoryBundle.longterm : [], query, kbDocs, kbReadOnly, memoryBundle, persona
   );
@@ -189,9 +192,12 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
   const result = await tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline,
     (opts && opts.resumeKey) || null, false, undefined,
     (opts && opts.onDelta) || null, (opts && opts.onReset) || null, kbReadOnly, origUserText,
-    hasKbDocs, persona);
-  // 回传本次实际使用的人格：调用方可据此在回复里标一个角色徽标（Web 端也可选用）
-  if (result && typeof result === 'object') result.personaId = persona.id;
+    hasKbDocs, persona, routeWhy);
+  // 回传本次实际使用的人格与路由依据：调用方可据此展示徽标与解释（Web 端也可选用）
+  if (result && typeof result === 'object') {
+    result.personaId = persona.id;
+    result.personaRoute = { source: route.source, reason: route.reason, matched: route.matched.slice(0, 5) };
+  }
   await recordWorkingMemory(env, chatId, origUserText, result, opts);
   return result;
 }
@@ -229,12 +235,12 @@ async function tgAgentResume(env, tgApi, chatId, saved, onProgress, opts) {
   const result = await tgAgentRunLoop(env, tgApi, chatId, saved.targetModelId, saved.messages, tools, allowTools, onProgress, deadline,
     (opts && opts.resumeKey) || null, true, baseLoopStartIdx,
     (opts && opts.onDelta) || null, (opts && opts.onReset) || null, kbReadOnly, saved.origUserText || '',
-    saved.hasKbDocs, persona);
+    saved.hasKbDocs, persona, '');
   await recordWorkingMemory(env, chatId, saved.origUserText || '', result, opts);
   return result;
 }
 
-async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume, baseLoopStartIdx, onDelta, onReset, kbReadOnly, origUserText, hasKbDocs, persona) {
+async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume, baseLoopStartIdx, onDelta, onReset, kbReadOnly, origUserText, hasKbDocs, persona, routeWhy) {
   // 不原地修改调用方数组：断点存档的 messages 被 push 后就被污染了，
   // 同一份存档再跑一次（如 fallback 重试）会带着上一轮的 assistant/tool 消息，序列直接错乱
   messages = Array.isArray(messages) ? messages.slice() : [];
@@ -361,8 +367,10 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
     }
     const elapsedSec = Math.max(1, Math.round((Date.now() - loopStartedAt) / 1000));
     const who = persona.id === DEFAULT_PERSONA_ID ? '🤖 Agent' : formatPersonaBadge(persona);
+    // 首步把路由依据亮出来（如「· 命中：502、排查」），后续步骤保持简短
+    const whyPart = (step === 0 && !isResume && routeWhy) ? ' · ' + routeWhy : '';
     const stepLabel = who + ' 思考中' + (isResume ? '（继续）' : '')
-      + '（第 ' + (step + 1) + '/' + maxSteps + ' 步 · ' + elapsedSec + 's）…';
+      + '（第 ' + (step + 1) + '/' + maxSteps + ' 步' + whyPart + ' · ' + elapsedSec + 's）…';
     fireProgress(stepLabel, false);
     try { tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {}); } catch (e) {}
 

@@ -294,6 +294,62 @@ function resolvePersona(explicitId, text) {
   return routePersona(text);
 }
 
+// ==================== 路由复盘（/agent why） ====================
+// 路由器是确定性的：同一句话任何时候重算结果都一样，所以「为什么这么选」
+// 不需要存状态——把最后一句话重新打一遍分就能完整复盘，调词表时也能直接验证。
+
+// 完整打分明细：每个角色得分 + 命中词，外加最终裁决与阈值
+function explainRoute(text) {
+  const ranked = PERSONAS
+    .filter(p => p.id !== DEFAULT_PERSONA_ID)
+    .map(p => ({ persona: p, ...scorePersona(p, text) }))
+    .sort((a, b) => b.score - a.score);
+  return { ranked, decision: routePersona(text), minScore: MIN_SCORE };
+}
+
+const ROUTE_REASON_TEXT = {
+  matched: '得分最高且领先第二名',
+  tech: '教学词得分最高，但主语是具体技术栈，按工程视角优先',
+  low: '最高分不足阈值，意图不明确，回落通用助手',
+  ambiguous: '前两名同分，意图不明确，回落通用助手',
+  manual: '已手动固定，未走自动路由',
+};
+
+// 给「命中：a、b」这类一行说明用；自动路由且选了非通用角色时才有内容
+function formatRouteHit(route, maxWords) {
+  if (!route || route.source !== 'auto') return '';
+  if (!route.persona || route.persona.id === DEFAULT_PERSONA_ID) return '';
+  const words = (route.matched || []).slice(0, maxWords || 3);
+  if (!words.length) return '';
+  return '命中：' + words.join('、');
+}
+
+// 完整复盘文本（Telegram / 微信共用，纯文本不依赖 Markdown）
+// fixedId：当前固定的人格（'auto' 或 id）；text：要复盘的那句话
+function formatRouteWhy(text, fixedId) {
+  const q = String(text || '').trim();
+  if (!q) return '🧭 还没有可复盘的内容。先随便问点什么，再发 /agent why；也可以直接 /agent why 任意文本 单独复盘一句话。';
+  const { ranked, decision, minScore } = explainRoute(q);
+  const lines = ['🧭 路由复盘', '问题：' + (q.length > 60 ? q.slice(0, 60) + '…' : q), ''];
+  const shown = ranked.filter(r => r.score > 0);
+  if (shown.length) {
+    for (const r of shown) {
+      const words = r.matched.length ? '（' + r.matched.slice(0, 5).join('、') + '）' : '';
+      lines.push(r.persona.emoji + ' ' + r.persona.name + '：' + r.score + ' 分' + words);
+    }
+  } else {
+    lines.push('（没有任何角色命中关键词）');
+  }
+  lines.push('');
+  const reasonText = ROUTE_REASON_TEXT[decision.reason] || decision.reason;
+  lines.push('结论：' + decision.persona.emoji + ' ' + decision.persona.name + ' —— ' + reasonText + '（阈值 ' + minScore + ' 分）');
+  const fixed = fixedId && String(fixedId) !== 'auto' ? personaById(fixedId) : null;
+  if (fixed && fixed.id !== DEFAULT_PERSONA_ID) {
+    lines.push('注意：你已固定 ' + fixed.emoji + ' ' + fixed.name + '（/agent ' + fixed.id + '），实际对话用它而不是上面的自动结果；发 /agent auto 恢复自动。');
+  }
+  return lines.join('\n');
+}
+
 function personaAllowsTool(persona, name) {
   if (!persona || !Array.isArray(persona.tools)) return true;
   return persona.tools.indexOf(String(name || '')) !== -1;
@@ -333,6 +389,7 @@ export {
   PERSONAS,
   PERSONA_IDS,
   DEFAULT_PERSONA_ID,
+  MIN_SCORE,
   normalizePersonaId,
   getPersona,
   personaById,
@@ -340,6 +397,9 @@ export {
   scorePersona,
   routePersona,
   resolvePersona,
+  explainRoute,
+  formatRouteHit,
+  formatRouteWhy,
   personaAllowsTool,
   personaPromptBlock,
   formatPersonaList,

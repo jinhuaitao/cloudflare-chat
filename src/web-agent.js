@@ -12,10 +12,13 @@ async function handleWebAgent(env, body) {
   const sid = String(body.session_id || 'default').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'default';
   const webChatId = 'web_' + sid;
   const history = Array.isArray(body.messages) ? body.messages : [];
-  const targetModelId = body.model;
   // 专家人格固定「自动」：网页端是公开入口，不做人格选择器，也不读请求体里的 persona ——
   // 每轮由提问内容确定性路由（零额外往返），避免公开页面被传参固定成某个角色。
   const personaId = 'auto';
+  // 模型同样收口：默认忽略 body.model、固定走第一个已配置通道，公开入口少一条外部可控参数。
+  // 自托管想让网页端模型下拉框在 Agent 模式下生效时设 WEB_AGENT_ALLOW_MODEL=1
+  // （仍只认白名单内已配置的模型，非法值由 buildAIRequest 兜底到默认通道）。
+  const targetModelId = env.WEB_AGENT_ALLOW_MODEL === '1' ? body.model : null;
   const encoder = new TextEncoder();
   // Web 无 Telegram 上下文：typing 心跳直接 no-op
   const noOpTgApi = () => Promise.resolve({ ok: true });
