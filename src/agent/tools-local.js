@@ -232,6 +232,21 @@ function parseIsoDateUtc(str) {
   return ms;
 }
 
+// Intl.DateTimeFormat 构造在 Workers 上是出名的高开销操作（每个约 0.1~1ms），
+// 而时区通常只有一两个，按「locale + timeZone + 选项」缓存复用。
+// prompt.js 里对当前时间格式化也做了同样处理。
+const dtfCache = new Map();
+function getDateTimeFormat(locale, options) {
+  const key = locale + '|' + (options.timeZone || '') + '|' + JSON.stringify(options);
+  let fmt = dtfCache.get(key);
+  if (!fmt) {
+    fmt = new Intl.DateTimeFormat(locale, options);
+    if (dtfCache.size > 16) dtfCache.clear();
+    dtfCache.set(key, fmt);
+  }
+  return fmt;
+}
+
 // 增强版时间与日期推算：支持当前时间、两日期间隔天数（target_date）、日期加减天数（add_days）与 Unix 时间戳
 function toolGetTime(timezone, opts) {
   if (timezone && typeof timezone === 'object') {
@@ -242,11 +257,11 @@ function toolGetTime(timezone, opts) {
   const tz = String(timezone || 'Asia/Shanghai').trim() || 'Asia/Shanghai';
   try {
     const now = new Date();
-    const fmt = new Intl.DateTimeFormat('zh-CN', {
+    const fmt = getDateTimeFormat('zh-CN', {
       timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
       hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, weekday: 'long'
     });
-    const parts = new Intl.DateTimeFormat('en-CA', {
+    const parts = getDateTimeFormat('en-CA', {
       timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit'
     }).formatToParts(now);
     const y = parts.find(p => p.type === 'year')?.value;
@@ -269,7 +284,7 @@ function toolGetTime(timezone, opts) {
         const weeks = Math.floor(absDays / 7);
         const remDays = absDays % 7;
         const wkNote = weeks > 0 ? `（即 ${weeks} 周${remDays > 0 ? '零 ' + remDays + ' 天' : ''}）` : '';
-        const targetWk = new Intl.DateTimeFormat('zh-CN', { timeZone: 'UTC', weekday: 'long' }).format(new Date(targetMs));
+        const targetWk = getDateTimeFormat('zh-CN', { timeZone: 'UTC', weekday: 'long' }).format(new Date(targetMs));
         out += `\n日期差推算：从 ${baseIso} 到 ${targetIso}（${targetWk}）共相差 ${diffDays} 天${wkNote}`;
       }
     }
@@ -280,7 +295,7 @@ function toolGetTime(timezone, opts) {
         const resMs = baseMs + delta * 86400000;
         const resDate = new Date(resMs);
         const resIso = resDate.toISOString().slice(0, 10);
-        const resWk = new Intl.DateTimeFormat('zh-CN', { timeZone: 'UTC', weekday: 'long' }).format(resDate);
+        const resWk = getDateTimeFormat('zh-CN', { timeZone: 'UTC', weekday: 'long' }).format(resDate);
         out += `\n日期加减推算：${baseIso} ${delta >= 0 ? '加上 ' + delta : '减去 ' + Math.abs(delta)} 天后为 ${resIso}（${resWk}）`;
       }
     }

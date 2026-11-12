@@ -47,15 +47,16 @@ function factTokens(fact) {
   return set;
 }
 
-// 构建 Agent 系统提示词
-// memoryBundle 为三层记忆的加载结果（memory/index.js 的 memoryLoad 返回值）。
-// 传入时走三层渲染；不传时退回旧版单层「长期记忆」渲染——老调用方与老测试不受影响。
-function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly, memoryBundle) {
-  const kbList = Array.isArray(kbDocs) ? kbDocs.filter(e => e && (e.title || e.file)) : [];
-  const hasKb = kbList.length > 0;
-  const hasMemory = !!memoryBundle;
+// 稳定前缀只取决于三个开关量：是否只读端 / 是否有知识库文档 / 知识库列表是否已知，
+// 一共 8 种组合。按组合缓存后：每轮省掉约 2.5KB 的重复字符串拼接，
+// 同时保证同一端发往上游的 system 前缀字节级稳定（上游前缀缓存命中的前提）。
+const stablePrefixCache = new Map();
 
-  // ---------- 稳定前缀：同一模型、同一端、同一轮里字节不变 ----------
+function buildStablePrefix(kbReadOnly, hasKb, kbListKnown) {
+  const cacheKey = (kbReadOnly ? '1' : '0') + (hasKb ? '1' : '0') + (kbListKnown ? '1' : '0');
+  const hit = stablePrefixCache.get(cacheKey);
+  if (hit) return hit;
+
   let p = '你是 Cloudflare-Chat 智能助手：一个会自主规划、并行调用工具、检索知识库的 AI Agent。\n\n';
 
   p += '【铁律】\n'
@@ -79,7 +80,7 @@ function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly, memoryBundl
   lines.push('· 记忆检索 → memory（action=search 跨 L1/L2/L3 一次查；action=stats 看各层条数；action=pin 固定本会话约束）');
   if (hasKb) {
     lines.push('· 知识库文档 → 直接用 read_doc 读相关文档（标题已在下方列表，无需先 list_docs；超长可传 offset 翻页；标题对不上会自动多关键词检索正文）');
-  } else if (!kbReadOnly || !Array.isArray(kbDocs)) {
+  } else if (!kbReadOnly || !kbListKnown) {
     lines.push('· 知识库文档 → 先 list_docs 看标题，有相关再 read_doc 细读（支持 offset 分页与多关键词搜正文）');
   }
   if (!kbReadOnly) {
@@ -99,6 +100,21 @@ function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly, memoryBundl
     + '- 默认用中文回答（用户用其他语言时跟随）；缺少关键参数（如查天气没给城市）时一句话追问，不要盲猜。\n'
     + '- 觉得信息够了就直接给最终答案，不要为了调用工具而调用工具。\n'
     + '- 收到"工具调用阶段已结束"或"仅剩 N 步"的提示时，立刻收束：把已有结果整理成完整答案，缺的部分明确写"未查到"。\n\n';
+
+  stablePrefixCache.set(cacheKey, p);
+  return p;
+}
+
+// 构建 Agent 系统提示词
+// memoryBundle 为三层记忆的加载结果（memory/index.js 的 memoryLoad 返回值）。
+// 传入时走三层渲染；不传时退回旧版单层「长期记忆」渲染——老调用方与老测试不受影响。
+function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly, memoryBundle) {
+  const kbList = Array.isArray(kbDocs) ? kbDocs.filter(e => e && (e.title || e.file)) : [];
+  const hasKb = kbList.length > 0;
+  const hasMemory = !!memoryBundle;
+
+  // ---------- 稳定前缀：同一模型、同一端、同一轮里字节不变 ----------
+  let p = buildStablePrefix(kbReadOnly, hasKb, Array.isArray(kbDocs));
 
   // ---------- 动态尾部：以下内容逐轮变化，放在最后以免影响前缀复用 ----------
   if (hasKb) {

@@ -43,7 +43,9 @@ async function tgGetHistory(env, chatId) {
     try {
       const h = JSON.parse(raw);
       if (Array.isArray(h)) {
-        mapSetBounded(tgHistories, chatId, h.slice(), undefined, tgHistoriesExp);
+        // 缓存直接持有刚解析出来的数组（外部拿到的是拷贝，不会污染缓存），
+        // 旧版这里连做两次 copy：一次进缓存、一次返回
+        mapSetBounded(tgHistories, chatId, h, undefined, tgHistoriesExp);
         return h.slice();
       }
     } catch (e) {}

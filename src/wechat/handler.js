@@ -403,12 +403,15 @@ async function saveWxContextToken(env, userId, contextToken) {
   const prev = mapGetBounded(wxContextTokens, key);
   mapSetBounded(wxContextTokens, key, ct, 500, wxContextTokensExp, 5 * 60 * 1000);
   if (ct !== prev) {
-    await storePut(env, 'wx_ctx_' + key, ct);
-    await storePut(env, 'wx_last_peer', JSON.stringify({
-      user_id: String(userId),
-      context_token: ct,
-      ts: Date.now(),
-    }));
+    // 两个 key 互不依赖，并行写入省掉一次串行 R2 往返
+    await Promise.all([
+      storePut(env, 'wx_ctx_' + key, ct),
+      storePut(env, 'wx_last_peer', JSON.stringify({
+        user_id: String(userId),
+        context_token: ct,
+        ts: Date.now(),
+      })),
+    ]);
   }
 }
 
@@ -421,15 +424,25 @@ async function getWxLastPeer(env) {
 }
 
 // ================= 3. 入站消息去重 =================
+// 去重窗口的 isolate 级读缓存：旧版每条消息一次 R2 GET + 一次 PUT，
+// 长轮询批量收消息时全是重复往返。TTL 10 秒足以合并同一批/连续消息，
+// 跨实例去重的最坏退化是 10 秒内漏判一次重复投递（与 R2「读-改-写」
+// 本就存在的并发间隙同级），可接受。
+const WX_DEDUP_CACHE_TTL_MS = 10000;
+let wxDedupCache = null; // { ts, win }
 async function loadWxDedupWindow(env) {
+  const now = Date.now();
+  if (wxDedupCache && now - wxDedupCache.ts < WX_DEDUP_CACHE_TTL_MS) return wxDedupCache.win;
+  let win = [];
   try {
     const raw = await storeGet(env, WX_DEDUP_KEY);
     if (raw) {
       const p = JSON.parse(raw);
-      if (Array.isArray(p)) return p;
+      if (Array.isArray(p)) win = p;
     }
   } catch (e) {}
-  return [];
+  wxDedupCache = { ts: now, win };
+  return win;
 }
 
 async function markWxMsgSeen(env, msgKey) {
@@ -445,6 +458,7 @@ async function markWxMsgSeen(env, msgKey) {
   fresh.push({ id: msgKey, ts: now });
   if (fresh.length > WX_DEDUP_MAX) fresh.splice(0, fresh.length - WX_DEDUP_MAX);
   try { await storePutChecked(env, WX_DEDUP_KEY, JSON.stringify(fresh)); } catch (e) {}
+  wxDedupCache = { ts: now, win: fresh };
   seenWxMsgIds.set(msgKey, now);
   for (const [k, t] of seenWxMsgIds) {
     if (now - t > WX_DEDUP_WINDOW_MS) seenWxMsgIds.delete(k);
@@ -458,7 +472,10 @@ async function releaseWxMsgForRetry(env, msgKey) {
   try {
     const win = await loadWxDedupWindow(env);
     const fresh = win.filter(e => !(e && e.id === msgKey));
-    if (fresh.length !== win.length) await storePutChecked(env, WX_DEDUP_KEY, JSON.stringify(fresh));
+    if (fresh.length !== win.length) {
+      await storePutChecked(env, WX_DEDUP_KEY, JSON.stringify(fresh));
+      wxDedupCache = { ts: Date.now(), win: fresh };
+    }
   } catch (e) {}
 }
 
@@ -583,12 +600,16 @@ async function processWechatMessage(env, creds, rawMsg) {
   }
 
   let contextToken = parsed.contextToken;
-  if (contextToken) {
-    await saveWxContextToken(env, userId, contextToken);
-  } else {
+  // context_token 落盘与后面的去重判定互不依赖：先发起写入，等去重判定完再收口，
+  // 这样两条 R2 写/读可以重叠，热路径少等一次往返（L1 缓存已在函数内同步更新）
+  const ctxPersist = parsed.contextToken
+    ? saveWxContextToken(env, userId, parsed.contextToken).catch(() => {})
+    : null;
+  if (!contextToken) {
     contextToken = await getWxContextToken(env, userId);
   }
   if (!contextToken) {
+    if (ctxPersist) await ctxPersist;
     await wxRecordDiag(env, 'error', '入站消息缺少 context_token', userId, false);
     return { skipped: true, reason: 'missing_context_token' };
   }
@@ -596,7 +617,9 @@ async function processWechatMessage(env, creds, rawMsg) {
   const dedupKey = parsed.msgId
     ? `id:${parsed.msgId}`
     : `hash:${userId}:${contextToken.slice(-24)}:${(parsed.text || '').slice(0, 48)}`;
-  if (await markWxMsgSeen(env, dedupKey)) {
+  const isDuplicate = await markWxMsgSeen(env, dedupKey);
+  if (ctxPersist) await ctxPersist;
+  if (isDuplicate) {
     return { skipped: true, reason: 'duplicate' };
   }
 
@@ -1016,9 +1039,15 @@ async function processWechatMessage(env, creds, rawMsg) {
       historyUserText = '画 ' + drawPrompt;
     }
 
-    // 异步非阻塞触发“对方正在输入…”并启动 5s 自动续期心跳，确保长推理/生图期间手机端提示不中断
+    // 异步非阻塞触发“对方正在输入…”并启动 5s 自动续期心跳，确保长推理/生图期间手机端提示不中断。
+    // lastTypingSent 由心跳 / wxCompatApi / onProgress 三路共用：旧版心跳无条件每 5 秒发一次，
+    // 与另外两路节流完全脱钩，一次 30 秒推理会多发好几次 iLink POST。
+    let lastTypingSent = Date.now();
     sendWxTypingStatus(env, creds, userId, contextToken, 1).catch(() => {});
     const typingHeartbeatTimer = setInterval(() => {
+      const now = Date.now();
+      if (now - lastTypingSent < 5000) return;
+      lastTypingSent = now;
       sendWxTypingStatus(env, creds, userId, contextToken, 1).catch(() => {});
     }, 5000);
     if (typingHeartbeatTimer && typeof typingHeartbeatTimer.unref === 'function') {
@@ -1028,18 +1057,23 @@ async function processWechatMessage(env, creds, rawMsg) {
     const modelProbe = buildAIRequest(env, activeModelId, [{ role: 'user', content: userText }], false);
     const isDirectImageModel = !!(modelProbe && modelProbe.isImageAPI);
 
-    const useAgent = !isDirectImageModel && (await agentGetMode(env, chatId));
+    // Agent 开关与会话历史互不依赖，并行读取省掉一次串行 R2 往返
+    const [agentModeOn, baseHistory] = await Promise.all([
+      isDirectImageModel ? Promise.resolve(false) : agentGetMode(env, chatId),
+      tgGetHistory(env, chatId),
+    ]);
+    const useAgent = !isDirectImageModel && agentModeOn;
     const wantResume = useAgent && !multimodalContent && userText.trim() === '继续';
     let resumeState = null;
     if (wantResume) resumeState = await agentLoadResumeState(env, chatId);
-    if (useAgent && !resumeState) await agentClearResumeState(env, chatId);
+    // 清残留断点只是兜底清理，后面有秒级 AI 调用，不需要串行等待这次 R2 删除
+    if (useAgent && !resumeState) agentClearResumeState(env, chatId).catch(() => {});
 
-    const baseHistory = await tgGetHistory(env, chatId);
-    let history = baseHistory.slice();
-    if (!resumeState) {
-      history.push({ role: 'user', content: multimodalContent || userText });
-      history = tgTrimHistory(history, env);
-    }
+    // tgGetHistory 返回的已是独立拷贝，tgTrimHistory 内部也会再拷贝；
+    // 用 concat 追加当前提问，baseHistory 保持不被污染（下方保存历史还要用）
+    const history = resumeState
+      ? baseHistory
+      : tgTrimHistory(baseHistory.concat([{ role: 'user', content: multimodalContent || userText }]), env);
 
     let replyText = null;
     let directImageSource = null;
@@ -1049,7 +1083,6 @@ async function processWechatMessage(env, creds, rawMsg) {
     if (!(wxBudgetMs >= 10000)) wxBudgetMs = 55000;
     if (wxBudgetMs > 240000) wxBudgetMs = 240000;
 
-    let lastTypingSent = Date.now();
     const wxCompatApi = async (method) => {
       if (method === 'sendChatAction') {
         const now = Date.now();
@@ -1850,13 +1883,17 @@ async function handleWxApi(request, env, url, ctx) {
         channelVersion: chanVer,
       }), { status: 200, headers: CORS_HEADERS });
     }
-    const lastPeer = await getWxLastPeer(env);
-    const cursor = creds ? await getWxCursor(env, creds.ilink_bot_id) : '';
+    // 三个互不依赖的状态读取并行（上次会话 / 游标 / 诊断），
+    // 冷 isolate 上从 4 次串行 R2 往返压到 2 次
+    const [lastPeer, cursor, diag] = await Promise.all([
+      getWxLastPeer(env),
+      creds && creds.ilink_bot_id ? getWxCursor(env, creds.ilink_bot_id) : Promise.resolve(''),
+      getWxDiagSummary(env),
+    ]);
     const effectiveUserId = (creds && creds.ilink_user_id) || (lastPeer && lastPeer.user_id) || '';
     const hasContextToken = effectiveUserId
       ? !!(await getWxContextToken(env, effectiveUserId)) || !!(lastPeer && lastPeer.context_token)
       : false;
-    const diag = await getWxDiagSummary(env);
     return new Response(JSON.stringify({
       ok: true,
       adminAuthorized: true,

@@ -73,12 +73,22 @@ async function getBotIdentity(env, tgApi) {
 const TG_DEDUP_KEY = 'tg_updates_dedup';
 const TG_DEDUP_WINDOW_MS = 10 * 60 * 1000;
 const TG_DEDUP_MAX = 200;
+// 去重窗口的 isolate 级读缓存：旧版每条消息一次 R2 GET + 一次 PUT，
+// 连续/批量消息时全是重复往返。TTL 10 秒足以合并连续消息，
+// 跨实例去重的最坏退化是 10 秒内漏判一次重复投递（与 R2「读-改-写」
+// 本就存在的并发间隙同级），可接受。
+const TG_DEDUP_CACHE_TTL_MS = 10000;
+let tgDedupCache = null; // { ts, win }
 async function loadDedupWindow(env) {
+  const now = Date.now();
+  if (tgDedupCache && now - tgDedupCache.ts < TG_DEDUP_CACHE_TTL_MS) return tgDedupCache.win;
+  let win = [];
   try {
     const raw = await storeGet(env, TG_DEDUP_KEY);
-    if (raw) { const p = JSON.parse(raw); if (Array.isArray(p)) return p; }
+    if (raw) { const p = JSON.parse(raw); if (Array.isArray(p)) win = p; }
   } catch (e) {}
-  return [];
+  tgDedupCache = { ts: now, win };
+  return win;
 }
 async function markUpdateSeen(env, uid) {
   if (uid === undefined || uid === null) return false;
@@ -93,6 +103,7 @@ async function markUpdateSeen(env, uid) {
   fresh.push({ id: uid, ts: now });
   if (fresh.length > TG_DEDUP_MAX) fresh.splice(0, fresh.length - TG_DEDUP_MAX);
   try { await storePutChecked(env, TG_DEDUP_KEY, JSON.stringify(fresh)); } catch (e) {}
+  tgDedupCache = { ts: now, win: fresh };
   seenUpdateIds.set(uid, now);
   for (const [k, t] of seenUpdateIds) { if (now - t > TG_DEDUP_WINDOW_MS) seenUpdateIds.delete(k); }
   return false;
@@ -103,7 +114,10 @@ async function releaseUpdateForRetry(env, uid) {
   try {
     const win = await loadDedupWindow(env);
     const fresh = win.filter(e => !(e && e.id === uid));
-    if (fresh.length !== win.length) await storePutChecked(env, TG_DEDUP_KEY, JSON.stringify(fresh));
+    if (fresh.length !== win.length) {
+      await storePutChecked(env, TG_DEDUP_KEY, JSON.stringify(fresh));
+      tgDedupCache = { ts: Date.now(), win: fresh };
+    }
   } catch (e) {}
 }
 
@@ -118,6 +132,23 @@ function parseCommand(t, botUsername) {
     return { cmd: m[1].toLowerCase(), rest: (m[3] || '').trim(), forOtherBot: true };
   }
   return { cmd: m[1].toLowerCase(), rest: (m[3] || '').trim(), forOtherBot: false };
+}
+
+// botUser 在 isolate 生命周期内基本不变，@提及正则按用户名缓存，
+// 不再每条群消息都重新编译两个 RegExp。
+// 注意：带 g 标志的正则复用会携带 lastIndex 状态，
+// mentionRe 仅用于 test（去掉 g 规避）；anyAtRe 用于 test + replace，
+// 每次使用前显式重置 lastIndex（replace 自身会从 0 开始并复位，只有 test 需要兜底）。
+let mentionReCache = { user: '', mentionRe: null, anyAtRe: null };
+function getMentionRegexes(botUser) {
+  if (mentionReCache.user === botUser && mentionReCache.mentionRe) return mentionReCache;
+  const esc = botUser.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  mentionReCache = {
+    user: botUser,
+    mentionRe: new RegExp('(?:^|\\s)@' + esc + '(?=\\s|$|[，,。！？!?:：;；])', 'i'),
+    anyAtRe: new RegExp('@' + esc + '\\b', 'gi'),
+  };
+  return mentionReCache;
 }
 
 // 判定群组消息是否应当触发机器人响应，并剥离文本中的 @bot_username
@@ -141,9 +172,8 @@ function inspectGroupTrigger(msg, botIdentity, replyAllInGroup) {
   let mentioned = false;
   let cleaned = rawText;
   if (botUser) {
-    const esc = botUser.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const mentionRe = new RegExp('(?:^|\\s)@' + esc + '(?=\\s|$|[，,。！？!?:：;；])', 'gi');
-    const anyAtRe = new RegExp('@' + esc + '\\b', 'gi');
+    const { mentionRe, anyAtRe } = getMentionRegexes(botUser);
+    anyAtRe.lastIndex = 0;
     if (mentionRe.test(rawText) || anyAtRe.test(rawText)) {
       mentioned = true;
       cleaned = rawText.replace(anyAtRe, ' ').replace(/[ \t]{2,}/g, ' ').trim();
@@ -691,23 +721,29 @@ export async function handleTgWebhook(request, env) {
           }
 
           let targetModelId = mapGetBounded(tgUserModels, chatId, env && env.R2 ? tgUserModelsExp : null);
-          if (!targetModelId) {
-            targetModelId = await storeGet(env, `tg_user_${chatId}`);
-            if (targetModelId) mapSetBounded(tgUserModels, chatId, targetModelId, undefined, tgUserModelsExp);
+          // 三个互不依赖的状态读取并行（模型选择 / Agent 开关 / 会话历史），
+          // 冷缓存时省掉两个串行 R2 往返，直接反映到首字延迟上
+          const [storedModel, useAgent, baseHistory] = await Promise.all([
+            targetModelId ? Promise.resolve(null) : storeGet(env, `tg_user_${chatId}`),
+            agentGetMode(env, chatId),
+            tgGetHistory(env, chatId),
+          ]);
+          if (!targetModelId && storedModel) {
+            targetModelId = storedModel;
+            mapSetBounded(tgUserModels, chatId, targetModelId, undefined, tgUserModelsExp);
           }
 
-          const useAgent = await agentGetMode(env, chatId);
           const wantResume = useAgent && !multimodalContent && userText.trim() === '继续';
           let resumeState = null;
           if (wantResume) resumeState = await agentLoadResumeState(env, chatId);
-          if (useAgent && !resumeState) await agentClearResumeState(env, chatId);
+          // 清残留断点只是兜底清理，后面有秒级 AI 调用，不需要串行等待这次 R2 删除
+          if (useAgent && !resumeState) agentClearResumeState(env, chatId).catch(() => {});
 
-          const baseHistory = await tgGetHistory(env, chatId);
-          let history = baseHistory.slice();
-          if (!resumeState) {
-            history.push({ role: "user", content: multimodalContent || userText });
-            history = tgTrimHistory(history, env);
-          }
+          // tgGetHistory 返回的已是独立拷贝，tgTrimHistory 内部也会再拷贝，
+          // 这里用 concat 追加当前提问，baseHistory 保持不被污染（下方 finalHist 还要用）
+          const history = resumeState
+            ? baseHistory
+            : tgTrimHistory(baseHistory.concat([{ role: "user", content: multimodalContent || userText }]), env);
 
           const sendActionPromise = tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
           const pendingMsgPromise = tgApi('sendMessage', {
