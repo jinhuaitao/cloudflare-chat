@@ -2,7 +2,6 @@
 
 import { SSE_HEADERS } from './constants.js';
 import { tgAgentChat } from './agent/loop.js';
-import { normalizePersonaId } from './agent/personas.js';
 
 // ==================== Web 端 Agent（v6.6.0，v6.9.3 只读权限分域） ====================
 // 与 Telegram 共用 tgAgentChat（提供联网搜索、网页抓取、计算、天气、时间及知识库只读检索），
@@ -14,9 +13,9 @@ async function handleWebAgent(env, body) {
   const webChatId = 'web_' + sid;
   const history = Array.isArray(body.messages) ? body.messages : [];
   const targetModelId = body.model;
-  // 专家人格：网页端不落盘，只接受本次请求的显式指定；未指定或非法值一律 auto（按提问自动路由）
-  const personaReq = String(body.persona || '').trim().toLowerCase();
-  const personaId = personaReq === 'auto' ? 'auto' : (normalizePersonaId(personaReq) || 'auto');
+  // 专家人格固定「自动」：网页端是公开入口，不做人格选择器，也不读请求体里的 persona ——
+  // 每轮由提问内容确定性路由（零额外往返），避免公开页面被传参固定成某个角色。
+  const personaId = 'auto';
   const encoder = new TextEncoder();
   // Web 无 Telegram 上下文：typing 心跳直接 no-op
   const noOpTgApi = () => Promise.resolve({ ok: true });

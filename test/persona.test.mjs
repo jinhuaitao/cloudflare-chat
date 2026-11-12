@@ -16,6 +16,7 @@ import { agentLimits } from '../src/agent/limits.js';
 import { buildAgentSystemPrompt } from '../src/agent/prompt.js';
 import { parseWxCommand } from '../src/wechat/text.js';
 import { tgAgentChat, tgAgentResume } from '../src/agent/loop.js';
+import { handleWebAgent } from '../src/web-agent.js';
 
 // ==================== 注册表完整性 ====================
 test('人格 id 唯一，元信息与输出契约齐备', () => {
@@ -324,6 +325,31 @@ test('tgAgentChat 支持显式人格，且无关提问保持通用提示词', as
     assert.equal(captured[1].messages[0].content.includes('【当前专家角色】'), false);
     // 空知识库时 list_docs / read_doc 会被裁掉，19 - 2 = 17
     assert.equal((captured[1].tools || []).length, 17);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('网页端固定自动选择：忽略请求体 persona，按提问路由', async () => {
+  const original = globalThis.fetch;
+  const captured = [];
+  globalThis.fetch = async (url, init) => {
+    captured.push(JSON.parse(init.body));
+    return sse([{ choices: [{ delta: { content: '先看 nginx 错误日志。' } }] }]);
+  };
+  try {
+    const res = await handleWebAgent(ENV, {
+      model: 'mock-model',
+      session_id: 'persona1',
+      // 网页端不提供人格选择器：即使外部传了 writer，也必须按提问自动走运维
+      persona: 'writer',
+      messages: [{ role: 'user', content: '服务器 502 怎么排查' }],
+    });
+    await res.text();
+    assert.equal(captured.length, 1);
+    const sys = captured[0].messages[0].content;
+    assert.ok(sys.includes('【当前专家角色】🛠️ 运维排障'), '网页端应按提问自动选运维');
+    assert.equal(sys.includes('✍️ 写作编辑'), false, '网页端不应被请求体固定成写作人格');
   } finally {
     globalThis.fetch = original;
   }
