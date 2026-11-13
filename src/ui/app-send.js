@@ -30,8 +30,14 @@ export default `  async function sendMessage() {
 
     const aiMsgId = 'ai_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
     // 字符串拼接替换模板字符串
+    // 思维链与工具轨迹一样收进折叠胶囊：默认只有一行状态，点开才展开原文。
+    // 旧版把 reasoning 直接铺成一个 160px 滚动框，思考长的模型（DeepSeek 等）会让
+    // 气泡里先出现一大段"自言自语"，正文反而被挤到下面看不见。
     appendMessageDOM('ai', 
-      '<div class="reasoning-box" style="display:none;"></div>' +
+      '<details class="reasoning" hidden>' +
+        '<summary class="reasoning-summary"><span class="reasoning-title">💭 正在深度思考…</span></summary>' +
+        '<div class="reasoning-box"></div>' +
+      '</details>' +
       '<div class="message-text markdown-body">' +
         '<div class="typing-indicator"><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div>' +
       '</div>', aiMsgId);
@@ -57,11 +63,52 @@ export default `  async function sendMessage() {
       let idleTimedOut = false; // 区分"用户手动中止"与"看门狗中止"
 
       const rBox = bubble.querySelector('.reasoning-box');
+      const rWrap = bubble.querySelector('.reasoning');
+      const rTitle = bubble.querySelector('.reasoning-title');
       const tBox = bubble.querySelector('.message-text');
+
+      // 思考胶囊的状态机：流式期间显示"正在深度思考…（Ns）"，收尾后定格为"深度思考 Ns"。
+      // 计时只用于这行标题，不参与任何持久化 —— 与工具轨迹胶囊一致，刷新后不留中间态。
+      let reasonT0 = 0;
+      let reasonT1 = 0;
+      let reasonTimer = null;
+      function updateReasoningHead() {
+        if (!rTitle) return;
+        const end = reasonT1 || Date.now();
+        const sec = reasonT0 ? Math.max(0, Math.round((end - reasonT0) / 1000)) : 0;
+        if (!reasonT1 && isCurrentlyStreaming) {
+          rTitle.textContent = '💭 正在深度思考…' + (sec >= 3 ? '（' + sec + ' 秒）' : '');
+          if (rWrap) rWrap.classList.add('live');
+        } else {
+          rTitle.textContent = sec >= 1 ? '💭 深度思考 ' + sec + ' 秒' : '💭 已深度思考';
+          if (rWrap) rWrap.classList.remove('live');
+        }
+      }
+      function noteReasoningStart() {
+        if (!reasonT0) {
+          reasonT0 = Date.now();
+          if (!reasonTimer) reasonTimer = setInterval(updateReasoningHead, 1000);
+        }
+        if (rWrap) rWrap.hidden = false;
+      }
+      function finishReasoning() {
+        if (reasonTimer) { clearInterval(reasonTimer); reasonTimer = null; }
+        if (reasonT0 && !reasonT1) reasonT1 = Date.now();
+        updateReasoningHead();
+      }
+      function resetReasoning() {
+        if (reasonTimer) { clearInterval(reasonTimer); reasonTimer = null; }
+        reasonT0 = 0;
+        reasonT1 = 0;
+        if (rBox) rBox.textContent = '';
+        if (rWrap) { rWrap.hidden = true; rWrap.open = false; rWrap.classList.remove('live'); }
+        if (rTitle) rTitle.textContent = '💭 正在深度思考…';
+      }
 
       let isRenderPending = false;
       let lastRenderTime = 0;
       const cursorHtml = '<span style="display:inline-block; width:6px; height:18px; background:var(--brand-color); animation:typing 1s infinite; vertical-align:middle; margin-left:4px; border-radius:2px;"></span>';
+      const typingHtml = '<div class="typing-indicator"><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div>';
 
       function scheduleUpdateUI(force = false) {
         const now = Date.now();
@@ -76,15 +123,19 @@ export default `  async function sendMessage() {
           if ((!isCurrentlyStreaming && !force) || !isCurrentActiveSession()) return;
 
           if (reasoningContent && rBox) {
-            if (rBox.style.display === 'none') rBox.style.display = 'block';
+            if (rWrap) rWrap.hidden = false;
             rBox.textContent = reasoningContent;
             rBox.scrollTop = rBox.scrollHeight;
+            updateReasoningHead();
           }
 
-          if (aiContent || !reasoningContent) {
+          // 正文只在真有内容时写；否则保持打字点。
+          // 旧版在这里塞了一句蓝色「深度思考中」占位，与新思考胶囊的标题重复，且位置落在
+          // 工具轨迹下方，读起来像回答结束又冒出一句状态。
+          if (aiContent) {
             tBox.innerHTML = safeHtml(aiContent) + (isCurrentlyStreaming ? cursorHtml : '');
-          } else if (reasoningContent && !aiContent) {
-            tBox.innerHTML = '<div style="color: var(--brand-color); font-size: 14px; font-weight: 500;">正在深度思考... ▍</div>';
+          } else if (isCurrentlyStreaming && !tBox.querySelector('.typing-indicator')) {
+            tBox.innerHTML = typingHtml;
           }
 
           const distanceToBottom = scrollArea.scrollHeight - scrollArea.scrollTop - scrollArea.clientHeight;
@@ -163,7 +214,10 @@ export default `  async function sendMessage() {
         if (!agentProgressEl) {
           agentProgressEl = document.createElement('div');
           agentProgressEl.className = 'agent-progress';
-          bubble.appendChild(agentProgressEl);
+          // 进度条要贴在正文上方：旧版 appendChild 会插到 .message-text 后面，
+          // 于是「已等待 N 秒」跑到回答文字下面，看起来像答完了还在等。
+          if (tBox && tBox.parentNode === bubble) bubble.insertBefore(agentProgressEl, tBox);
+          else bubble.appendChild(agentProgressEl);
           if (!agentProgressT0) agentProgressT0 = Date.now();
           agentProgressTimer = setInterval(renderAgentProgress, 1000);
         }
@@ -193,8 +247,8 @@ export default `  async function sendMessage() {
       function resetStreamedText() {
         aiContent = '';
         reasoningContent = '';
-        if (rBox) { rBox.style.display = 'none'; rBox.textContent = ''; }
-        tBox.innerHTML = '';
+        resetReasoning();
+        tBox.innerHTML = typingHtml;
         if (agentProgressEl) showAgentProgress(agentProgressBase || '🤖 Agent 正在继续…');
       }
 
@@ -226,8 +280,8 @@ export default `  async function sendMessage() {
         agentPersonaTrace = '';
         agentPersonaDetail = null;
         clearAgentProgress();
-        if (rBox) { rBox.style.display = 'none'; rBox.textContent = ''; }
-        tBox.innerHTML = '';
+        resetReasoning();
+        tBox.innerHTML = typingHtml;
       }
 
       // 单次流式请求。收到 [DONE] 返回 true；网络/鉴权等错误直接 throw。
@@ -317,7 +371,7 @@ export default `  async function sendMessage() {
             }
             if (sseData.choices && sseData.choices[0] && sseData.choices[0].delta) {
               const delta = sseData.choices[0].delta;
-              if (delta.reasoning_content) reasoningContent += delta.reasoning_content;
+              if (delta.reasoning_content) { noteReasoningStart(); reasoningContent += delta.reasoning_content; }
               if (delta.content !== undefined && delta.content !== null && delta.content !== '') {
                 aiContent += delta.content;
                 hideAgentProgress();
@@ -335,7 +389,7 @@ export default `  async function sendMessage() {
             const data = JSON.parse(buffer.slice(5).trim());
             if (data.choices && data.choices[0].delta) {
               const delta = data.choices[0].delta;
-              if (delta.reasoning_content) reasoningContent += delta.reasoning_content;
+              if (delta.reasoning_content) { noteReasoningStart(); reasoningContent += delta.reasoning_content; }
               if (delta.content) aiContent += delta.content;
             }
           } catch(e) {}
@@ -379,10 +433,17 @@ export default `  async function sendMessage() {
       if (!gotDone) throw streamError;
 
       isCurrentlyStreaming = false;
-      if (!reasoningContent && rBox) rBox.remove();
+      finishReasoning();
+      // 没产生思考就整块移除，别留一个空的可展开胶囊占位
+      if (!reasoningContent && rWrap && rWrap.parentNode) rWrap.parentNode.removeChild(rWrap);
       clearAgentProgress();
 
-      tBox.innerHTML = safeHtml(aiContent);
+      if (aiContent) {
+        tBox.innerHTML = safeHtml(aiContent);
+      } else {
+        // 只有思考、没有正文：给一句明确交代，避免 finally 把打字点误判成「连接中断」
+        tBox.innerHTML = '<span style="color: var(--muted); font-size: 13px;">（本轮模型只输出了思考过程，没有给出答复，可以补充信息后重问）</span>';
+      }
       bubble.__rawText = aiContent;   // 供「复制」取原始 Markdown
       if (isCurrentActiveSession() && isNearBottom) scrollArea.scrollTop = scrollArea.scrollHeight;
 
@@ -410,6 +471,7 @@ export default `  async function sendMessage() {
     } catch (error) {
       if (!error) error = new Error('连接意外中断（未收到结束标记）');
       isCurrentlyStreaming = false;
+      finishReasoning();
       clearAgentProgress();
       const tBox = bubble.querySelector('.message-text');
 
@@ -446,7 +508,7 @@ export default `  async function sendMessage() {
             bubble.__time = partT;
             ensureMessageActions(bubble);
           }
-          if (rBox && reasoningContent) rBox.remove();
+          if (rWrap && reasoningContent && rWrap.parentNode) rWrap.parentNode.removeChild(rWrap);
         } else {
           tBox.innerText = '通信断开: ' + error.message; 
           if (bubble.parentElement) bubble.parentElement.classList.add('error-msg');

@@ -451,17 +451,65 @@ export default `  <style>
       white-space: pre;
     }
 
-    /* ---------------- 推理过程 / 工具轨迹胶囊 / 消息操作 ---------------- */
-    .reasoning-box {
-      font-size: 13.5px; color: var(--text-2);
+    /* ---------------- 推理过程（折叠胶囊）/ 工具轨迹胶囊 / 消息操作 ---------------- */
+    /* 与工具轨迹胶囊同一套视觉语言：一行摘要，点开才展开思考原文。
+       旧版是一个 160px 高的常驻滚动框，长思考会把正文挤到看不见。 */
+    .reasoning {
+      margin: 0 0 12px;
+      border: 1px solid var(--border);
       background: var(--bg-soft);
-      padding: 11px 14px;
-      border-radius: 12px;
-      border-left: 3px solid var(--border-strong);
-      margin-bottom: 14px;
-      white-space: pre-wrap; line-height: 1.6;
-      max-height: 160px; overflow-y: auto;
+      border-radius: 10px;
+      font-size: 12.5px;
+      color: var(--text-2);
+      overflow: hidden;
+    }
+    .reasoning[hidden] { display: none; }
+    .reasoning-summary {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 6px 12px;
+      cursor: pointer;
+      font-weight: 550;
+      user-select: none;
+      list-style: none;
+      transition: background .12s ease, color .12s ease;
+    }
+    .reasoning-summary::-webkit-details-marker { display: none; }
+    .reasoning-summary::after {
+      content: '▾';
+      font-size: 12px;
+      color: var(--muted);
+      transition: transform .15s ease;
+    }
+    .reasoning[open] .reasoning-summary::after { transform: rotate(180deg); }
+    .reasoning-summary:hover { background: var(--hover); color: var(--text); }
+    .reasoning-title {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    /* 生成中：标题走品牌色 + 呼吸小点，与「已经想完」的静态态区分 */
+    .reasoning.live .reasoning-title { color: var(--brand-color); }
+    .reasoning.live .reasoning-title::after {
+      content: '';
+      display: inline-block;
+      width: 5px; height: 5px;
+      margin-left: 6px;
+      border-radius: 50%;
+      background: var(--brand-color);
+      vertical-align: middle;
+      animation: speakPulse 1.2s infinite ease-in-out;
+    }
+    .reasoning-box {
+      padding: 8px 12px 10px;
+      border-top: 1px solid var(--border);
+      white-space: pre-wrap; line-height: 1.62;
+      max-height: 240px; overflow-y: auto;
       overflow-wrap: anywhere;
+      font-size: 12.5px;
+      color: var(--text-2);
     }
     .reasoning-box::-webkit-scrollbar { width: 4px; }
     .reasoning-box::-webkit-scrollbar-thumb { background: rgba(128, 128, 128, .3); border-radius: 4px; }
@@ -635,7 +683,8 @@ export default `  <style>
       white-space: pre-line;
       overflow-wrap: anywhere;
     }
-    .agent-progress { animation: speakPulse 1.6s infinite ease-in-out; }
+    /* 进度条现在插在正文之前，补一点下间距，别和回答首行粘在一起 */
+    .agent-progress { animation: speakPulse 1.6s infinite ease-in-out; margin-bottom: 10px; }
 
     /* ---------------- 打字指示器 ---------------- */
     .typing-indicator {

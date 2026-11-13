@@ -170,6 +170,23 @@ test('专家徽标可折叠详情在样式、构建、事件与持久化四处�
   assert.ok(inline.includes('agentPersonaDetail = null'), '重置时未清理明细状态');
 });
 
+test('思考过程默认折叠、不与正文占位重复，且进度条贴在正文上方', () => {
+  // 这张截图暴露的三个具体缺陷：
+  //   1) 思维链被铺成 160px 常驻滚动框，思考长的模型会把正文挤到看不见；
+  //   2) 正文区同时渲染一句「正在深度思考... ▍」，与思考框内容重复，且落在工具轨迹下方；
+  //   3) 进度条 appendChild 到气泡末尾，实际位置在正文之后，像是答完了还在等。
+  const inline = HTML_CONTENT.match(/<script>([\s\S]*)<\/script>/)[1];
+  assert.ok(HTML_CONTENT.includes('.reasoning {'), '缺少思考胶囊样式');
+  assert.ok(HTML_CONTENT.includes('.reasoning-summary'), '缺少折叠摘要行样式');
+  assert.ok(inline.includes('<details class="reasoning" hidden>'), '思考过程应是默认收起的 details');
+  assert.ok(inline.includes('function updateReasoningHead'), '缺少「正在深度思考/深度思考 N 秒」状态机');
+  assert.ok(inline.includes('noteReasoningStart'), '流式增量未驱动思考胶囊');
+  assert.ok(inline.includes('finishReasoning'), '收尾未定格思考计时');
+  assert.equal(inline.includes('正在深度思考... ▍'), false, '正文区不应再渲染重复的思考占位');
+  assert.ok(inline.includes('bubble.insertBefore(agentProgressEl, tBox)'), '进度条应插在正文之前');
+  assert.ok(inline.includes('if (!reasoningContent && rWrap'), '没思考时应整块移除胶囊');
+});
+
 test('app-kb.js 需要的 DOM 节点与接口都已接线', () => {
   // 这三个 id 曾经在 body.js 里全都不存在，导致 app-kb.js 变成死代码
   for (const id of ['kbModal', 'kbModalToggle', 'kbCloseBtn', 'kbRefreshBtn', 'kbListBox']) {

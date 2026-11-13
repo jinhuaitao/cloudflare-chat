@@ -19,6 +19,11 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json 与 README.md 的版本号，
 // CI 会用 npm run check 校验三处一致，防止文档与代码再次脱节）
+// 7.18.0：网页端思考过程改为折叠胶囊——旧版把 reasoning 铺成 160px 常驻滚动框，
+//         思考长的模型会让气泡里先出现一大段"自语"，正文被挤到下面；同时正文区还渲染
+//         一句「正在深度思考…」占位，与新胶囊标题重复且落在工具轨迹下方。现在默认只留
+//         一行「💭 正在深度思考…N 秒」（品牌色 + 呼吸点），点开才看原文，收尾定格为
+//         「💭 深度思考 N 秒」，没思考就整块移除；进度条改插在正文之前。
 // 7.17.0：网页端 🧭 徽标可展开——服务端把路由明细（结论、命中词、逐阶段分工、打分表）
 //         随 agent_persona 事件一并下发，点开即网页版 /agent why；明细随消息落库，
 //         切换会话/刷新后仍可展开；旧消息没有明细时回退成原来的静态胶囊。
@@ -72,7 +77,7 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 //        断点起点修正、流式读取不阻塞、抓取失败语义统一）。
 // 7.5.0：Agent 内核加固（工具并发闸门、预算感知超时、步数感知收束、双保险空转熔断、
 //        历史轮次压缩）+ 工具箱新增 JSON/正则动作 + 全量回归测试。
-const APP_VERSION = '7.17.0';
+const APP_VERSION = '7.18.0';
 const PNG_HEADERS = {
   'Content-Type': 'image/png',
   'Cache-Control': 'public, max-age=86400',
