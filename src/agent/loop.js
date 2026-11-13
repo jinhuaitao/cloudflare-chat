@@ -46,7 +46,7 @@ import { kbGetRegistry } from '../kb/registry.js';
 import { mapLimit } from '../utils.js';
 import { sanitizeHistory, lastUserText } from './history.js';
 import { agentGetPersona } from './mode.js';
-import { resolvePersona, personaById, personaAllowsTool, formatPersonaBadge, formatChainBadge, formatRouteHit, formatPersonaTrace, DEFAULT_PERSONA_ID } from './personas.js';
+import { resolvePersona, personaById, personaAllowsTool, formatPersonaBadge, formatChainBadge, formatRouteHit, formatPersonaTrace, personaRouteDetail, DEFAULT_PERSONA_ID } from './personas.js';
 
 const WRITE_TOOLS_SET = new Set(['remember', 'forget_memory', 'save_doc', 'delete_doc']);
 
@@ -203,6 +203,9 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
     result.personaRoute = { source: route.source, reason: route.reason, matched: route.matched.slice(0, 5) };
     const trace = formatPersonaTrace(route);
     if (trace) result.personaTrace = trace;
+    // 明细只在有徽标时才有意义（通用回落不打扰），且沿用路由时的那句话，
+    // 保证「打分明细」和「实际选择」来自同一次判定。
+    if (trace) result.personaDetail = personaRouteDetail(route, query);
     if (chain) result.personaChain = chain.map(p => p.id);
   }
   await recordWorkingMemory(env, chatId, origUserText, result, opts);

@@ -19,6 +19,9 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json 与 README.md 的版本号，
 // CI 会用 npm run check 校验三处一致，防止文档与代码再次脱节）
+// 7.17.0：网页端 🧭 徽标可展开——服务端把路由明细（结论、命中词、逐阶段分工、打分表）
+//         随 agent_persona 事件一并下发，点开即网页版 /agent why；明细随消息落库，
+//         切换会话/刷新后仍可展开；旧消息没有明细时回退成原来的静态胶囊。
 // 7.16.0：网页端补齐「谁答的」——专家路由结果以 agent_persona 事件下发，
 //         消息气泡顶部留一条可回溯的 🧭 摘要（角色 + 命中依据 / 接力链），
 //         并随会话消息落 localStorage，切换会话与刷新后仍在；
@@ -69,7 +72,7 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 //        断点起点修正、流式读取不阻塞、抓取失败语义统一）。
 // 7.5.0：Agent 内核加固（工具并发闸门、预算感知超时、步数感知收束、双保险空转熔断、
 //        历史轮次压缩）+ 工具箱新增 JSON/正则动作 + 全量回归测试。
-const APP_VERSION = '7.16.0';
+const APP_VERSION = '7.17.0';
 const PNG_HEADERS = {
   'Content-Type': 'image/png',
   'Cache-Control': 'public, max-age=86400',

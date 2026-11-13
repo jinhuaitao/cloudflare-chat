@@ -103,6 +103,7 @@ export default `  async function sendMessage() {
       let agentTraceEl = null;
       let agentPersonaEl = null;
       let agentPersonaTrace = '';
+      let agentPersonaDetail = null;
 
       function recordAgentToolSteps(progressText) {
         const lines = String(progressText || '').split('\\n').map(s => s.trim()).filter(Boolean);
@@ -140,17 +141,17 @@ export default `  async function sendMessage() {
       }
 
       // 本轮由哪位专家处理：插在气泡最上方，正文流式推完后进度条会收起，这条留着可回看。
-      // 内容由服务端统一生成（personas.formatPersonaTrace），前端只负责显示，不重复判断逻辑。
-      function showAgentPersona(trace) {
+      // 摘要文案与打分明细都由服务端给（personas.formatPersonaTrace / personaRouteDetail），
+      // 前端只负责折叠交互，不重复实现路由判定。
+      function showAgentPersona(trace, detail) {
         const text = String(trace || '').trim();
         if (!text) return;
         agentPersonaTrace = text;
-        if (!agentPersonaEl) {
-          agentPersonaEl = document.createElement('div');
-          agentPersonaEl.className = 'agent-persona';
-          bubble.insertBefore(agentPersonaEl, bubble.firstChild);
-        }
-        agentPersonaEl.textContent = text;
+        agentPersonaDetail = (detail && typeof detail === 'object') ? detail : null;
+        // 明细可能晚于摘要到达（或缺失），统一重建而不是原地改文本
+        if (agentPersonaEl && agentPersonaEl.parentNode) agentPersonaEl.parentNode.removeChild(agentPersonaEl);
+        agentPersonaEl = createPersonaCard(text, agentPersonaDetail);
+        if (agentPersonaEl) bubble.insertBefore(agentPersonaEl, bubble.firstChild);
       }
 
       function renderAgentProgress() {
@@ -223,6 +224,7 @@ export default `  async function sendMessage() {
         if (agentPersonaEl && agentPersonaEl.parentNode) agentPersonaEl.parentNode.removeChild(agentPersonaEl);
         agentPersonaEl = null;
         agentPersonaTrace = '';
+        agentPersonaDetail = null;
         clearAgentProgress();
         if (rBox) { rBox.style.display = 'none'; rBox.textContent = ''; }
         tBox.innerHTML = '';
@@ -290,7 +292,7 @@ export default `  async function sendMessage() {
                   showAgentProgress(adata.agent_progress);
                   handledAsAgentEvent = true;
                 } else if (adata && adata.agent_persona !== undefined) {
-                  showAgentPersona(adata.agent_persona && adata.agent_persona.trace);
+                  showAgentPersona(adata.agent_persona && adata.agent_persona.trace, adata.agent_persona && adata.agent_persona.detail);
                   handledAsAgentEvent = true;
                 } else if (adata && adata.agent_reset !== undefined) {
                   resetStreamedText();
@@ -397,6 +399,8 @@ export default `  async function sendMessage() {
           // 存进消息而不是只留在 DOM：切会话时 renderMessages 会整片重建，
           // 不落库的话徽标一刷新就没了。没有走专家路由时不写这个字段，保持旧数据形状。
           ...(agentPersonaTrace ? { personaTrace: agentPersonaTrace } : {}),
+          // 明细一并落库，否则重绘/切会话后胶囊还在、点开却是空的
+          ...(agentPersonaDetail ? { personaDetail: agentPersonaDetail } : {}),
         });
         bubble.__time = aiT;
         ensureMessageActions(bubble);

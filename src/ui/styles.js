@@ -467,17 +467,83 @@ export default `  <style>
     .reasoning-box::-webkit-scrollbar-thumb { background: rgba(128, 128, 128, .3); border-radius: 4px; }
 
     /* v7.0.0：可折叠「工具调用轨迹胶囊」 */
+    /* 「谁答的」胶囊：默认只有一行，点开才显示打分明细（等价于 /agent why） */
     .agent-persona {
-      display: inline-block;
       margin: 0 0 10px;
+      font-size: 12.5px;
+      line-height: 1.6;
+      color: var(--text-2);
+    }
+    /* 没有明细（旧会话数据）时保持原来的静态胶囊观感 */
+    .agent-persona.static {
+      display: inline-block;
       padding: 3px 10px;
       border: 1px solid var(--border);
       border-radius: 999px;
       background: var(--bg-soft);
-      font-size: 12.5px;
-      line-height: 1.6;
-      color: var(--text-2);
       user-select: none;
+    }
+    .agent-persona-head {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      max-width: 100%;
+      padding: 3px 10px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--bg-soft);
+      color: var(--text-2);
+      font: inherit;
+      text-align: left;
+      cursor: pointer;
+      user-select: none;
+      transition: background .12s ease, color .12s ease, border-color .12s ease;
+    }
+    .agent-persona-head:hover { background: var(--hover); color: var(--text); border-color: var(--border); }
+    .agent-persona-head:focus-visible { outline: 2px solid var(--brand-color); outline-offset: 2px; }
+    .agent-persona-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .agent-persona-chev { font-size: 10px; color: var(--muted); transition: transform .15s ease; }
+    .agent-persona.open .agent-persona-chev { transform: rotate(180deg); }
+    .agent-persona-body {
+      margin-top: 8px;
+      padding: 9px 11px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--bg-soft);
+      font-size: 12px;
+      color: var(--text-2);
+      user-select: text;
+    }
+    .agent-persona-body[hidden] { display: none; }
+    .ap-reason { font-weight: 550; color: var(--text); margin-bottom: 6px; }
+    .ap-chips { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-bottom: 6px; }
+    .ap-chips-label { color: var(--muted); margin-right: 2px; }
+    .ap-chip {
+      padding: 0 7px;
+      border-radius: 6px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 11.5px;
+      line-height: 18px;
+    }
+    .ap-stages { list-style: none; margin: 0 0 6px; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+    .ap-stage { display: flex; flex-wrap: wrap; gap: 5px; align-items: baseline; }
+    .ap-seg { color: var(--text); }
+    .ap-arrow { color: var(--muted); }
+    .ap-who { color: var(--text); }
+    /* 名字列用固定宽度，跨行才能对齐；用 flex 而不是 grid，是为了让每行仍是一个整体 */
+    .ap-cell { display: flex; flex-direction: column; min-width: 0; flex: 0 0 108px; }
+    .ap-score { color: var(--muted); font-variant-numeric: tabular-nums; flex: 0 0 auto; text-align: right; }
+    .ap-words { color: var(--muted); font-size: 11.5px; line-height: 1.5; overflow-wrap: anywhere; }
+    .ap-rank { display: flex; flex-direction: column; gap: 7px; margin-top: 2px; }
+    .ap-rank-row { display: flex; align-items: center; gap: 10px; }
+    .ap-bar { display: block; flex: 1 1 auto; min-width: 40px; height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; }
+    .ap-bar-fill { display: block; height: 100%; background: var(--brand-color); border-radius: 3px; }
+    .ap-note { margin-top: 6px; color: var(--muted); }
+    /* 窄屏：名字列收窄，把宽度让给分数条 */
+    @media (max-width: 420px) {
+      .ap-cell { flex-basis: 92px; }
+      .ap-rank-row { gap: 8px; }
     }
     .agent-trace {
       margin: 0 0 12px;

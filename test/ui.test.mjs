@@ -147,6 +147,29 @@ test('Agent 专家徽标在样式、事件解析与历史重绘三处都已接�
   assert.ok(inline.includes('personaTrace'), '历史消息重绘未还原 personaTrace');
 });
 
+test('专家徽标可折叠详情在样式、构建、事件与持久化四处都已接线', () => {
+  // 少任何一环都会「点得开但没内容」或「切会话回来点开是空的」：
+  // 没样式 → 详情撑破气泡；没解析 detail → 只有一行摘要；没落库 → 重绘后明细丢失。
+  const inline = HTML_CONTENT.match(/<script>([\s\S]*)<\/script>/)[1];
+  assert.ok(HTML_CONTENT.includes('.agent-persona-body'), '缺少详情面板样式');
+  assert.ok(HTML_CONTENT.includes('.ap-rank-row'), '缺少打分行样式');
+  assert.ok(inline.includes('function createPersonaCard'), '缺少统一的徽标构建函数');
+  assert.ok(inline.includes('aria-expanded'), '折叠按钮缺少 aria-expanded');
+  assert.ok(inline.includes('setAttribute(\'aria-expanded\''), '点击时应切换 aria-expanded');
+  assert.ok(inline.includes('body.hidden'), '详情默认应收起');
+  // 明细字段都要用到：结论、命中词、阶段、打分表、承接来源、固定提示
+  for (const field of ['reasonText', 'matched', 'stages', 'ranked', 'continuedFrom', 'source === \'manual\'']) {
+    assert.ok(inline.includes(field), '详情面板未消费字段：' + field);
+  }
+  // 流式路径与历史重绘必须共用同一构建函数，否则两处形态会分叉
+  assert.ok(inline.includes('adata.agent_persona.trace, adata.agent_persona && adata.agent_persona.detail'),
+    '流式接收未把 detail 传给徽标');
+  assert.ok(inline.includes('msg.personaTrace, msg.personaDetail'), '历史重绘未传 personaDetail');
+  // 明细要落库，否则切会话/刷新后胶囊还在、点开为空
+  assert.ok(inline.includes('personaDetail: agentPersonaDetail'), '明细未写入消息对象');
+  assert.ok(inline.includes('agentPersonaDetail = null'), '重置时未清理明细状态');
+});
+
 test('app-kb.js 需要的 DOM 节点与接口都已接线', () => {
   // 这三个 id 曾经在 body.js 里全都不存在，导致 app-kb.js 变成死代码
   for (const id of ['kbModal', 'kbModalToggle', 'kbCloseBtn', 'kbRefreshBtn', 'kbListBox']) {

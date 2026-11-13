@@ -707,6 +707,62 @@ function formatPersonaTrace(route) {
   return '🧭 ' + p.emoji + ' ' + p.name + (why ? ' · ' + why : '');
 }
 
+// 展开面板用的结构化明细（网页端「谁答的」胶囊 → 点开 = 网页版 /agent why）。
+// 这里返回对象而不是拼好的一段文本：前端要排版成 chip、分数条和阶段列表，
+// 文本换行在窄气泡里会散架；同时也避免把一整段复盘文案塞进 SSE。
+// 数据来源与 /agent why 完全一致（同一份确定性打分），不额外存状态。
+const ROUTE_DETAIL_MAX_RANKED = 4;
+
+// 用户原话片段回显给同一用户，只需要截断与压平空白，不做改写
+function clipText(s, n) {
+  const t = String(s === undefined || s === null ? '' : s).replace(/\s+/g, ' ').trim();
+  return t.length > n ? t.slice(0, n - 1) + '…' : t;
+}
+
+function personaRouteDetail(route, text) {
+  if (!route || !route.persona) return null;
+  const p = route.persona;
+  const detail = {
+    persona: { id: p.id, emoji: p.emoji, name: p.name },
+    source: route.source,
+    reason: route.reason,
+    reasonText: ROUTE_REASON_TEXT[route.reason] || '',
+    score: route.score || 0,
+    minScore: MIN_SCORE,
+    matched: (route.matched || []).slice(0, 5),
+  };
+  if (route.reason === 'chain' && Array.isArray(route.chainDetail)) {
+    detail.stages = route.chainDetail.map((d, i) => ({
+      n: i + 1,
+      segment: clipText(d.segment, 28),
+      id: d.persona.id,
+      emoji: d.persona.emoji,
+      name: d.persona.name,
+      score: d.score || 0,
+      matched: (d.matched || []).slice(0, 3),
+    }));
+    return detail;
+  }
+  if (route.reason === 'followup' && route.continuedFrom) {
+    const prev = personaById(route.continuedFrom);
+    if (prev) detail.continuedFrom = { id: prev.id, emoji: prev.emoji, name: prev.name };
+  }
+  // 手动固定时自动打分与实际执行无关，列出来只会误导，直接返回结论
+  if (route.source === 'manual' || !text) return detail;
+  const ranked = explainRoute(String(text)).ranked;
+  detail.ranked = ranked
+    .filter(r => r.score > 0)
+    .slice(0, ROUTE_DETAIL_MAX_RANKED)
+    .map(r => ({
+      id: r.persona.id,
+      emoji: r.persona.emoji,
+      name: r.persona.name,
+      score: r.score,
+      matched: r.matched.slice(0, 4),
+    }));
+  return detail;
+}
+
 function personaAllowsTool(persona, name) {
   if (!persona || !Array.isArray(persona.tools)) return true;
   return persona.tools.indexOf(String(name || '')) !== -1;
@@ -787,6 +843,7 @@ export {
   formatRouteHit,
   formatRouteWhy,
   formatPersonaTrace,
+  personaRouteDetail,
   personaAllowsTool,
   personaPromptBlock,
   chainPromptBlock,

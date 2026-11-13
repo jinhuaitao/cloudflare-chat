@@ -10,6 +10,7 @@ import {
   normalizePersonaId, getPersona, personaById, listPersonas,
   routePersona, resolvePersona, explainRoute, formatRouteHit, formatRouteWhy,
   formatPersonaTrace,
+  personaRouteDetail,
   personaAllowsTool, personaPromptBlock,
   formatPersonaList, formatPersonaBadge,
 } from '../src/agent/personas.js';
@@ -443,6 +444,14 @@ test('网页端固定自动选择：忽略请求体 persona，按提问路由', 
     // 网页端没有 /agent status，这条事件是用户事后唯一能看见「谁答的」的地方
     assert.ok(sseBody.includes('"agent_persona"'), '缺少人格摘要事件');
     assert.ok(sseBody.includes('🧭 🛠️ 运维排障'), '人格摘要事件里应带角色名：' + sseBody.slice(0, 400));
+    // 摘要要带可展开的明细（等价于网页版 /agent why），否则点开是空的
+    const evt = sseBody.split('\n')
+      .filter(l => l.startsWith('data:') && l.includes('agent_persona'))
+      .map(l => JSON.parse(l.slice(5).trim()))[0];
+    assert.ok(evt && evt.agent_persona.detail, '缺少明细字段');
+    assert.equal(evt.agent_persona.detail.persona.id, 'ops');
+    assert.ok(evt.agent_persona.detail.ranked.length > 0, '明细要有打分表');
+    assert.ok(evt.agent_persona.detail.reasonText.length > 0, '明细要有结论文案');
   } finally {
     globalThis.fetch = original;
   }
@@ -489,6 +498,50 @@ test('formatPersonaTrace 给出可留存的「本轮由谁处理」摘要', () =
   // 入参缺失不抛错
   assert.equal(formatPersonaTrace(null), '');
   assert.equal(formatPersonaTrace({}), '');
+});
+
+test('personaRouteDetail 展开明细与 /agent why 同源：结论、命中词、打分表', () => {
+  const q = '服务器 502 怎么排查';
+  const d = personaRouteDetail(resolvePersona('auto', q), q);
+  assert.equal(d.persona.id, 'ops');
+  assert.equal(d.reason, 'matched');
+  assert.ok(d.reasonText.includes('得分最高'), '结论文案缺失：' + d.reasonText);
+  assert.equal(d.minScore, 3);
+  assert.ok(d.score >= 3);
+  assert.ok(d.matched.includes('502'), '命中词要带出来');
+  assert.ok(Array.isArray(d.ranked) && d.ranked.length > 0, '要有打分表');
+  // 打分表与 explainRoute 完全一致（同一份确定性计算）
+  const ranked = explainRoute(q).ranked.filter(r => r.score > 0);
+  assert.deepEqual(d.ranked.map(r => r.id), ranked.slice(0, 4).map(r => r.persona.id));
+  assert.equal(d.ranked[0].score, ranked[0].score);
+  // 明细不携带用户原话以外的内容，也不含超长字段
+  for (const r of d.ranked) assert.ok(r.matched.length <= 4);
+
+  // 接力：逐阶段给出原话片段、角色与分数
+  const cq = '先写一份小程序 PRD，然后制定一个两周的上线计划';
+  const c = personaRouteDetail(resolvePersona('auto', cq), cq);
+  assert.equal(c.reason, 'chain');
+  assert.ok(Array.isArray(c.stages) && c.stages.length >= 2, '接力要逐阶段展开');
+  assert.equal(c.stages[0].n, 1);
+  assert.ok(c.stages[0].segment.length > 0 && c.stages[0].segment.length <= 28);
+  assert.ok(c.stages.every(s => s.id && s.name && s.emoji), '每个阶段都要带角色信息');
+  assert.equal(c.ranked, undefined, '接力时不该再列单角色打分表');
+
+  // 手动固定：明确不走自动路由，也不给容易误导的打分表
+  const m = personaRouteDetail(resolvePersona('writer', '服务器 502 怎么排查'), '服务器 502 怎么排查');
+  assert.equal(m.source, 'manual');
+  assert.equal(m.persona.id, 'writer');
+  assert.equal(m.ranked, undefined);
+  assert.ok(m.reasonText.includes('手动固定'));
+
+  // 通用回落：明细仍返回（徽标本身为空，前端不会显示），但结论是「意图不明确」
+  const low = personaRouteDetail(resolvePersona('auto', '你好'), '你好');
+  assert.equal(low.persona.id, 'general');
+  assert.ok(['low', 'ambiguous'].includes(low.reason));
+
+  // 入参缺失不抛错
+  assert.equal(personaRouteDetail(null, 'x'), null);
+  assert.equal(personaRouteDetail({}, 'x'), null);
 });
 
 test('formatRouteWhy 输出完整复盘：得分、命中词、结论与固定提示', () => {
