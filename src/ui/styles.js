@@ -467,6 +467,18 @@ export default `  <style>
     .reasoning-box::-webkit-scrollbar-thumb { background: rgba(128, 128, 128, .3); border-radius: 4px; }
 
     /* v7.0.0：可折叠「工具调用轨迹胶囊」 */
+    .agent-persona {
+      display: inline-block;
+      margin: 0 0 10px;
+      padding: 3px 10px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--bg-soft);
+      font-size: 12.5px;
+      line-height: 1.6;
+      color: var(--text-2);
+      user-select: none;
+    }
     .agent-trace {
       margin: 0 0 12px;
       border: 1px solid var(--border);

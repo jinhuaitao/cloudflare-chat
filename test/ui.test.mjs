@@ -138,6 +138,15 @@ test('脚本里 getElementById 的每个 id 都能在 HTML 里找到', () => {
   assert.deepEqual(missing, [], '这些 id 在 HTML 里不存在：' + missing.join(', '));
 });
 
+test('Agent 专家徽标在样式、事件解析与历史重绘三处都已接线', () => {
+  // 三处少任何一处，功能都会静默失效：没样式 → 裸文字挤在气泡里；
+  // 没解析 → 服务端发了也不显示；没重绘 → 切会话回来徽标消失。
+  const inline = HTML_CONTENT.match(/<script>([\s\S]*)<\/script>/)[1];
+  assert.ok(HTML_CONTENT.includes('.agent-persona {'), '缺少 .agent-persona 样式');
+  assert.ok(inline.includes('agent_persona'), '未解析服务端下发的 agent_persona 事件');
+  assert.ok(inline.includes('personaTrace'), '历史消息重绘未还原 personaTrace');
+});
+
 test('app-kb.js 需要的 DOM 节点与接口都已接线', () => {
   // 这三个 id 曾经在 body.js 里全都不存在，导致 app-kb.js 变成死代码
   for (const id of ['kbModal', 'kbModalToggle', 'kbCloseBtn', 'kbRefreshBtn', 'kbListBox']) {

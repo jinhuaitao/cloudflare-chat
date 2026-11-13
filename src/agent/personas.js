@@ -692,6 +692,21 @@ function formatRouteWhy(text, fixedId, history) {
   return lines.join('\n');
 }
 
+// 网页端消息卡片用的一行「本轮由谁处理、依据是什么」。
+// Telegram / 微信在进度条里就能看到角色，网页端的进度条正文一出来就收起，
+// 用户翻回去只剩一段回答 —— 所以单独给一条可留存的摘要（通用回落时返回空串，不打扰）。
+function formatPersonaTrace(route) {
+  if (!route || !route.persona) return '';
+  const p = route.persona;
+  if (route.reason === 'chain' && Array.isArray(route.chain) && route.chain.length > 1) {
+    return '🧭 接力：' + route.chain.map(x => x.emoji + ' ' + x.name).join(' → ');
+  }
+  if (p.id === DEFAULT_PERSONA_ID) return '';
+  if (route.source === 'manual') return '🧭 ' + p.emoji + ' ' + p.name + '（已固定）';
+  const why = formatRouteHit(route, 3);
+  return '🧭 ' + p.emoji + ' ' + p.name + (why ? ' · ' + why : '');
+}
+
 function personaAllowsTool(persona, name) {
   if (!persona || !Array.isArray(persona.tools)) return true;
   return persona.tools.indexOf(String(name || '')) !== -1;
@@ -771,6 +786,7 @@ export {
   routeChain,
   formatRouteHit,
   formatRouteWhy,
+  formatPersonaTrace,
   personaAllowsTool,
   personaPromptBlock,
   chainPromptBlock,

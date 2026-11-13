@@ -46,7 +46,7 @@ import { kbGetRegistry } from '../kb/registry.js';
 import { mapLimit } from '../utils.js';
 import { sanitizeHistory, lastUserText } from './history.js';
 import { agentGetPersona } from './mode.js';
-import { resolvePersona, personaById, personaAllowsTool, formatPersonaBadge, formatChainBadge, formatRouteHit, DEFAULT_PERSONA_ID } from './personas.js';
+import { resolvePersona, personaById, personaAllowsTool, formatPersonaBadge, formatChainBadge, formatRouteHit, formatPersonaTrace, DEFAULT_PERSONA_ID } from './personas.js';
 
 const WRITE_TOOLS_SET = new Set(['remember', 'forget_memory', 'save_doc', 'delete_doc']);
 
@@ -197,10 +197,12 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
     (opts && opts.onDelta) || null, (opts && opts.onReset) || null, kbReadOnly, origUserText,
     hasKbDocs, persona, chain, routeWhy);
   // 回传本次实际使用的人格与路由依据：TG/微信据此显示徽标，
-  // Web 端的进度流已经由 routeWhy 带出「命中：xx」，这里只作为结构化结果给调用方留存。
+  // Web 端把 personaTrace 挂到消息卡片上，避免「进度条一收起就再也看不出是谁答的」。
   if (result && typeof result === 'object') {
     result.personaId = persona.id;
     result.personaRoute = { source: route.source, reason: route.reason, matched: route.matched.slice(0, 5) };
+    const trace = formatPersonaTrace(route);
+    if (trace) result.personaTrace = trace;
     if (chain) result.personaChain = chain.map(p => p.id);
   }
   await recordWorkingMemory(env, chatId, origUserText, result, opts);

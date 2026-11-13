@@ -83,6 +83,9 @@ async function handleWebAgent(env, body, ctx) {
         const onProgress = async (text) => { send({ agent_progress: String(text).slice(0, 500) }); };
         let r = await tgAgentChat(env, noOpTgApi, webChatId, targetModelId, history, true, onProgress, webOpts);
         if (r.fallback) r = await tgAgentChat(env, noOpTgApi, webChatId, targetModelId, history, false, onProgress, webOpts);
+        // 本轮由哪位专家处理：正文流式推完后进度条会收起，补一条可留存的摘要，
+        // 前端把它插到消息顶部（与 Telegram/微信进度条里的角色信息对齐）。
+        if (r && r.personaTrace && !r.error) send({ agent_persona: { trace: r.personaTrace } });
         if (r.error) {
           send({ agent_error: r.error });
         } else if (r.paused && r.text) {

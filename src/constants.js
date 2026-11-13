@@ -19,6 +19,10 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json 与 README.md 的版本号，
 // CI 会用 npm run check 校验三处一致，防止文档与代码再次脱节）
+// 7.16.0：网页端补齐「谁答的」——专家路由结果以 agent_persona 事件下发，
+//         消息气泡顶部留一条可回溯的 🧭 摘要（角色 + 命中依据 / 接力链），
+//         并随会话消息落 localStorage，切换会话与刷新后仍在；
+//         README 核心特性行的角色枚举改为短名同源（此前是一份独立且已过期的 emoji 列表）。
 // 7.15.1：跨端文案一致性——人格短名/工具数量改为从注册表派生，修掉 7→12 位扩容后
 //         Telegram 帮助、微信菜单、网页按钮提示、README 表格里残留的旧枚举与旧数字；
 //         README 人格表的 emoji/名称/步数/预算改为与注册表逐行校验；
@@ -65,7 +69,7 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 //        断点起点修正、流式读取不阻塞、抓取失败语义统一）。
 // 7.5.0：Agent 内核加固（工具并发闸门、预算感知超时、步数感知收束、双保险空转熔断、
 //        历史轮次压缩）+ 工具箱新增 JSON/正则动作 + 全量回归测试。
-const APP_VERSION = '7.15.1';
+const APP_VERSION = '7.16.0';
 const PNG_HEADERS = {
   'Content-Type': 'image/png',
   'Cache-Control': 'public, max-age=86400',

@@ -133,6 +133,17 @@ test('README 人格表与注册表逐行一致（emoji / 名称 / id / 步数 / 
   }
 });
 
+test('README 核心特性行的角色目录与注册表一致', () => {
+  // 这一行曾经是一份独立的 emoji 枚举（🧩 产品 / 👀 审查 / 🌐 翻译 / 📅 规划），
+  // 扩容后没跟着注册表走。现在改成纯短名列表，并由测试比对顺序与内容。
+  const line = read('README.md').split('\n').find(l => l.startsWith('| 🧭 **专家人格'));
+  assert.ok(line, 'README 缺少「专家人格」核心特性行');
+  const cell = line.split('|')[2] || '';
+  const list = cell.split('；')[0].trim().split(' / ').map(s => s.trim());
+  const expected = [...specialistPersonas().map(p => PERSONA_SHORT[p.id]), PERSONA_SHORT[DEFAULT_PERSONA_ID]];
+  assert.deepEqual(list, expected, '核心特性行的角色目录与注册表不一致');
+});
+
 // ==================== 不留写死的过期数量 ====================
 
 test('源码与元数据里的数量文案都与注册表一致', () => {

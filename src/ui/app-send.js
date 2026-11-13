@@ -101,6 +101,8 @@ export default `  async function sendMessage() {
       let agentProgressTimer = null;
       const agentToolSteps = [];
       let agentTraceEl = null;
+      let agentPersonaEl = null;
+      let agentPersonaTrace = '';
 
       function recordAgentToolSteps(progressText) {
         const lines = String(progressText || '').split('\\n').map(s => s.trim()).filter(Boolean);
@@ -135,6 +137,20 @@ export default `  async function sendMessage() {
         });
         agentTraceEl.appendChild(sum);
         agentTraceEl.appendChild(list);
+      }
+
+      // 本轮由哪位专家处理：插在气泡最上方，正文流式推完后进度条会收起，这条留着可回看。
+      // 内容由服务端统一生成（personas.formatPersonaTrace），前端只负责显示，不重复判断逻辑。
+      function showAgentPersona(trace) {
+        const text = String(trace || '').trim();
+        if (!text) return;
+        agentPersonaTrace = text;
+        if (!agentPersonaEl) {
+          agentPersonaEl = document.createElement('div');
+          agentPersonaEl.className = 'agent-persona';
+          bubble.insertBefore(agentPersonaEl, bubble.firstChild);
+        }
+        agentPersonaEl.textContent = text;
       }
 
       function renderAgentProgress() {
@@ -204,6 +220,9 @@ export default `  async function sendMessage() {
         agentToolSteps.length = 0;
         if (agentTraceEl && agentTraceEl.parentNode) agentTraceEl.parentNode.removeChild(agentTraceEl);
         agentTraceEl = null;
+        if (agentPersonaEl && agentPersonaEl.parentNode) agentPersonaEl.parentNode.removeChild(agentPersonaEl);
+        agentPersonaEl = null;
+        agentPersonaTrace = '';
         clearAgentProgress();
         if (rBox) { rBox.style.display = 'none'; rBox.textContent = ''; }
         tBox.innerHTML = '';
@@ -263,12 +282,15 @@ export default `  async function sendMessage() {
             line = line.trim();
             if (!line.startsWith('data:')) continue;
             if (line.slice(5).trim() === '[DONE]') { gotDone = true; continue; }
-            if (line.indexOf('"agent_progress"') > 0 || line.indexOf('"agent_error"') > 0 || line.indexOf('"agent_reset"') > 0) {
+            if (line.indexOf('"agent_progress"') > 0 || line.indexOf('"agent_error"') > 0 || line.indexOf('"agent_reset"') > 0 || line.indexOf('"agent_persona"') > 0) {
               let handledAsAgentEvent = false;
               try {
                 const adata = JSON.parse(line.slice(5).trim());
                 if (adata && adata.agent_progress !== undefined) {
                   showAgentProgress(adata.agent_progress);
+                  handledAsAgentEvent = true;
+                } else if (adata && adata.agent_persona !== undefined) {
+                  showAgentPersona(adata.agent_persona && adata.agent_persona.trace);
                   handledAsAgentEvent = true;
                 } else if (adata && adata.agent_reset !== undefined) {
                   resetStreamedText();
@@ -370,7 +392,12 @@ export default `  async function sendMessage() {
       
       if (sessions.indexOf(reqSession) !== -1) {
         const aiT = Date.now();
-        reqSession.messages.push({ role: 'assistant', content: aiContent, t: aiT });
+        reqSession.messages.push({
+          role: 'assistant', content: aiContent, t: aiT,
+          // 存进消息而不是只留在 DOM：切会话时 renderMessages 会整片重建，
+          // 不落库的话徽标一刷新就没了。没有走专家路由时不写这个字段，保持旧数据形状。
+          ...(agentPersonaTrace ? { personaTrace: agentPersonaTrace } : {}),
+        });
         bubble.__time = aiT;
         ensureMessageActions(bubble);
         saveSessions();

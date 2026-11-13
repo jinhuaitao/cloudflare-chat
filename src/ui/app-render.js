@@ -36,13 +36,13 @@ export default `  function renderSessionList() {
       emptyState.style.display = 'none'; 
       currentSession.messages.forEach(msg => {
         const uiRole = msg.role === 'assistant' ? 'ai' : msg.role;
-        appendMessageDOM(uiRole, msg.content, null, false, msg.t);
+        appendMessageDOM(uiRole, msg.content, null, false, msg.t, msg.personaTrace);
       }); 
       syncRegenButtons();
     }
   }
 
-  function appendMessageDOM(role, content, msgId = null, isError = false, time = null) {
+  function appendMessageDOM(role, content, msgId = null, isError = false, time = null, personaTrace = '') {
     let row = msgId ? document.getElementById('row_' + msgId) : null;
     let bubble = msgId ? document.getElementById(msgId) : null;
 
@@ -76,6 +76,14 @@ export default `  function renderSessionList() {
     } else {
       bubble.innerText = content; 
       bubble.__rawText = content;
+    }
+
+    // 历史消息重绘时把「谁答的」一起还原：徽标只存在消息对象里，DOM 重建后要重新插入
+    if (role === 'ai' && personaTrace) {
+      const personaEl = document.createElement('div');
+      personaEl.className = 'agent-persona';
+      personaEl.textContent = String(personaTrace);
+      bubble.insertBefore(personaEl, bubble.firstChild);
     }
     ensureMessageActions(bubble);
 

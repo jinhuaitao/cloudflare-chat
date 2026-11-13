@@ -9,6 +9,7 @@ import {
   PERSONAS, PERSONA_IDS, DEFAULT_PERSONA_ID,
   normalizePersonaId, getPersona, personaById, listPersonas,
   routePersona, resolvePersona, explainRoute, formatRouteHit, formatRouteWhy,
+  formatPersonaTrace,
   personaAllowsTool, personaPromptBlock,
   formatPersonaList, formatPersonaBadge,
 } from '../src/agent/personas.js';
@@ -434,11 +435,14 @@ test('网页端固定自动选择：忽略请求体 persona，按提问路由', 
       persona: 'writer',
       messages: [{ role: 'user', content: '服务器 502 怎么排查' }],
     });
-    await res.text();
+    const sseBody = await res.text();
     assert.equal(captured.length, 1);
     const sys = captured[0].messages[0].content;
     assert.ok(sys.includes('【当前专家角色】🛠️ 运维排障'), '网页端应按提问自动选运维');
     assert.equal(sys.includes('✍️ 写作编辑'), false, '网页端不应被请求体固定成写作人格');
+    // 网页端没有 /agent status，这条事件是用户事后唯一能看见「谁答的」的地方
+    assert.ok(sseBody.includes('"agent_persona"'), '缺少人格摘要事件');
+    assert.ok(sseBody.includes('🧭 🛠️ 运维排障'), '人格摘要事件里应带角色名：' + sseBody.slice(0, 400));
   } finally {
     globalThis.fetch = original;
   }
@@ -463,6 +467,28 @@ test('formatRouteHit 只在自动选中非通用角色时给命中词', () => {
   assert.equal(formatRouteHit(resolvePersona('auto', '服务器 502 怎么排查'), 3).startsWith('命中：'), true);
   assert.equal(formatRouteHit(resolvePersona('auto', '你好'), 3), '', '回落通用时没有命中词');
   assert.equal(formatRouteHit(resolvePersona('coder', '今天天气'), 3), '', '手动固定时没有命中词');
+});
+
+test('formatPersonaTrace 给出可留存的「本轮由谁处理」摘要', () => {
+  // 自动命中：角色 + 命中词，正文流完后仍能看出是谁答的
+  const auto = formatPersonaTrace(resolvePersona('auto', '服务器 502 怎么排查'));
+  assert.ok(auto.startsWith('🧭 🛠️ 运维排障'), '实际：' + auto);
+  assert.ok(auto.includes('命中：'));
+
+  // 回落通用时不打扰
+  assert.equal(formatPersonaTrace(resolvePersona('auto', '你好')), '');
+
+  // 手动固定要标明
+  assert.equal(formatPersonaTrace(resolvePersona('writer', '随便聊聊')), '🧭 ✍️ 写作编辑（已固定）');
+
+  // 接力链按顺序列出全部角色
+  const chain = formatPersonaTrace(resolvePersona('auto', '先写一份小程序 PRD，然后制定一个两周的上线计划'));
+  assert.ok(chain.startsWith('🧭 接力：'), '实际：' + chain);
+  assert.ok(chain.includes('→'));
+
+  // 入参缺失不抛错
+  assert.equal(formatPersonaTrace(null), '');
+  assert.equal(formatPersonaTrace({}), '');
 });
 
 test('formatRouteWhy 输出完整复盘：得分、命中词、结论与固定提示', () => {
