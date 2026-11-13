@@ -321,6 +321,37 @@ const PERSONAS = [
 const DEFAULT_PERSONA_ID = 'general';
 const PERSONA_IDS = PERSONAS.map(p => p.id);
 const PERSONA_MAP = new Map(PERSONAS.map(p => [p.id, p]));
+const PERSONA_COUNT = PERSONAS.length;
+
+// 短名：命令回执、帮助文案、徽标里用的两字称呼。
+// 集中放一处而不是在每个 handler 里手写枚举 —— 之前把人格从 7 位扩到 12 位时，
+// Telegram / 微信 / 网页三端的文案各漏了一半，用户看到的角色列表和实际能力对不上。
+// 新增角色只改这张表，测试会校验「每个角色都有短名且不重复」。
+const PERSONA_SHORT = {
+  general: '通用', research: '研究', coder: '编程', writer: '写作', analyst: '分析',
+  ops: '运维', tutor: '教学', product: '产品', reviewer: '审查', translator: '翻译',
+  planner: '规划', designer: '设计',
+};
+
+// 除通用外的专业角色（通用是回落项，不该出现在「可选专家」的枚举里）
+function specialistPersonas() {
+  return PERSONAS.filter(p => p.id !== DEFAULT_PERSONA_ID);
+}
+
+// 「研究/编程/写作/…」：给「自动匹配（…）」这类一行文案用
+function personaCatalogText(sep) {
+  return specialistPersonas().map(p => PERSONA_SHORT[p.id] || p.name).join(sep || '/');
+}
+
+// 「research|coder|writer|…」：给「/agent <id>」的取值说明用，避免手写 id 漏角色
+function personaIdListText(sep) {
+  return specialistPersonas().map(p => p.id).join(sep || '｜');
+}
+
+// 「🔬 研究员 / 🧑‍💻 编程工程师 / … / 🤖 通用助手」：给完整帮助文案用
+function personaFullListText(sep) {
+  return PERSONAS.map(p => p.emoji + ' ' + p.name).join(sep || ' / ');
+}
 
 // 词表预编译挂到人格定义上（下划线前缀，外部不应读取）
 for (const p of PERSONAS) {
@@ -692,11 +723,13 @@ function formatChainBadge(chain) {
   return chain.map(p => p.emoji + ' ' + p.name).join(' → ');
 }
 
-// 命令回执与帮助文案共用，纯字符串、无副作用
-function formatPersonaList(currentId, opts) {
+// 命令回执与帮助文案共用，纯字符串、无副作用。
+// 是否「自动」由 currentId 自己决定，不再额外传 opts.auto —— 那个参数从来没有被读过，
+// 调用方却都老老实实传了，属于会让人误以为有开关的死参数。
+function formatPersonaList(currentId) {
   const isAuto = !currentId || String(currentId) === 'auto';
   const cur = isAuto ? null : personaById(currentId);
-  const lines = ['🧭 专家人格（共 ' + PERSONAS.length + ' 个）', ''];
+  const lines = ['🧭 专家人格（共 ' + PERSONA_COUNT + ' 个）', ''];
   for (const p of PERSONAS) {
     const mark = (!isAuto && cur && p.id === cur.id) ? '✅ ' : '　 ';
     lines.push(mark + p.emoji + ' ' + p.name + '（' + p.id + '）— ' + p.tagline);
@@ -718,12 +751,18 @@ function formatPersonaBadge(persona) {
 export {
   PERSONAS,
   PERSONA_IDS,
+  PERSONA_COUNT,
+  PERSONA_SHORT,
   DEFAULT_PERSONA_ID,
   MIN_SCORE,
   normalizePersonaId,
   getPersona,
   personaById,
   listPersonas,
+  specialistPersonas,
+  personaCatalogText,
+  personaIdListText,
+  personaFullListText,
   scorePersona,
   routePersona,
   resolvePersona,

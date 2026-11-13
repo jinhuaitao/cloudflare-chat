@@ -359,6 +359,10 @@ const TOOL_DEFS = [
 const WRITE_TOOL_NAMES = ['remember', 'forget_memory', 'save_doc', 'delete_doc'];
 const KB_READ_TOOL_NAMES = ['list_docs', 'read_doc'];
 
+// 工具总数从定义表派生：三端文案（Telegram 帮助 / 微信菜单 / 网页按钮提示）
+// 都要说「N 项工具」，以前每处手写数字，加一个工具就得改三个文件，还容易漏。
+const AGENT_TOOL_COUNT = TOOL_DEFS.length;
+
 // 按「权限位 + 知识库是否为空 + 专家人格」缓存过滤结果：Agent 一轮里每步都会用到它，
 // 反复重建 18 个对象纯属浪费；共享同一份也让发往上游的 tools 字节完全一致。
 // 人格白名单同时是省 token 的手段：写文案的那一轮不需要 DNS 诊断与汇率 schema。
@@ -508,6 +512,7 @@ async function execAgentTool(name, args, env, chatId, kbReadOnly, opts) {
 
 export {
   TOOL_FAILURE_PREFIXES,
+  AGENT_TOOL_COUNT,
   isToolFailureResult,
   getAgentTools,
   execAgentTool,

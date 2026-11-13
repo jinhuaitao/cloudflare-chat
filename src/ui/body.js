@@ -1,4 +1,11 @@
-// 页面骨架 HTML：侧栏、消息区、输入区、弹窗（_worker.js 原第 3373-3482 行，内嵌页面分片；只允许字符串导出）
+// 页面骨架 HTML：侧栏、消息区、输入区、弹窗（_worker.js 原第 3373-3482 行，内嵌页面分片）
+// 导出仍然是「一个模板字符串」；顶部 import 只用来取注册表里的数量，
+// 不引入任何运行期逻辑，分片的定界符与转义约束（见 test/ui.test.mjs）保持不变。
+// 能力数量从注册表派生：专家人格数与工具数都写在这儿，加角色/加工具时前端文案自动跟上，
+// 不会再出现「后端 12 位、页面还写着 7 位」这种对不上的情况。
+import { PERSONA_COUNT, personaCatalogText } from '../agent/personas.js';
+import { AGENT_TOOL_COUNT } from '../agent/tools.js';
+
 export default `</head>
 <body>
 
@@ -191,7 +198,7 @@ export default `</head>
       <div class="empty-state" id="emptyState">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path></svg>
         <h2>今天我能为你提供什么帮助？</h2>
-        <p>输入问题即可开始，支持 Markdown、代码高亮、19 项 Agent 工具、Telegram 与微信 ClawBot 通道。</p>
+        <p>输入问题即可开始，支持 Markdown、代码高亮、${AGENT_TOOL_COUNT} 项 Agent 工具、${PERSONA_COUNT} 位专家人格、Telegram 与微信 ClawBot 通道。</p>
         <div class="suggestion-grid" id="suggestionGrid">
           <button class="suggestion-chip" type="button" data-prompt="帮我写一封得体的商务邮件">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"></path><polyline points="22,6 12,13 2,6"></polyline></svg>
@@ -234,7 +241,7 @@ export default `</head>
               {{MODEL_OPTIONS}}
             </select>
           </div>
-          <button class="agent-toggle" id="agentToggle" title="Agent 模式：自主规划并调用工具（🔍 搜索 / 📄 网页 / 🌐 维基 / 🐙 GitHub / 🎓 论文 / 🔥 热榜 / 💱 汇率 / 🧮 计算 / 📏 换算 / 🔤 编码 / 🖧 网络 / 🌤 天气 / 🕐 时间），内置 7 位专家（研究/编程/写作/分析/运维/教学）按提问自动匹配；回答优先查知识库文档；知识库在本端只读，保存文档/记住信息请通过 Telegram 或微信 ClawBot 机器人">🤖 Agent</button>
+          <button class="agent-toggle" id="agentToggle" title="Agent 模式：自主规划并调用 ${AGENT_TOOL_COUNT} 项工具（🔍 搜索 / 📄 网页 / 🌐 维基 / 🐙 GitHub / 🎓 论文 / 🔥 热榜 / 💱 汇率 / 🧮 计算 / 📏 换算 / 🔤 编码 / 🖧 网络 / 🌤 天气 / 🕐 时间），内置 ${PERSONA_COUNT} 位专家（${personaCatalogText('/')}）按提问自动匹配；回答优先查知识库文档；知识库在本端只读，保存文档/记住信息请通过 Telegram 或微信 ClawBot 机器人">🤖 Agent</button>
         </div>
       </div>
       <div class="disclaimer">AI 生成的内容可能不准确，请核实重要信息。</div>

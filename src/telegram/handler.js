@@ -11,7 +11,11 @@ import { tgTrimHistory, tgGetHistory, tgSaveHistory, tgClearHistory } from '../t
 import { agentForgetMemory } from '../agent/memory.js';
 import { memoryReport, memoryClearSession, memoryStats } from '../memory/index.js';
 import { agentGetMode, agentSetMode, agentGetPersona, agentSetPersona } from '../agent/mode.js';
-import { formatPersonaList, formatPersonaBadge, formatRouteWhy, getPersona, personaById } from '../agent/personas.js';
+import {
+  PERSONA_COUNT, formatPersonaList, formatPersonaBadge, formatRouteWhy, getPersona, personaById,
+  personaCatalogText, personaIdListText, personaFullListText
+} from '../agent/personas.js';
+import { AGENT_TOOL_COUNT } from '../agent/tools.js';
 import { lastUserText } from '../agent/history.js';
 import { agentLoadResumeState, agentClearResumeState, tgAgentResumeKey } from '../agent/resume.js';
 import { tgAgentChat, tgAgentResume } from '../agent/loop.js';
@@ -564,7 +568,7 @@ export async function handleTgWebhook(request, env, ctx) {
 
             await tgApi('sendMessage', {
               chat_id: chatId,
-              text: "⚙️ **请选择对话要使用的 AI 模型:**\n\n_支持多轮对话（最近 " + (parseInt(env.TG_HISTORY_ROUNDS || '10', 10) || 10) + " 轮），群聊中直接 @我 或回复我的消息即可对话，支持发送图片识图或上传 .md/.txt/.csv 文档，发送 /clear 可清空上下文。_\n\n🤖 **Agent 模式**（默认开启）：我会自主规划、调用 19 项工具（🔍 搜索、📄 网页、🌐 维基百科、🐙 GitHub、📑 arXiv 论文、📰 HackerNews、💱 实时汇率/币价、🛰️ DNS/IP 诊断、🧮 科学计算、🧰 实用工具箱、🌤 天气、🕐 时间/日期推算），并用 🧠🗑️ 管理长期记忆、🔎 检索三层记忆、用 💾📚📖 存取知识库文档。发送 /agent 可切换模式，/agent list 选择专家人格（🔬 研究 / 🧑‍💻 编程 / ✍️ 写作 / 📊 分析 / 🛠️ 运维 / 🎓 教学），/help 查看全部命令。",
+              text: "⚙️ **请选择对话要使用的 AI 模型:**\n\n_支持多轮对话（最近 " + (parseInt(env.TG_HISTORY_ROUNDS || '10', 10) || 10) + " 轮），群聊中直接 @我 或回复我的消息即可对话，支持发送图片识图或上传 .md/.txt/.csv 文档，发送 /clear 可清空上下文。_\n\n🤖 **Agent 模式**（默认开启）：我会自主规划、调用 " + AGENT_TOOL_COUNT + " 项工具（🔍 搜索、📄 网页、🌐 维基百科、🐙 GitHub、📑 arXiv 论文、📰 HackerNews、💱 实时汇率/币价、🛰️ DNS/IP 诊断、🧮 科学计算、🧰 实用工具箱、🌤 天气、🕐 时间/日期推算），并用 🧠🗑️ 管理长期记忆、🔎 检索三层记忆、用 💾📚📖 存取知识库文档。发送 /agent 可切换模式，/agent list 选择专家人格（共 " + PERSONA_COUNT + " 位：" + personaCatalogText(' / ') + "），/help 查看全部命令。",
               parse_mode: "Markdown",
               reply_markup: { inline_keyboard },
               ...replyExtra
@@ -589,7 +593,7 @@ export async function handleTgWebhook(request, env, ctx) {
                 + "/start、/model —— 选择对话模型\n"
                 + "/agent —— 切换 Agent / 普通对话模式\n"
                 + "/agent list —— 查看全部专家人格\n"
-                + "/agent <id> —— 固定专家（research｜coder｜writer｜analyst｜ops｜tutor）\n"
+                + "/agent <id> —— 固定专家（" + personaIdListText('｜') + "）\n"
                 + "/agent auto —— 恢复按问题自动选择专家\n"
                 + "/agent why —— 复盘上一次为什么选这位专家（可带文本单独复盘）\n"
                 + "/clear —— 清空当前对话上下文（含 L1 工作记忆，保留长期记忆与归档）\n"
@@ -603,8 +607,8 @@ export async function handleTgWebhook(request, env, ctx) {
                 + "任务太长被暂停时，发送「继续」（群聊可 @我 继续 或直接回复我「继续」）可接着做\n\n"
                 + "👥 群聊用法：在群里直接 `@机器人 你的问题`，或直接「回复（Reply）」机器人的上一条消息即可连续对话（传图/传文件同理）。\n"
                 + "✨ 支持直接发送图片（多模态识图 + 工具协同）或上传文本文件（.md/.txt/.csv/.json 等，可直接总结或说“存进知识库”）。\n"
-                + "🛠️ Agent 工具箱（19 项零密钥工具）：🔍 联网搜索（一步深读）、📄 结构化网页阅读（0ms 缓存翻页）、🌐 维基百科、🐙 GitHub 仓库/发版检索、📑 arXiv 论文检索、📰 HackerNews 热榜、💱 实时汇率/加密币价、🛰️ DNS/IP 网络诊断、🧮 科学计算器、🧰 全能工具箱（单位换算/SHA哈希/Base64/UUID/字数统计）、🌤 天气预报、🕐 时间与日期差推算、🧠🗑️ 长期记忆存取、🔎 三层记忆检索、💾📚📖 知识库文档分页精读与多关键词检索。"
-                + "\n\n🧭 专家人格（7 位）：🔬 研究员 / 🧑‍💻 编程工程师 / ✍️ 写作编辑 / 📊 数据分析师 / 🛠️ 运维排障 / 🎓 学习教练 / 🤖 通用助手。默认按提问自动匹配，也可用 /agent <id> 固定；每个角色有自己的工作流、输出契约与工具白名单。"
+                + "🛠️ Agent 工具箱（" + AGENT_TOOL_COUNT + " 项零密钥工具）：🔍 联网搜索（一步深读）、📄 结构化网页阅读（0ms 缓存翻页）、🌐 维基百科、🐙 GitHub 仓库/发版检索、📑 arXiv 论文检索、📰 HackerNews 热榜、💱 实时汇率/加密币价、🛰️ DNS/IP 网络诊断、🧮 科学计算器、🧰 全能工具箱（单位换算/SHA哈希/Base64/UUID/字数统计）、🌤 天气预报、🕐 时间与日期差推算、🧠🗑️ 长期记忆存取、🔎 三层记忆检索、💾📚📖 知识库文档分页精读与多关键词检索。"
+                + "\n\n🧭 专家人格（共 " + PERSONA_COUNT + " 位）：" + personaFullListText(' / ') + "。默认按提问自动匹配，也可用 /agent <id> 固定；每个角色有自己的工作流、输出契约与工具白名单。"
                 + "\n\n🧠 三层记忆：L1 记录本会话要点（超出 12 条自动沉淀），L2 存跨会话事实/偏好（带权重与衰减，满 240 条淘汰最弱的），L3 是自动归档，随时可用「查一下你记得的…」检索。"
                 + "\n\n📌 当前版本 v" + APP_VERSION + "（当前会话 ID: " + chatId + "）",
               ...replyExtra
@@ -726,7 +730,7 @@ export async function handleTgWebhook(request, env, ctx) {
               await tgApi('sendMessage', {
                 chat_id: chatId,
                 text: !cur
-                  ? "🤖 **Agent 模式已开启**\n\n我会自主规划、调用 19 项工具（🔍 搜索、📄 网页、🌐 维基百科、🐙 GitHub、📑 arXiv、📰 HackerNews、💱 汇率/币价、🛰️ DNS/IP、🧮 计算、🧰 工具箱、🌤 天气、🕐 时间），分三层记住你告诉我的重要信息（本会话要点 / 长期事实 / 历史归档），还能用 💾 保存、📚 查阅知识库文档。\n\n🧭 当前专家：" + formatPersonaBadge(personaById(curPersona)) + "\n发送 /agent list 查看全部专家，/agent <id> 可固定角色。"
+                  ? "🤖 **Agent 模式已开启**\n\n我会自主规划、调用 " + AGENT_TOOL_COUNT + " 项工具（🔍 搜索、📄 网页、🌐 维基百科、🐙 GitHub、📑 arXiv、📰 HackerNews、💱 汇率/币价、🛰️ DNS/IP、🧮 计算、🧰 工具箱、🌤 天气、🕐 时间），分三层记住你告诉我的重要信息（本会话要点 / 长期事实 / 历史归档），还能用 💾 保存、📚 查阅知识库文档。\n\n🧭 当前专家：" + formatPersonaBadge(personaById(curPersona)) + "\n发送 /agent list 查看全部专家，/agent <id> 可固定角色。"
                   : "💬 **已切换为普通对话模式**\n\n单轮问答，不调用工具、不使用长期记忆。如需 Agent 能力再发送 /agent 切回。",
                 parse_mode: "Markdown",
                 ...replyExtra
@@ -738,7 +742,7 @@ export async function handleTgWebhook(request, env, ctx) {
               const curPersona = await agentGetPersona(env, chatId);
               await tgApi('sendMessage', {
                 chat_id: chatId,
-                text: formatPersonaList(curPersona, { auto: curPersona === 'auto' }),
+                text: formatPersonaList(curPersona),
                 ...replyExtra
               });
               return;
@@ -750,7 +754,7 @@ export async function handleTgWebhook(request, env, ctx) {
               await tgApi('sendMessage', {
                 chat_id: chatId,
                 text: '🧭 已恢复**自动选择**专家人格' + (prev !== 'auto' ? '（原为 ' + formatPersonaBadge(personaById(prev)) + '）' : '')
-                  + '\n\n之后每轮会根据你的提问自动匹配（研究/编程/写作/分析/运维/教学），拿不准时用通用助手。\n发送 /agent list 查看全部。',
+                  + '\n\n之后每轮会根据你的提问自动匹配（' + personaCatalogText('/') + '），拿不准时用通用助手。\n发送 /agent list 查看全部。',
                 parse_mode: "Markdown",
                 ...replyExtra
               });
@@ -793,7 +797,7 @@ export async function handleTgWebhook(request, env, ctx) {
               const curPersona = await agentGetPersona(env, chatId);
               await tgApi('sendMessage', {
                 chat_id: chatId,
-                text: '🤔 没有「' + arg + '」这个专家。\n\n' + formatPersonaList(curPersona, { auto: curPersona === 'auto' }),
+                text: '🤔 没有「' + arg + '」这个专家。\n\n' + formatPersonaList(curPersona),
                 ...replyExtra
               });
               return;

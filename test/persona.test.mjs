@@ -13,7 +13,7 @@ import {
   formatPersonaList, formatPersonaBadge,
 } from '../src/agent/personas.js';
 import { resetChannelConfigCache } from '../src/channel.js';
-import { getAgentTools, failureRecoveryHint } from '../src/agent/tools.js';
+import { getAgentTools, failureRecoveryHint, AGENT_TOOL_COUNT } from '../src/agent/tools.js';
 import { agentLimits } from '../src/agent/limits.js';
 import { buildAgentSystemPrompt } from '../src/agent/prompt.js';
 import { parseWxCommand } from '../src/wechat/text.js';
@@ -209,7 +209,7 @@ test('人格白名单裁剪工具集，通用人格保持全量', () => {
   const ops = getAgentTools(false, { hasKbDocs: true, persona: personaById('ops') }).map(t => t.function.name);
   const general = getAgentTools(false, { hasKbDocs: true }).map(t => t.function.name);
 
-  assert.equal(general.length, 19, '通用人格工具数不能变');
+  assert.equal(general.length, AGENT_TOOL_COUNT, '通用人格必须拿到全量工具');
   assert.ok(writer.includes('save_doc'));
   assert.equal(writer.includes('net_lookup'), false, '写作角色不该带 DNS 诊断');
   assert.equal(writer.includes('get_weather'), false);
@@ -319,11 +319,11 @@ test('微信中文口令能进入人格命令', () => {
 });
 
 test('人格列表文案包含全部角色与当前标记', () => {
-  const t = formatPersonaList('coder', { auto: false });
+  const t = formatPersonaList('coder');
   for (const p of PERSONAS) assert.ok(t.includes('（' + p.id + '）'), '缺少 ' + p.id);
   assert.ok(t.includes('✅ 🧑‍💻 编程工程师'));
   assert.ok(t.includes('已固定'));
-  const auto = formatPersonaList('auto', { auto: true });
+  const auto = formatPersonaList('auto');
   assert.ok(auto.includes('由问题自动选择'));
   assert.equal(formatPersonaBadge(personaById('ops')), '🛠️ 运维排障');
 });

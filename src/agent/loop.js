@@ -196,7 +196,8 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
     (opts && opts.resumeKey) || null, false, undefined,
     (opts && opts.onDelta) || null, (opts && opts.onReset) || null, kbReadOnly, origUserText,
     hasKbDocs, persona, chain, routeWhy);
-  // 回传本次实际使用的人格与路由依据：调用方可据此展示徽标与解释（Web 端也可选用）
+  // 回传本次实际使用的人格与路由依据：TG/微信据此显示徽标，
+  // Web 端的进度流已经由 routeWhy 带出「命中：xx」，这里只作为结构化结果给调用方留存。
   if (result && typeof result === 'object') {
     result.personaId = persona.id;
     result.personaRoute = { source: route.source, reason: route.reason, matched: route.matched.slice(0, 5) };
