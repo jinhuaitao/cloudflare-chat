@@ -19,6 +19,13 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json 与 README.md 的版本号，
 // CI 会用 npm run check 校验三处一致，防止文档与代码再次脱节）
+// 7.15.0：人格接力——一句话里的显式有序阶段（先…然后…/编号步骤）自动组成协作链，
+//         首位角色主导、链上角色依次接力；工具白名单取并集、预算取最大值+2 步、
+//         链式提示词不含用户原话（前缀缓存友好）、断点续做恢复整条链。
+// 7.14.0：专家人格扩到 12 位（新增产品/代码审查/翻译/规划/体验设计），
+//         并补「短追问承接」：当前句信号不足且明显是承接语气时，
+//         确定性沿用最近一轮的专业角色（不读 R2、零额外往返）；
+//         新增「明确审查意图」裁决，review+代码不再与编程调试同分回落。
 // 7.13.1：Agent 热路径性能（路由词表模块级预编译 + 提问只转一次小写，路由 52µs→14µs；
 //         explainRoute 与 routePersona 共享同一份打分不再打两遍；
 //         每轮收尾的记忆写入改挂 ctx.waitUntil，TG/微信/Web 的最终回复不再串行等一次 R2 写入）。
@@ -54,7 +61,7 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 //        断点起点修正、流式读取不阻塞、抓取失败语义统一）。
 // 7.5.0：Agent 内核加固（工具并发闸门、预算感知超时、步数感知收束、双保险空转熔断、
 //        历史轮次压缩）+ 工具箱新增 JSON/正则动作 + 全量回归测试。
-const APP_VERSION = '7.13.1';
+const APP_VERSION = '7.15.0';
 const PNG_HEADERS = {
   'Content-Type': 'image/png',
   'Cache-Control': 'public, max-age=86400',

@@ -116,6 +116,93 @@ test('auto / 空值 / 非法 id 都不会锁死人', () => {
   assert.equal(personaById('whatever').id, DEFAULT_PERSONA_ID);
 });
 
+// ==================== v7.14.0 新角色与上下文连续 ====================
+test('12 位人格注册完整，新角色支持中英文别名', () => {
+  assert.equal(PERSONAS.length, 12);
+  const aliases = [
+    ['产品', 'product'], ['pm', 'product'],
+    ['代码审查', 'reviewer'], ['review', 'reviewer'],
+    ['翻译', 'translator'], ['translate', 'translator'],
+    ['规划', 'planner'], ['plan', 'planner'],
+    ['设计', 'designer'], ['design', 'designer'],
+  ];
+  for (const [alias, want] of aliases) assert.equal(normalizePersonaId(alias), want, alias);
+  for (const id of ['product', 'reviewer', 'translator', 'planner', 'designer']) {
+    const p = personaById(id);
+    assert.ok(p.prompt.includes('工作方式') && p.prompt.includes('输出契约'), id + ' 提示词不完整');
+    assert.ok(p.tools.length > 0 && p.maxSteps > 0 && p.ctxBudget > 0, id + ' 缺少运行配置');
+  }
+});
+
+test('新增五类专业提问路由到对应专家', () => {
+  const cases = [
+    ['写一份小程序 PRD，包含用户故事和验收标准', 'product'],
+    ['帮我审查这段代码有没有 SQL 注入风险', 'reviewer'],
+    ['把这段产品说明翻译成英文，保留术语', 'translator'],
+    ['制定一个两周的上线计划，列出里程碑和依赖', 'planner'],
+    ['设计一个移动端登录页面，包含加载和错误状态', 'designer'],
+    ['review 这段代码的并发安全和边界条件', 'reviewer'],
+    ['做一份竞品分析，列出功能差异和优先级', 'product'],
+  ];
+  for (const [text, want] of cases) {
+    const r = routePersona(text);
+    assert.equal(r.persona.id, want, text + ' 实际为 ' + r.persona.id + ' / ' + r.reason);
+  }
+});
+
+test('短追问在信号不足时承接上一轮专家，无需额外存储', () => {
+  const history = [
+    { role: 'user', content: '帮我写一个 Python 脚本读取 CSV' },
+    { role: 'assistant', content: '可以，先看文件编码。' },
+    { role: 'user', content: '再优化一下' },
+  ];
+  for (const q of ['再优化一下', '继续', '这个怎么改', '详细一点']) {
+    const h = history.slice(0, 2).concat([{ role: 'user', content: q }]);
+    const r = resolvePersona('auto', q, h);
+    assert.equal(r.persona.id, 'coder', q + ' 应承接编程角色');
+    assert.equal(r.reason, 'followup');
+  }
+  assert.ok(formatRouteHit(resolvePersona('auto', '继续', history)).includes('承接'));
+});
+
+test('新主题与无关追问不会被旧人格劫持', () => {
+  const previous = [
+    { role: 'user', content: '帮我写一个 Python 脚本读取 CSV' },
+    { role: 'assistant', content: '可以。' },
+  ];
+  for (const [q, want] of [
+    ['为什么天空是蓝色的', 'tutor'],
+    ['今天天气怎么样', 'general'],
+    ['服务器 502 怎么排查', 'ops'],
+    ['再见', 'general'],
+  ]) {
+    const r = resolvePersona('auto', q, previous.concat([{ role: 'user', content: q }]));
+    assert.equal(r.persona.id, want, q + ' 实际为 ' + r.persona.id + ' / ' + r.reason);
+    assert.notEqual(r.reason, 'followup', q + ' 不应被当成旧话题承接');
+  }
+});
+
+test('/agent why 能复盘承接原因，且手动指定不受历史影响', () => {
+  const history = [
+    { role: 'user', content: '设计一个移动端登录页面' },
+    { role: 'assistant', content: '先确定主流程。' },
+    { role: 'user', content: '再补充错误状态' },
+  ];
+  const why = formatRouteWhy('再补充错误状态', 'auto', history);
+  assert.ok(why.includes('🎨 体验设计师'));
+  assert.ok(why.includes('承接上一轮专业话题'));
+  assert.equal(resolvePersona('writer', '继续', history).persona.id, 'writer');
+  assert.equal(resolvePersona('writer', '继续', history).reason, 'manual');
+});
+
+test('非通用人格统一带交付自检，通用人格保持原样', () => {
+  for (const p of PERSONAS) {
+    const block = personaPromptBlock(p);
+    if (p.id === DEFAULT_PERSONA_ID) assert.equal(block, '');
+    else assert.ok(block.includes('交付自检'), p.id + ' 缺少交付自检');
+  }
+});
+
 // ==================== 工具白名单 ====================
 test('人格白名单裁剪工具集，通用人格保持全量', () => {
   const writer = getAgentTools(false, { hasKbDocs: true, persona: personaById('writer') }).map(t => t.function.name);
@@ -503,6 +590,36 @@ test('路由打分性能护栏：预编译词表 + 单次小写，1000 次路由
   assert.ok(ms2 < 600, '1000 次 explainRoute 耗时 ' + ms2.toFixed(0) + 'ms，超出性能护栏（疑似重复打分）');
 });
 
+test('主循环对短追问沿用上一轮人格与工具白名单', async () => {
+  const original = globalThis.fetch;
+  const captured = [];
+  globalThis.fetch = async (url, init) => {
+    captured.push(JSON.parse(init.body));
+    return sse([{ choices: [{ delta: { content: '已补充缓存与超时。' } }] }]);
+  };
+  const progress = [];
+  try {
+    resetChannelConfigCache();
+    const history = [
+      { role: 'user', content: '帮我写一个 Python 脚本读取 CSV' },
+      { role: 'assistant', content: '先给你一个基础版本。' },
+      { role: 'user', content: '再优化一下' },
+    ];
+    const r = await tgAgentChat(ENV, noopTgApi, 'p_chat_followup', 'mock-model', history, true,
+      async (text) => { progress.push(String(text)); }, { maxRuntimeMs: 30000 });
+    assert.equal(r.personaId, 'coder');
+    assert.equal(r.personaRoute.reason, 'followup');
+    assert.ok(captured[0].messages[0].content.includes('【当前专家角色】🧑‍💻 编程工程师'));
+    const names = (captured[0].tools || []).map(t => t.function.name);
+    assert.ok(names.includes('github_lookup'));
+    assert.equal(names.includes('net_lookup'), false);
+    assert.ok(progress.some(t => t.includes('承接：上一轮编程工程师')));
+  } finally {
+    globalThis.fetch = original;
+    resetChannelConfigCache();
+  }
+});
+
 test('断点续做沿用存档里的人格与工具白名单', async () => {
   const original = globalThis.fetch;
   const captured = [];
@@ -531,6 +648,109 @@ test('断点续做沿用存档里的人格与工具白名单', async () => {
     const names = (captured[0].tools || []).map(t => t.function.name);
     assert.ok(names.includes('github_lookup'));
     assert.equal(names.includes('net_lookup'), false, '恢复后不该多出其他角色的工具');
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+// ==================== 人格接力（v7.15.0） ====================
+test('多阶段有序任务自动组成接力链', () => {
+  const r = resolvePersona('auto', '先写一份小程序 PRD，然后制定一个两周的上线计划');
+  assert.equal(r.reason, 'chain');
+  assert.deepEqual(r.chain.map(p => p.id), ['product', 'planner']);
+  assert.equal(r.persona.id, 'product', '链上第一个角色主导本轮');
+
+  const r2 = resolvePersona('auto', '先规划微服务架构，然后给出部署方案和回滚预案');
+  assert.equal(r2.reason, 'chain');
+  assert.deepEqual(r2.chain.map(p => p.id), ['planner', 'ops']);
+
+  const r3 = resolvePersona('auto', '第一步：调研竞品；第二步：写分析报告');
+  assert.equal(r3.reason, 'chain');
+  assert.equal(r3.chain.length >= 2, true);
+});
+
+test('单意图与普通短句不会误触发接力', () => {
+  assert.notEqual(resolvePersona('auto', '帮我写一个 Python 脚本读取 CSV 并画图').reason, 'chain');
+  assert.notEqual(resolvePersona('auto', '今天天气怎么样').reason, 'chain');
+  assert.notEqual(resolvePersona('auto', '再优化一下').reason, 'chain');
+  // 首段无强信号（锚点不足）→ 不成链
+  assert.notEqual(resolvePersona('auto', '先查下明天天气，然后提醒我带伞').reason, 'chain');
+  // 两段同角色去重后只剩一个 → 不成链
+  assert.notEqual(resolvePersona('auto', '先写代码，然后再优化一下代码').reason, 'chain');
+});
+
+test('接力链的工具白名单取链上角色并集', () => {
+  const chain = [personaById('research'), personaById('writer')];
+  const names = getAgentTools(false, { hasKbDocs: true, persona: chain[0], chain }).map(t => t.function.name);
+  // research 独有
+  assert.ok(names.includes('arxiv_search'));
+  // writer 独有
+  assert.ok(names.includes('web_search'));
+  // 只读端再叠加：写入工具仍然被剥掉
+  const ro = getAgentTools(true, { hasKbDocs: true, persona: chain[0], chain }).map(t => t.function.name);
+  assert.equal(ro.includes('remember'), false);
+  assert.equal(ro.includes('save_doc'), false);
+});
+
+test('接力链注入提示词且只含角色不含用户原话', () => {
+  const chain = [personaById('product'), personaById('planner')];
+  const p = buildAgentSystemPrompt([], '先写 PRD 然后排期', null, false, null, chain[0], chain);
+  assert.ok(p.includes('【人格接力】'));
+  assert.ok(p.includes('产品经理') && p.includes('项目规划师'));
+  assert.equal(p.includes('先写 PRD 然后排期'), false, '接力段不应携带用户原话（前缀缓存友好）');
+  // 无链时与旧版一致
+  const single = buildAgentSystemPrompt([], '写 PRD', null, false, null, personaById('product'));
+  assert.equal(single.includes('【人格接力】'), false);
+});
+
+test('接力链预算取链上最大值且步数 +2', () => {
+  const chain = [personaById('research'), personaById('writer')]; // 8/32K 与 5/20K
+  const l = agentLimits({}, chain[0], chain);
+  assert.equal(l.maxSteps, 10);
+  assert.equal(l.ctxBudget, 32000);
+  // 环境变量显式配置永远优先
+  const l2 = agentLimits({ AGENT_MAX_STEPS: '5' }, chain[0], chain);
+  assert.equal(l2.maxSteps, 5);
+});
+
+test('接力路由复盘展示逐阶段分工', () => {
+  const why = formatRouteWhy('先写一份小程序 PRD，然后制定一个两周的上线计划', 'auto');
+  assert.ok(why.includes('多阶段任务'));
+  assert.ok(why.includes('产品经理') && why.includes('项目规划师'));
+  const hit = formatRouteHit(resolvePersona('auto', '先写一份小程序 PRD，然后制定一个两周的上线计划'), 3);
+  assert.ok(hit.startsWith('接力：'));
+});
+
+test('断点续做恢复存档里的接力链与并集工具', async () => {
+  const original = globalThis.fetch;
+  const captured = [];
+  globalThis.fetch = async (url, init) => {
+    captured.push(JSON.parse(init.body));
+    return sse([{ choices: [{ delta: { content: '继续接力。' } }] }]);
+  };
+  try {
+    const saved = {
+      targetModelId: 'mock-model',
+      allowTools: true,
+      kbReadOnly: false,
+      hasKbDocs: true,
+      personaId: 'product',
+      chainIds: ['product', 'planner'],
+      loopStartIdx: 2,
+      origUserText: '先写 PRD 然后排期',
+      messages: [
+        { role: 'system', content: 'sys' },
+        { role: 'user', content: '先写 PRD 然后排期' },
+        { role: 'assistant', content: '', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'list_docs', arguments: '{}' } }] },
+        { role: 'tool', tool_call_id: 'c1', name: 'list_docs', content: '（空）' },
+      ],
+    };
+    const r = await tgAgentResume(ENV, noopTgApi, 'p_chat_chain', saved, null, { maxRuntimeMs: 30000 });
+    assert.ok(r.text.includes('继续接力'));
+    const names = (captured[0].tools || []).map(t => t.function.name);
+    // product 与 planner 的并集：两边都有的 read_doc 在；product 独有的 remember 在
+    assert.ok(names.includes('read_doc'));
+    assert.ok(names.includes('remember'));
   } finally {
     globalThis.fetch = original;
   }

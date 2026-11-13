@@ -46,7 +46,7 @@ import { kbGetRegistry } from '../kb/registry.js';
 import { mapLimit } from '../utils.js';
 import { sanitizeHistory, lastUserText } from './history.js';
 import { agentGetPersona } from './mode.js';
-import { resolvePersona, personaById, personaAllowsTool, formatPersonaBadge, formatRouteHit, DEFAULT_PERSONA_ID } from './personas.js';
+import { resolvePersona, personaById, personaAllowsTool, formatPersonaBadge, formatChainBadge, formatRouteHit, DEFAULT_PERSONA_ID } from './personas.js';
 
 const WRITE_TOOLS_SET = new Set(['remember', 'forget_memory', 'save_doc', 'delete_doc']);
 
@@ -175,15 +175,18 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
     withTimeout(agentGetPersona(env, chatId), r2BudgetMs, 'auto')
   ]);
   const hasKbDocs = Array.isArray(kbDocs) ? kbDocs.length > 0 : undefined;
-  // 显式指定（Web 请求体 / 本次调用参数）优先，其次是用户固定的人格，最后按提问自动路由
-  const route = resolvePersona((opts && opts.persona) || savedPersona, query);
+  // 显式指定（本次调用参数）优先，其次是用户固定的人格，最后按提问自动路由。
+  // 传入 safeHistory：短追问在当前句信号不足时可承接上一轮专家，无需额外存储或模型调用。
+  // 一句话里出现显式有序阶段（先…然后…）时组成接力链：首位角色主导，链上角色依次接力。
+  const route = resolvePersona((opts && opts.persona) || savedPersona, query, safeHistory);
   const persona = route.persona;
-  // 路由「为什么」：自动选中非通用角色时，首步进度里带一句「命中：xx、xx」，让用户看得见依据
+  const chain = Array.isArray(route.chain) && route.chain.length > 1 ? route.chain : null;
+  // 路由「为什么」：自动选中非通用角色时，首步进度里带一句「命中：xx、xx」/「接力：A → B」，让用户看得见依据
   const routeWhy = formatRouteHit(route, 3);
   const systemPrompt = buildAgentSystemPrompt(
-    memoryBundle ? memoryBundle.longterm : [], query, kbDocs, kbReadOnly, memoryBundle, persona
+    memoryBundle ? memoryBundle.longterm : [], query, kbDocs, kbReadOnly, memoryBundle, persona, chain
   );
-  const tools = allowTools ? getAgentTools(kbReadOnly, { hasKbDocs, persona }) : null;
+  const tools = allowTools ? getAgentTools(kbReadOnly, { hasKbDocs, persona, chain }) : null;
   const messages = [{ role: 'system', content: systemPrompt }];
   for (const m of safeHistory) messages.push(m);
 
@@ -192,11 +195,12 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
   const result = await tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline,
     (opts && opts.resumeKey) || null, false, undefined,
     (opts && opts.onDelta) || null, (opts && opts.onReset) || null, kbReadOnly, origUserText,
-    hasKbDocs, persona, routeWhy);
+    hasKbDocs, persona, chain, routeWhy);
   // 回传本次实际使用的人格与路由依据：调用方可据此展示徽标与解释（Web 端也可选用）
   if (result && typeof result === 'object') {
     result.personaId = persona.id;
     result.personaRoute = { source: route.source, reason: route.reason, matched: route.matched.slice(0, 5) };
+    if (chain) result.personaChain = chain.map(p => p.id);
   }
   await recordWorkingMemory(env, chatId, origUserText, result, opts);
   return result;
@@ -237,23 +241,29 @@ async function tgAgentResume(env, tgApi, chatId, saved, onProgress, opts) {
   // 人格跟着存档走：恢复后不能因为自动路由换了个角色，导致工具集与提示词口径不一致。
   // 旧存档没有 personaId，回落通用人格（与旧版行为一致）。
   const persona = personaById(saved.personaId);
-  const tools = allowTools ? getAgentTools(kbReadOnly, { hasKbDocs: saved.hasKbDocs, persona }) : null;
+  // 接力链也随存档恢复：链上工具白名单是并集，少了链会让第二阶段的工具凭空消失
+  const chain = Array.isArray(saved.chainIds) && saved.chainIds.length > 1
+    ? saved.chainIds.map(id => personaById(id)).filter(p => p && p.id !== DEFAULT_PERSONA_ID)
+    : null;
+  const chainOk = Array.isArray(chain) && chain.length > 1 ? chain : null;
+  const tools = allowTools ? getAgentTools(kbReadOnly, { hasKbDocs: saved.hasKbDocs, persona, chain: chainOk }) : null;
   const deadline = tgAgentDeadline(env, opts);
   const baseLoopStartIdx = (typeof saved.loopStartIdx === 'number' && saved.loopStartIdx >= 0) ? saved.loopStartIdx : undefined;
   const result = await tgAgentRunLoop(env, tgApi, chatId, saved.targetModelId, saved.messages, tools, allowTools, onProgress, deadline,
     (opts && opts.resumeKey) || null, true, baseLoopStartIdx,
     (opts && opts.onDelta) || null, (opts && opts.onReset) || null, kbReadOnly, saved.origUserText || '',
-    saved.hasKbDocs, persona, '');
+    saved.hasKbDocs, persona, chainOk, '');
   await recordWorkingMemory(env, chatId, saved.origUserText || '', result, opts);
   return result;
 }
 
-async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume, baseLoopStartIdx, onDelta, onReset, kbReadOnly, origUserText, hasKbDocs, persona, routeWhy) {
+async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume, baseLoopStartIdx, onDelta, onReset, kbReadOnly, origUserText, hasKbDocs, persona, chain, routeWhy) {
   // 不原地修改调用方数组：断点存档的 messages 被 push 后就被污染了，
   // 同一份存档再跑一次（如 fallback 重试）会带着上一轮的 assistant/tool 消息，序列直接错乱
   messages = Array.isArray(messages) ? messages.slice() : [];
   persona = persona || personaById(DEFAULT_PERSONA_ID);
-  const limits = agentLimits(env, persona);
+  chain = Array.isArray(chain) && chain.length > 1 ? chain : null;
+  const limits = agentLimits(env, persona, chain);
   const maxSteps = limits.maxSteps;
   const ctxBudget = limits.ctxBudget;
   const useUpstreamStream = env.AGENT_STREAM_UPSTREAM !== '0';
@@ -303,6 +313,8 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       hasKbDocs: hasKbDocs,
       // 人格跟着存档：恢复后工具集与提示词口径必须与暂停前一致
       personaId: persona.id,
+      // 接力链跟着存档：恢复后链上角色的工具并集不能凭空缩水
+      chainIds: chain ? chain.map(p => p.id) : null,
       messages: trimmed.messages,
       loopStartIdx: trimmed.loopStartIdx,
       origUserText: origUserText || ''
@@ -374,7 +386,7 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       return await pauseForResume();
     }
     const elapsedSec = Math.max(1, Math.round((Date.now() - loopStartedAt) / 1000));
-    const who = persona.id === DEFAULT_PERSONA_ID ? '🤖 Agent' : formatPersonaBadge(persona);
+    const who = chain ? formatChainBadge(chain) : (persona.id === DEFAULT_PERSONA_ID ? '🤖 Agent' : formatPersonaBadge(persona));
     // 首步把路由依据亮出来（如「· 命中：502、排查」），后续步骤保持简短
     const whyPart = (step === 0 && !isResume && routeWhy) ? ' · ' + routeWhy : '';
     const stepLabel = who + ' 思考中' + (isResume ? '（继续）' : '')

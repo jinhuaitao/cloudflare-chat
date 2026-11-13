@@ -775,13 +775,14 @@ export async function handleTgWebhook(request, env, ctx) {
             if (argLower === 'why' || argLower === '为什么' || argLower.startsWith('why ') || argLower.startsWith('为什么 ')) {
               const curPersona = await agentGetPersona(env, chatId);
               let q = arg.replace(/^(why|为什么)\s*/i, '').trim();
+              let hist = null;
               if (!q) {
-                const hist = await tgGetHistory(env, chatId);
+                hist = await tgGetHistory(env, chatId);
                 q = lastUserText(hist);
               }
               await tgApi('sendMessage', {
                 chat_id: chatId,
-                text: formatRouteWhy(q, curPersona),
+                text: formatRouteWhy(q, curPersona, hist),
                 ...replyExtra
               });
               return;

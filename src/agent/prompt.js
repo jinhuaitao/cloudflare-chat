@@ -19,7 +19,7 @@
 
 import { memTokens as memoryTokens } from '../memory/layers.js';
 import { memoryPromptBlock } from '../memory/index.js';
-import { personaPromptBlock } from './personas.js';
+import { personaPromptBlock, chainPromptBlock } from './personas.js';
 
 // Intl.DateTimeFormat 在 Workers 里构造较慢，按实例缓存复用
 let cachedFmt = null;
@@ -53,8 +53,9 @@ function factTokens(fact) {
 // 同时保证同一端发往上游的 system 前缀字节级稳定（上游前缀缓存命中的前提）。
 const stablePrefixCache = new Map();
 
-function buildStablePrefix(kbReadOnly, hasKb, kbListKnown, persona) {
-  const personaKey = persona && persona.prompt ? persona.id : '';
+function buildStablePrefix(kbReadOnly, hasKb, kbListKnown, persona, chain) {
+  const chainKey = Array.isArray(chain) && chain.length > 1 ? chain.map(p => p.id).join('+') : '';
+  const personaKey = persona && persona.prompt ? persona.id + (chainKey ? '>' + chainKey : '') : '';
   const cacheKey = (kbReadOnly ? '1' : '0') + (hasKb ? '1' : '0') + (kbListKnown ? '1' : '0') + '|' + personaKey;
   const hit = stablePrefixCache.get(cacheKey);
   if (hit) return hit;
@@ -71,6 +72,8 @@ function buildStablePrefix(kbReadOnly, hasKb, kbListKnown, persona) {
   // 专家人格：只注入一段工作方式与输出契约。
   // 放在铁律之后、工具速查之前 —— 人格只调侧重点，不能覆盖上面的硬约束。
   p += personaPromptBlock(persona);
+  // 人格接力：多阶段任务时再补一段链式分工（只含角色与侧重，不含用户原话，前缀缓存友好）
+  p += chainPromptBlock(chain);
 
   const lines = [];
   // 搜索关键词策略：英文技术词在主流搜索引擎的召回质量明显更好，时效词带年份能压住旧文
@@ -115,13 +118,14 @@ function buildStablePrefix(kbReadOnly, hasKb, kbListKnown, persona) {
 // memoryBundle 为三层记忆的加载结果（memory/index.js 的 memoryLoad 返回值）。
 // 传入时走三层渲染；不传时退回旧版单层「长期记忆」渲染——老调用方与老测试不受影响。
 // persona 为 personas.js 的人格对象；不传或传通用人格时不注入角色段（与旧版字节一致）。
-function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly, memoryBundle, persona) {
+// chain 可选：人格接力的角色数组（≥2 位时注入链式分工段）。
+function buildAgentSystemPrompt(memories, query, kbDocs, kbReadOnly, memoryBundle, persona, chain) {
   const kbList = Array.isArray(kbDocs) ? kbDocs.filter(e => e && (e.title || e.file)) : [];
   const hasKb = kbList.length > 0;
   const hasMemory = !!memoryBundle;
 
   // ---------- 稳定前缀：同一模型、同一端、同一人格、同一轮里字节不变 ----------
-  let p = buildStablePrefix(kbReadOnly, hasKb, Array.isArray(kbDocs), persona);
+  let p = buildStablePrefix(kbReadOnly, hasKb, Array.isArray(kbDocs), persona, chain);
 
   // ---------- 动态尾部：以下内容逐轮变化，放在最后以免影响前缀复用 ----------
   if (hasKb) {

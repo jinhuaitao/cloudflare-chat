@@ -7,12 +7,24 @@
 // ==================== Telegram Agent：主循环限制与工具描述 ====================
 // persona 可选：只提供「默认预算」，显式配置的环境变量永远优先。
 // 调研类要多跑几步多读几篇，写作类给多了只会增加发散风险，预算跟着任务形态走。
-function agentLimits(env, persona) {
+// chain 可选：人格接力时预算取链上角色的最大值，步数额外 +2——
+// 阶段切换本身要消耗一步，不能让第二阶段刚开始就撞上限。
+function agentLimits(env, persona, chain) {
   env = env || {};
+  const chainList = Array.isArray(chain) && chain.length > 1 ? chain : null;
 
   let maxSteps = parseInt(env.AGENT_MAX_STEPS, 10);
   if (!(maxSteps > 0)) {
-    maxSteps = parseInt(persona && persona.maxSteps, 10);
+    if (chainList) {
+      maxSteps = 0;
+      for (const p of chainList) {
+        const v = parseInt(p && p.maxSteps, 10);
+        if (v > maxSteps) maxSteps = v;
+      }
+      if (maxSteps > 0) maxSteps += 2;
+    } else {
+      maxSteps = parseInt(persona && persona.maxSteps, 10);
+    }
     if (!(maxSteps > 0)) maxSteps = 6;
   }
   if (maxSteps > 12) maxSteps = 12;
@@ -35,7 +47,15 @@ function agentLimits(env, persona) {
   // 单轮上下文字符预算：超出后自动折叠早期工具输出并压缩更早的历史轮次
   let ctxBudget = parseInt(env.AGENT_CONTEXT_BUDGET, 10);
   if (!(ctxBudget > 0)) {
-    ctxBudget = parseInt(persona && persona.ctxBudget, 10);
+    if (chainList) {
+      ctxBudget = 0;
+      for (const p of chainList) {
+        const v = parseInt(p && p.ctxBudget, 10);
+        if (v > ctxBudget) ctxBudget = v;
+      }
+    } else {
+      ctxBudget = parseInt(persona && persona.ctxBudget, 10);
+    }
     if (!(ctxBudget > 0)) ctxBudget = 24000;
   }
   if (ctxBudget < 6000) ctxBudget = 6000;

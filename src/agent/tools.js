@@ -367,8 +367,11 @@ const toolsCache = new Map();
 function getAgentTools(kbReadOnly, opts) {
   const hasKbDocs = opts && typeof opts.hasKbDocs === 'boolean' ? (opts.hasKbDocs ? 'y' : 'n') : 'u';
   const persona = opts && opts.persona ? opts.persona : null;
+  // 人格接力：链上多个角色的工具白名单取并集——写 PRD 的那一轮不该拿不到排期要用的工具
+  const chain = Array.isArray(opts && opts.chain) && opts.chain.length > 1 ? opts.chain : null;
   const personaKey = persona && Array.isArray(persona.tools) ? persona.id : '';
-  const cacheKey = (kbReadOnly ? 'ro' : 'rw') + '|' + hasKbDocs + '|' + personaKey;
+  const chainKey = chain ? chain.map(p => p.id).join('+') : '';
+  const cacheKey = (kbReadOnly ? 'ro' : 'rw') + '|' + hasKbDocs + '|' + personaKey + '|' + chainKey;
   const hit = toolsCache.get(cacheKey);
   if (hit) return hit;
 
@@ -379,7 +382,13 @@ function getAgentTools(kbReadOnly, opts) {
   if (hasKbDocs === 'n') {
     filtered = filtered.filter(t => KB_READ_TOOL_NAMES.indexOf(t.function.name) === -1);
   }
-  if (personaKey) {
+  if (chain) {
+    const allow = new Set();
+    for (const p of chain) {
+      if (Array.isArray(p.tools)) for (const n of p.tools) allow.add(n);
+    }
+    filtered = filtered.filter(t => allow.has(t.function.name));
+  } else if (personaKey) {
     filtered = filtered.filter(t => persona.tools.indexOf(t.function.name) !== -1);
   }
   toolsCache.set(cacheKey, filtered);
