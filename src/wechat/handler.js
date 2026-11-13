@@ -15,7 +15,7 @@
 // 6) 中英双语快捷口令（菜单/帮助、模型/模型 序号、智能体/模式、画 <描述>、清空、记忆、忘掉、知识库、状态）+ 网页端会话同步与实时收发诊断日志。
 
 import { APP_VERSION, CORS_HEADERS } from '../constants.js';
-import { mapSetBounded, mapGetBounded, mapLimit, parseCommaSeparated, safeEqual } from '../utils.js';
+import { mapSetBounded, mapGetBounded, mapLimit, parseCommaSeparated, safeEqual, deferOrAwait } from '../utils.js';
 import { storeGet, storePut, storePutChecked, storeDelete } from '../store/r2.js';
 import { getChannelConfig, resolveModelKey, buildAIRequest } from '../channel.js';
 import { tgTrimHistory, tgGetHistory, tgSaveHistory, tgClearHistory } from '../tg-history.js';
@@ -122,6 +122,13 @@ const wxDiagMem = {
   events: [],
 };
 
+// 诊断落盘合并：'reply' / 'image' 这类每条消息都发生的事件，旧版每条都同步写一次 R2，
+// 等于每条回复在关键路径上多付一次 R2 写。改为至少间隔 30 秒才落一次盘；
+// 'error' / 'login' 低频且排查时等不起，保持每次都写。
+const WX_DIAG_PERSIST_MIN_MS = 30000;
+const WX_DIAG_ALWAYS_PERSIST_KINDS = ['error', 'login'];
+let wxDiagLastPersistAt = 0;
+
 async function wxRecordDiag(env, kind, detail, userId = '', persist = false) {
   const now = Date.now();
   if (kind === 'poll') {
@@ -145,17 +152,21 @@ async function wxRecordDiag(env, kind, detail, userId = '', persist = false) {
     if (wxDiagMem.events.length > 20) wxDiagMem.events.length = 20;
   }
   if (persist && env && env.R2) {
-    try {
-      await storePut(env, WX_DIAG_KEY, JSON.stringify({
-        lastPollAt: wxDiagMem.lastPollAt,
-        lastInboundAt: wxDiagMem.lastInboundAt,
-        lastReplyAt: wxDiagMem.lastReplyAt,
-        lastError: wxDiagMem.lastError,
-        totalPolls: wxDiagMem.totalPolls,
-        totalProcessed: wxDiagMem.totalProcessed,
-        events: wxDiagMem.events.slice(0, 12),
-      }));
-    } catch (e) {}
+    const always = WX_DIAG_ALWAYS_PERSIST_KINDS.indexOf(kind) !== -1;
+    if (always || now - wxDiagLastPersistAt >= WX_DIAG_PERSIST_MIN_MS) {
+      wxDiagLastPersistAt = now;
+      try {
+        await storePut(env, WX_DIAG_KEY, JSON.stringify({
+          lastPollAt: wxDiagMem.lastPollAt,
+          lastInboundAt: wxDiagMem.lastInboundAt,
+          lastReplyAt: wxDiagMem.lastReplyAt,
+          lastError: wxDiagMem.lastError,
+          totalPolls: wxDiagMem.totalPolls,
+          totalProcessed: wxDiagMem.totalProcessed,
+          events: wxDiagMem.events.slice(0, 12),
+        }));
+      } catch (e) {}
+    }
   }
 }
 
@@ -645,12 +656,15 @@ async function processWechatMessage(env, creds, rawMsg, ctx) {
   const sendReply = async (replyText, skipFormat = false) => {
     const cleanText = skipFormat ? String(replyText || '').trim() : formatWechatText(replyText);
     const chunks = splitWechatText(cleanText, 3800, 5);
+    // context_token 在一次回复内复用：旧版每个分片都重新读一次 R2，
+    // 5 个分片就是 5 次往返；token 只在收到新入站消息时轮换，秒级窗口内复用是安全的
+    let replyCtxToken = null;
     for (const chunk of chunks) {
       if (!chunk) continue;
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-          const latestCtxToken = (await getWxContextToken(env, userId)) || contextToken;
-          const r = await ilinkSendMessage(creds.baseurl, creds.bot_token, userId, chunk, latestCtxToken, chanVer, 15000);
+          if (replyCtxToken === null) replyCtxToken = (await getWxContextToken(env, userId)) || contextToken;
+          const r = await ilinkSendMessage(creds.baseurl, creds.bot_token, userId, chunk, replyCtxToken, chanVer, 15000);
           if (r && (r.ret === -14 || r.errcode === -14)) {
             await markWxSessionExpired(env, creds, r.errmsg);
             return;
@@ -763,7 +777,8 @@ async function processWechatMessage(env, creds, rawMsg, ctx) {
         nextHist.push({ role: 'user', content: `【上传文件并自动整理入库：《${fm.fileName}》】\n` + docText.slice(0, 4000) });
         nextHist.push({ role: 'assistant', content: kbReply });
         nextHist = tgTrimHistory(nextHist, env);
-        await tgSaveHistory(env, chatId, nextHist);
+        // 入库结果写回会话历史不挡回复：挂 waitUntil 后台跑
+        await deferOrAwait(ctx, tgSaveHistory(env, chatId, nextHist));
 
         await wxRecordDiag(env, 'reply', `自动整理文件入库《${docTitle}》(${docText.length}字)`, userId, true);
         await sendReply(kbReply);
@@ -838,10 +853,13 @@ async function processWechatMessage(env, creds, rawMsg, ctx) {
     }
 
     if (cmd && (cmd.cmd === '/clear' || cmd.cmd === '/new')) {
-      await tgClearHistory(env, chatId);
-      await agentClearResumeState(env, chatId);
-      // v7.10.0：/clear 连 L1 工作记忆一起清（换话题语义），L2 长期事实与 L3 归档保留
-      await memoryClearSession(env, chatId);
+      // 三次互不依赖的 R2 操作并行：清空语义必须等它们落地，但没必要串行等
+      await Promise.all([
+        tgClearHistory(env, chatId),
+        agentClearResumeState(env, chatId),
+        // v7.10.0：/clear 连 L1 工作记忆一起清（换话题语义），L2 长期事实与 L3 归档保留
+        memoryClearSession(env, chatId),
+      ]);
       await sendReply('🧹 当前微信会话上下文已清空（含本会话工作记忆），长期记忆与归档保留，可以开始新的话题了。', true);
       return { processed: true };
     }
@@ -1222,15 +1240,18 @@ async function processWechatMessage(env, creds, rawMsg, ctx) {
           if (mUrl) directImageSource = mUrl[1];
         }
         if (!r.paused) {
+          const deferred = [];
           if (!r.isImage && replyText) {
             let finalHist = baseHistory.slice();
             const qToSave = resumeState ? (resumeState.origUserText || '') : historyUserText;
             if (qToSave) finalHist.push({ role: 'user', content: qToSave });
             finalHist.push({ role: 'assistant', content: replyText });
             finalHist = tgTrimHistory(finalHist, env);
-            await tgSaveHistory(env, chatId, finalHist);
+            deferred.push(tgSaveHistory(env, chatId, finalHist));
           }
-          await agentClearResumeState(env, chatId);
+          deferred.push(agentClearResumeState(env, chatId));
+          // 历史保存与断点清理不挡回复：挂 waitUntil 后台跑
+          await deferOrAwait(ctx, deferred);
         }
       }
     } else {
@@ -1282,7 +1303,8 @@ async function processWechatMessage(env, creds, rawMsg, ctx) {
             finalHist.push({ role: 'user', content: historyUserText });
             finalHist.push({ role: 'assistant', content: replyText });
             finalHist = tgTrimHistory(finalHist, env);
-            await tgSaveHistory(env, chatId, finalHist);
+            // 与 Agent 路径一致：保存不挡回复
+            await deferOrAwait(ctx, tgSaveHistory(env, chatId, finalHist));
           }
         } else {
           let diag = '';

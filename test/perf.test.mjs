@@ -181,3 +181,51 @@ test('思维链默认不回灌上下文，AGENT_KEEP_REASONING=1 才回灌', asy
     globalThis.fetch = original;
   }
 });
+
+// 收尾持久化（历史保存 / 断点清理）不该挡在用户看回复的关键路径上：
+// 有 ctx 时挂 waitUntil 立即返回，没有时也要并行等（不再逐个串行 await）。
+test('deferOrAwait：有 ctx 挂 waitUntil 立即返回，任务仍跑完', async () => {
+  const { deferOrAwait } = await import('../src/utils.js');
+  const order = [];
+  const task = (name, ms) => new Promise(res => setTimeout(() => { order.push(name); res(); }, ms));
+  const held = [];
+  const ctx = { waitUntil: (p) => held.push(p) };
+  const t0 = Date.now();
+  await deferOrAwait(ctx, [task('a', 40), task('b', 40)]);
+  assert.ok(Date.now() - t0 < 25, '挂了 waitUntil 后不应原地等待任务完成');
+  assert.equal(held.length, 1, '必须真的挂进 waitUntil');
+  await held[0];
+  assert.deepEqual(order.sort(), ['a', 'b'], '后台任务必须全部跑完');
+});
+
+test('deferOrAwait：无 ctx 时并行等待（总时长取 max 而非 sum）', async () => {
+  const { deferOrAwait } = await import('../src/utils.js');
+  const task = (ms) => new Promise(res => setTimeout(res, ms));
+  const t0 = Date.now();
+  await deferOrAwait(null, [task(40), task(40)]);
+  const cost = Date.now() - t0;
+  assert.ok(cost < 70, '两个 40ms 任务串行要 80ms+，并行应明显小于（实测 ' + cost + 'ms）');
+});
+
+test('收尾写入延后已接到 TG / 微信双端的四条回复路径', async () => {
+  const fs = await import('node:fs');
+  const tg = fs.readFileSync(new URL('../src/telegram/handler.js', import.meta.url), 'utf8');
+  const wx = fs.readFileSync(new URL('../src/wechat/handler.js', import.meta.url), 'utf8');
+  for (const [name, src] of [['telegram', tg], ['wechat', wx]]) {
+    // Agent 路径：保存历史 + 清断点一起延后
+    assert.ok(src.includes('deferred.push(tgSaveHistory('), name + '：Agent 路径未延后历史保存');
+    assert.ok(src.includes('deferred.push(agentClearResumeState('), name + '：Agent 路径未延后断点清理');
+    assert.ok(src.includes('await deferOrAwait(ctx, deferred)'), name + '：Agent 路径未走 deferOrAwait');
+    // 普通对话路径：保存历史同样延后
+    assert.ok(src.includes('await deferOrAwait(ctx, tgSaveHistory('), name + '：普通路径未延后历史保存');
+    // 旧的串行写法不允许再出现（在这两个收尾块里）
+    assert.equal(src.includes('await tgSaveHistory('), false, name + '：仍存在关键路径上的串行历史保存');
+    // /clear 三次清理并行（语义要等待，但不必串行）
+    assert.ok(/\/clear[\s\S]{0,600}Promise\.all\(\[/.test(src), name + '：/clear 未并行化');
+  }
+  // 微信专属：诊断日志落盘必须按时间合并，否则每条回复都多一次 R2 写
+  assert.ok(wx.includes('WX_DIAG_PERSIST_MIN_MS'), 'wechat：诊断落盘未做时间合并');
+  assert.ok(wx.includes('WX_DIAG_ALWAYS_PERSIST_KINDS'), 'wechat：error/login 应保持立即落盘');
+  // 回复分片复用 context_token，不再每片读一次 R2
+  assert.ok(wx.includes('replyCtxToken === null'), 'wechat：回复分片未复用 context_token');
+});

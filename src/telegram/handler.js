@@ -4,7 +4,7 @@
 // 2) 新增私聊管理员专属微信 ClawBot 绑定命令（/wxlogin、/wxstatus、/wxunbind），无需打开网页即可在 Telegram 私聊中安全完成微信扫码绑定。
 
 import { APP_VERSION } from '../constants.js';
-import { mapSetBounded, mapGetBounded, parseCommaSeparated, safeEqual } from '../utils.js';
+import { mapSetBounded, mapGetBounded, parseCommaSeparated, safeEqual, deferOrAwait } from '../utils.js';
 import { storeGet, storePut, storePutChecked } from '../store/r2.js';
 import { getChannelConfig, buildAIRequest } from '../channel.js';
 import { tgTrimHistory, tgGetHistory, tgSaveHistory, tgClearHistory } from '../tg-history.js';
@@ -577,11 +577,14 @@ export async function handleTgWebhook(request, env, ctx) {
           }
 
           if (cmd && (cmd.cmd === '/clear' || cmd.cmd === '/new')) {
-            await tgClearHistory(env, chatId);
-            await agentClearResumeState(env, chatId);
-            // v7.10.0：/clear 语义是"换个话题"，所以连 L1 工作记忆一起清；
-            // L2 长期事实与 L3 归档保留——用户不会因为清空上下文就想把"我叫什么"忘掉。
-            await memoryClearSession(env, chatId);
+            // 三次互不依赖的 R2 操作并行：清空语义必须等它们落地，但没必要串行等
+            await Promise.all([
+              tgClearHistory(env, chatId),
+              agentClearResumeState(env, chatId),
+              // v7.10.0：/clear 语义是"换个话题"，所以连 L1 工作记忆一起清；
+              // L2 长期事实与 L3 归档保留——用户不会因为清空上下文就想把"我叫什么"忘掉。
+              memoryClearSession(env, chatId),
+            ]);
             await tgApi('sendMessage', { chat_id: chatId, text: "🧹 上下文已清空（含本会话工作记忆），长期记忆与归档保留，可以开始新的话题了。", ...replyExtra });
             return;
           }
@@ -912,15 +915,18 @@ export async function handleTgWebhook(request, env, ctx) {
             } else {
               replyText = r.text;
               if (!r.paused) {
+                const deferred = [];
                 if (!r.isImage && replyText) {
                   let finalHist = baseHistory.slice();
                   const qToSave = resumeState ? (resumeState.origUserText || '') : historyUserText;
                   if (qToSave) finalHist.push({ role: "user", content: qToSave });
                   finalHist.push({ role: "assistant", content: replyText });
                   finalHist = tgTrimHistory(finalHist, env);
-                  await tgSaveHistory(env, chatId, finalHist);
+                  deferred.push(tgSaveHistory(env, chatId, finalHist));
                 }
-                await agentClearResumeState(env, chatId);
+                deferred.push(agentClearResumeState(env, chatId));
+                // 历史保存与断点清理不挡回复：挂 waitUntil 后台跑，用户立刻看到答复
+                await deferOrAwait(ctx, deferred);
               }
             }
           } else {
@@ -968,7 +974,8 @@ export async function handleTgWebhook(request, env, ctx) {
                   finalHist.push({ role: "user", content: historyUserText });
                   finalHist.push({ role: "assistant", content: replyText });
                   finalHist = tgTrimHistory(finalHist, env);
-                  await tgSaveHistory(env, chatId, finalHist);
+                  // 与 Agent 路径一致：保存不挡回复
+                  await deferOrAwait(ctx, tgSaveHistory(env, chatId, finalHist));
                 }
               } else {
                 let diag = '';

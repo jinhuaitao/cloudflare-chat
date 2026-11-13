@@ -19,6 +19,10 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json 与 README.md 的版本号，
 // CI 会用 npm run check 校验三处一致，防止文档与代码再次脱节）
+// 7.19.0：回复关键路径减负——历史保存 / 断点清理从回复发送前的串行 await 改为
+//         deferOrAwait（有 ctx 挂 waitUntil 后台跑，无 ctx 并行等待），TG / 微信
+//         四条回复路径统一接入；微信诊断日志落盘按 30 秒合并（error/login 保持立即），
+//         回复分片不再每片重读 context_token；/clear 三次 R2 清理并行。
 // 7.18.0：网页端思考过程改为折叠胶囊——旧版把 reasoning 铺成 160px 常驻滚动框，
 //         思考长的模型会让气泡里先出现一大段"自语"，正文被挤到下面；同时正文区还渲染
 //         一句「正在深度思考…」占位，与新胶囊标题重复且落在工具轨迹下方。现在默认只留
@@ -77,7 +81,7 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 //        断点起点修正、流式读取不阻塞、抓取失败语义统一）。
 // 7.5.0：Agent 内核加固（工具并发闸门、预算感知超时、步数感知收束、双保险空转熔断、
 //        历史轮次压缩）+ 工具箱新增 JSON/正则动作 + 全量回归测试。
-const APP_VERSION = '7.18.0';
+const APP_VERSION = '7.19.0';
 const PNG_HEADERS = {
   'Content-Type': 'image/png',
   'Cache-Control': 'public, max-age=86400',

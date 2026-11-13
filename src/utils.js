@@ -81,6 +81,21 @@ function safeEqual(a, b) {
   return diff === 0;
 }
 
+// 收尾写入延后：历史保存 / 断点清理这类「必须完成、但不挡用户看回复」的持久化操作，
+// 旧版在回复发送前逐个 await，每条消息都在关键路径上多等一两个 R2 往返。
+// 有 Workers 执行上下文时挂 waitUntil（响应发出后平台保证跑完），
+// 没有（测试 / 直接调用）就并行等待，语义与旧版一致。
+// 注意：任务在调用前已启动（Promise 已创建），这里只决定"等不等、挂在哪"。
+async function deferOrAwait(ctx, tasks) {
+  const list = (Array.isArray(tasks) ? tasks : [tasks]).map(t => Promise.resolve(t));
+  if (!list.length) return;
+  const all = Promise.all(list).catch(() => {});
+  if (ctx && typeof ctx.waitUntil === 'function') {
+    try { ctx.waitUntil(all); return; } catch (e) {}
+  }
+  await all;
+}
+
 export {
   MEM_CACHE_MAX,
   DEFAULT_CACHE_TTL_MS,
@@ -89,4 +104,5 @@ export {
   mapLimit,
   parseCommaSeparated,
   safeEqual,
+  deferOrAwait,
 };
