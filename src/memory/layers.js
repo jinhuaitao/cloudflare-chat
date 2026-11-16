@@ -38,6 +38,18 @@ export const AR_TEXT_MAX = 200;
 // 三层注入提示词的默认总预算（字符）。L1/L2/L3 按 16:30:9 分配。
 export const MEM_PROMPT_BUDGET = 5500;
 
+// isolate 内记忆缓存的默认 TTL。记忆是"读多写少"的数据：一轮对话要读三层，
+// 但只有 remember / 每轮 L1 要点会写。60 秒意味着连续对话里每分钟仍要回源一次，
+// 而写路径是穿透更新缓存的，所以把 TTL 放宽到 3 分钟并不会让用户看到旧数据
+// （跨 isolate 的最坏情况是别人在另一个实例里改了记忆，本实例最多晚 3 分钟看到）。
+// 需要更严格的实时性可调小，需要更省 R2 操作可调大。
+export const MEM_CACHE_TTL_MS = 180 * 1000;
+
+export function memCacheTtl(env) {
+  const e = env || {};
+  return clampInt(e.MEM_CACHE_TTL_MS, 5000, 3600000, MEM_CACHE_TTL_MS);
+}
+
 function clampInt(v, min, max, dflt) {
   const n = parseInt(v, 10);
   if (!isFinite(n)) return dflt;

@@ -1,6 +1,7 @@
 // 知识库文档注册表：kb/docs/registry.json 的读写与自愈重建（_worker.js 原第 786-904 行）
 
 import { KB_PREFIX } from '../store/kb.js';
+import { storeGetMeta, storeGetRange, storeList, storePutChecked, storePutCas } from '../store/r2.js';
 import { mapLimit } from '../utils.js';
 
 // ==================== 知识库文档（v6.8.0 重构，v6.9.5 缓存加速）：注册表方案 ====================
@@ -17,6 +18,8 @@ const KB_REG_CACHE_TTL_MS = 30 * 1000;
 let cachedRegistry = null;
 let cachedRegistryBucket = null;
 let cachedRegistryExp = 0;
+// 注册表当前版本在 R2 里的 etag：条件写（CAS）的前提，写路径用它判断"读到之后有没有人改过"
+let cachedRegistryEtag = '';
 // 注册表版本号：每次成功写入 +1，供正文检索缓存判断结果是否过期
 let kbRegVersion = 0;
 function kbRegistryVersion() { return kbRegVersion; }
@@ -76,7 +79,7 @@ async function kbListDocObjects(env) {
   try {
     let cursor;
     do {
-      const listed = await env.R2.list({ prefix: KB_DOCS_PREFIX, limit: 1000, cursor: cursor });
+      const listed = await storeList(env, { prefix: KB_DOCS_PREFIX, limit: 1000, cursor: cursor });
       for (const o of (listed.objects || [])) {
         if (o.key !== KB_REGISTRY_KEY) objs.push(o);
       }
@@ -96,9 +99,10 @@ async function kbRebuildRegistry(env, objs) {
     let fm = {};
     try {
       // v6.8.4：frontmatter 含长标题/长 source 时 1200 字节可能截断，放大到 4096
+      // v7.20.0：走 storeGetRange —— 只取头 4KB，且享受统一的重试与指标统计
       if (o.size > 0) {
-        const r = await env.R2.get(o.key, { range: { offset: 0, length: 4096 } });
-        if (r) fm = kbParseFrontmatter(await r.text());
+        const head = await storeGetRange(env, o.key, 0, 4096);
+        if (head) fm = kbParseFrontmatter(head);
       }
     } catch (e) {}
     const ver = parseInt(fm.version, 10);
@@ -160,48 +164,121 @@ async function kbVerifyRegistry(env, reg) {
 // opts.fresh：跳过 30 秒内存缓存，直接读 R2。写路径必须用（否则会覆盖别的实例刚写入的条目）。
 // opts.verify：读完再和实际文件核对一次，不一致就重建。
 // 另外：注册表为空但 kb/docs/ 下有文件时，无论是否传 verify 都会自动核对修复。
-async function kbGetRegistry(env, opts) {
-  if (!env || !env.R2) return [];
+//
+// v7.20.0：读路径带出 etag，写路径改「条件写」——
+// 旧版为了防丢更新，每次 save 都要 verify（= 一次 R2 list + 漂移时读全部文档头），
+// 那是保存延迟里最贵的一段。现在用 etag 做 CAS：读到 → 改 → 带着 etag 写，
+// 有人抢先改过就写不进去，调用方重读重算。互斥效果相同，成本从 list 降到 0。
+async function kbGetRegistryEx(env, opts) {
+  if (!env || !env.R2) return { reg: [], etag: '' };
   const o = opts || {};
   const now = Date.now();
   if (!o.fresh && cachedRegistry && cachedRegistryBucket === env.R2 && now < cachedRegistryExp) {
     const hit = cachedRegistry.slice();
-    if (o.verify || !hit.length) return (await kbVerifyRegistry(env, hit)).reg;
-    return hit;
+    if (o.verify || !hit.length) {
+      const r = await kbVerifyRegistry(env, hit);
+      return { reg: r.reg, etag: cachedRegistryEtag };
+    }
+    return { reg: hit, etag: cachedRegistryEtag };
   }
   try {
-    const obj = await env.R2.get(KB_REGISTRY_KEY);
-    if (obj) {
-      const p = JSON.parse(await obj.text());
+    const obj = await storeGetMeta(env, KB_REGISTRY_KEY);
+    // 读失败 ≠ 索引不存在：有上一份缓存就先顶着用，绝不因为一次抖动就去重建索引
+    if (obj.failed) {
+      if (cachedRegistry && cachedRegistryBucket === env.R2) {
+        return { reg: cachedRegistry.slice(), etag: cachedRegistryEtag };
+      }
+    } else if (obj.text) {
+      const p = JSON.parse(obj.text);
       if (Array.isArray(p)) {
         cachedRegistry = p.slice();
         cachedRegistryBucket = env.R2;
         cachedRegistryExp = Date.now() + KB_REG_CACHE_TTL_MS;
-        if (o.verify || !p.length) return (await kbVerifyRegistry(env, p.slice())).reg;
-        return p.slice();
+        cachedRegistryEtag = obj.etag || '';
+        if (o.verify || !p.length) {
+          const r = await kbVerifyRegistry(env, p.slice());
+          return { reg: r.reg, etag: cachedRegistryEtag };
+        }
+        return { reg: p.slice(), etag: cachedRegistryEtag };
       }
     }
   } catch (e) {}
   // 缺失或损坏 → 自动重建（自愈）
-  return await kbRebuildRegistry(env);
+  const rebuilt = await kbRebuildRegistry(env);
+  return { reg: rebuilt, etag: cachedRegistryEtag };
+}
+
+async function kbGetRegistry(env, opts) {
+  const r = await kbGetRegistryEx(env, opts);
+  return r.reg;
 }
 // v6.8.4：返回布尔值——注册表写入失败必须让调用方知道，
 // 否则会出现"文档已保存但列表/读取找不到"的幽灵成功。
-async function kbSaveRegistry(env, reg) {
+// opts.expectEtag：条件写。给了 etag 就只在 R2 里的对象仍是这一版时写入，
+// 预条件失败返回 false（调用方重读重算），绝不静默覆盖别人刚写的条目。
+async function kbSaveRegistry(env, reg, opts) {
   if (!env || !env.R2) return false;
+  const o = opts || {};
   try {
     const list = Array.isArray(reg) ? reg.slice() : [];
-    await env.R2.put(KB_REGISTRY_KEY, JSON.stringify(list));
+    const body = JSON.stringify(list);
+    if (o.expectEtag) {
+      const res = await storePutCas(env, KB_REGISTRY_KEY, body, o.expectEtag);
+      if (!res.ok) {
+        // 冲突：缓存已不可信，清掉让下次读回源
+        cachedRegistry = null;
+        cachedRegistryExp = 0;
+        cachedRegistryEtag = '';
+        return false;
+      }
+      cachedRegistry = list;
+      cachedRegistryBucket = env.R2;
+      cachedRegistryExp = Date.now() + KB_REG_CACHE_TTL_MS;
+      kbRegVersion += 1;
+      return true;
+    }
+    const ok = await storePutChecked(env, KB_REGISTRY_KEY, body);
+    if (!ok) {
+      cachedRegistry = null;
+      cachedRegistryExp = 0;
+      cachedRegistryEtag = '';
+      return false;
+    }
     cachedRegistry = list;
     cachedRegistryBucket = env.R2;
     cachedRegistryExp = Date.now() + KB_REG_CACHE_TTL_MS;
+    // 普通写的 etag 未知，清空避免拿旧 etag 去做条件写
+    cachedRegistryEtag = '';
     kbRegVersion += 1;
     return true;
   } catch (e) {
     cachedRegistry = null;
     cachedRegistryExp = 0;
+    cachedRegistryEtag = '';
     return false;
   }
+}
+
+// 注册表「读-改-条件写」的通用封装：mutate 拿到最新列表的副本，返回新列表（或 null 表示放弃）。
+// 冲突（别的实例抢先写入）时自动重读重算，最多 3 轮——跨 isolate 也不会互相覆盖条目。
+async function kbMutateRegistry(env, mutate, opts) {
+  if (!env || !env.R2) return { ok: false, reg: [] };
+  const tries = (opts && opts.tries > 0) ? opts.tries : 3;
+  let seed = opts && opts.seedReg ? opts.seedReg : null;
+  let etag = opts && opts.seedEtag ? opts.seedEtag : '';
+  for (let i = 0; i < tries; i++) {
+    if (!seed) {
+      const cur = await kbGetRegistryEx(env, { fresh: true });
+      seed = cur.reg;
+      etag = cur.etag;
+    }
+    const next = await mutate(seed.slice());
+    if (!Array.isArray(next)) return { ok: false, reg: seed, skipped: true };
+    if (await kbSaveRegistry(env, next, { expectEtag: etag })) return { ok: true, reg: next };
+    seed = null;
+    etag = '';
+  }
+  return { ok: false, reg: [] };
 }
 // 注册表内模糊查找：标题精确相等 > 标题包含 > 标签命中 > slug 归一化 > 文件名包含
 // v7.11.0：新增标签命中，让「读一下 Kubernetes 相关的文档」这类按标签检索的需求能落地。
@@ -264,7 +341,9 @@ export {
   kbVerifyRegistry,
   kbTakeRepairCount,
   kbGetRegistry,
+  kbGetRegistryEx,
   kbSaveRegistry,
+  kbMutateRegistry,
   kbFindRegEntry,
   kbRegistryVersion,
   kbFmtSize,

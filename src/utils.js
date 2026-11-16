@@ -36,6 +36,29 @@ function mapGetBounded(map, key, expMap) {
   return map.get(key);
 }
 
+// 单飞（single-flight）：同一个 key 的并发加载只真正执行一次，其余调用者共享同一个 promise。
+// 用在三层记忆的读路径上：一轮对话里 loop.js 与工具层可能同时要同一份记忆，
+// 旧版会各读一次 R2（同一 isolate 内完全重复的往返）。
+// 约定：fn 必须返回「只读快照」，调用方各自 clone 后再改，避免共享可变对象。
+const singleFlightBuckets = new Map();
+
+function singleFlight(namespace, key, fn, max) {
+  let map = singleFlightBuckets.get(namespace);
+  if (!map) {
+    map = new Map();
+    singleFlightBuckets.set(namespace, map);
+  }
+  const hit = map.get(key);
+  if (hit) return hit;
+  const wrapped = (async () => fn())().finally(() => {
+    if (map.get(key) === wrapped) map.delete(key);
+  });
+  const limit = max > 0 ? max : 256;
+  if (map.size >= limit) map.clear();
+  map.set(key, wrapped);
+  return wrapped;
+}
+
 function parseCommaSeparated(str) {
   if (!str) return [];
   return str.split(',').map(s => s.trim()).filter(Boolean);
@@ -101,6 +124,7 @@ export {
   DEFAULT_CACHE_TTL_MS,
   mapSetBounded,
   mapGetBounded,
+  singleFlight,
   mapLimit,
   parseCommaSeparated,
   safeEqual,

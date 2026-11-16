@@ -1,6 +1,6 @@
 // R2 文件夹布局与知识库记忆的 Markdown 镜像辅助（_worker.js 原第 196-275 行）
 
-import { storePut } from './r2.js';
+import { storePut, storeList, storeDelete } from './r2.js';
 
 // ---------- R2 文件夹布局（v6.6.6 起，v6.6.7 补充 md 镜像，v7.1.0 性能优化） ----------
 // R2 没有真正的目录，用 key 前缀 + '/' 模拟文件夹，控制台按此展示层级。
@@ -43,7 +43,7 @@ function kbMemMarkdown(chatId, fact, ts, meta) {
 // R2 批量删除（delete 支持字符串数组，一次最多 1000 个）
 async function kbDeleteKeys(env, keys) {
   if (!env.R2 || !keys || !keys.length) return;
-  try { await env.R2.delete(keys.slice(0, 1000)); } catch (e) {}
+  try { await storeDelete(env, keys.slice(0, 1000)); } catch (e) {}
   if (keys.length > 1000) await kbDeleteKeys(env, keys.slice(1000));
 }
 // 清空某用户的整个 md 镜像目录（删 Web 会话时用）
@@ -53,9 +53,9 @@ async function kbDeleteMemDir(env, chatId) {
     const prefix = kbMemDir(chatId);
     let cursor;
     do {
-      const listed = await env.R2.list({ prefix: prefix, cursor: cursor, limit: 1000 });
+      const listed = await storeList(env, { prefix: prefix, cursor: cursor, limit: 1000 });
       const keys = (listed.objects || []).map(function (o) { return o.key; });
-      if (keys.length) await env.R2.delete(keys);
+      if (keys.length) await storeDelete(env, keys);
       cursor = listed.truncated ? listed.cursor : undefined;
     } while (cursor);
   } catch (e) {}
@@ -90,7 +90,7 @@ async function kbBackfillMd(env, chatId, arr, forceVerify) {
   try {
     let cursor;
     do {
-      const listed = await env.R2.list({ prefix: dir, limit: 1000, cursor: cursor });
+      const listed = await storeList(env, { prefix: dir, limit: 1000, cursor: cursor });
       for (const o of (listed.objects || [])) existing.add(o.key);
       cursor = listed.truncated ? listed.cursor : undefined;
     } while (cursor);

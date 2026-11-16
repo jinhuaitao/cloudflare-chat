@@ -44,6 +44,7 @@ import { memoryLoad, memoryRecordTurn } from '../memory/index.js';
 import { buildAgentSystemPrompt } from './prompt.js';
 import { kbGetRegistry } from '../kb/registry.js';
 import { mapLimit } from '../utils.js';
+import { r2StatsLine } from '../store/r2.js';
 import { sanitizeHistory, lastUserText } from './history.js';
 import { agentGetPersona } from './mode.js';
 import { resolvePersona, personaById, personaAllowsTool, formatPersonaBadge, formatChainBadge, formatRouteHit, formatPersonaTrace, personaRouteDetail, DEFAULT_PERSONA_ID } from './personas.js';
@@ -373,7 +374,9 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
         model: targetModelId, persona: persona.id,
         steps: stats.steps, tools: stats.tools, fails: stats.fails,
         ctxChars: stats.ctxChars, ctxMsgs: stats.ctxMsgs, toolsChars: toolsChars,
-        ms: Date.now() - loopStartedAt, maxSteps: maxSteps, ctxBudget: ctxBudget
+        ms: Date.now() - loopStartedAt, maxSteps: maxSteps, ctxBudget: ctxBudget,
+        // R2 往返是本轮里最容易被忽视的固定成本：读多少次、省掉多少次、重试几次，一眼可见
+        r2: r2StatsLine()
       }));
     } catch (e) {}
   };

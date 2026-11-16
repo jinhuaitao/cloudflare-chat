@@ -6,6 +6,9 @@ import { normalizePersonaId } from './personas.js';
 
 const tgAgentModeCache = new Map();
 const tgAgentModeExp = new Map();
+// 开关与人格都是「极少改、每轮读」的配置：写入是穿透更新缓存的，
+// 所以缓存可以放长到 3 分钟 —— 跨实例的最坏情况是别人刚改了人格，本实例最多晚 3 分钟生效。
+const MODE_CACHE_TTL_MS = 180 * 1000;
 
 // 获取 Agent 模式开关（默认开启）
 async function agentGetMode(env, chatId) {
@@ -14,12 +17,12 @@ async function agentGetMode(env, chatId) {
   let on = true; // 默认开启 Agent 模式
   const v = await storeGet(env, 'agent_mode_' + chatId);
   on = v !== '0';
-  mapSetBounded(tgAgentModeCache, chatId, on, undefined, tgAgentModeExp);
+  mapSetBounded(tgAgentModeCache, chatId, on, undefined, tgAgentModeExp, MODE_CACHE_TTL_MS);
   return on;
 }
 
 async function agentSetMode(env, chatId, on) {
-  mapSetBounded(tgAgentModeCache, chatId, !!on, undefined, tgAgentModeExp);
+  mapSetBounded(tgAgentModeCache, chatId, !!on, undefined, tgAgentModeExp, MODE_CACHE_TTL_MS);
   await storePut(env, 'agent_mode_' + chatId, on ? '1' : '0');
 }
 
@@ -36,14 +39,14 @@ async function agentGetPersona(env, chatId) {
   const raw = await storeGet(env, PERSONA_KEY_PREFIX + chatId);
   // 存档里可能是旧版 id 或手改的脏值：不认识就回落 auto，绝不把脏值带进提示词
   const id = normalizePersonaId(raw) || 'auto';
-  mapSetBounded(tgPersonaCache, chatId, id, undefined, tgPersonaExp);
+  mapSetBounded(tgPersonaCache, chatId, id, undefined, tgPersonaExp, MODE_CACHE_TTL_MS);
   return id;
 }
 
 async function agentSetPersona(env, chatId, id) {
   const raw = String(id || '').trim().toLowerCase();
   const value = (!raw || raw === 'auto' || raw === '自动') ? 'auto' : (normalizePersonaId(raw) || 'auto');
-  mapSetBounded(tgPersonaCache, chatId, value, undefined, tgPersonaExp);
+  mapSetBounded(tgPersonaCache, chatId, value, undefined, tgPersonaExp, MODE_CACHE_TTL_MS);
   await storePut(env, PERSONA_KEY_PREFIX + chatId, value);
   return value;
 }

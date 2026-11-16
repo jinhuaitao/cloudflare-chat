@@ -7,13 +7,14 @@
 //    它存在的意义是"比彻底消失好"，不是"永久全量"。
 // 3) 与 L1/L2 一样带 60 秒内存缓存，写入穿透更新。
 
-import { mapSetBounded, mapGetBounded } from '../utils.js';
+import { mapSetBounded, mapGetBounded, singleFlight } from '../utils.js';
 import { storeGet, storePutChecked, storeDelete } from '../store/r2.js';
-import { arKey, AR_MAX_ITEMS, AR_TEXT_MAX, clipText, memTokens, memNorm, memLimits } from './layers.js';
+import { arKey, AR_MAX_ITEMS, AR_TEXT_MAX, clipText, memTokens, memNorm, memLimits, memCacheTtl } from './layers.js';
 
 const arCache = new Map();
 const arExp = new Map();
-const AR_CACHE_TTL_MS = 60 * 1000;
+// 单飞：一轮内多处并发读 L3 时只打一次 R2
+const arLoads = new Map();
 const AR_CACHE_MAX = 500;
 
 function emptyArchive(chatId) {
@@ -48,14 +49,14 @@ function cloneArchive(a) {
 }
 
 async function arPut(env, chatId, obj) {
-  mapSetBounded(arCache, chatId, cloneArchive(obj), AR_CACHE_MAX, arExp, AR_CACHE_TTL_MS);
+  mapSetBounded(arCache, chatId, cloneArchive(obj), AR_CACHE_MAX, arExp, memCacheTtl(env));
   if (!env || !env.R2) return false;
   return await storePutChecked(env, arKey(chatId), JSON.stringify(obj));
 }
 
-export async function arGet(env, chatId) {
+async function arLoad(env, chatId) {
   const cached = mapGetBounded(arCache, chatId, env && env.R2 ? arExp : null);
-  if (cached) return cloneArchive(cached);
+  if (cached) return cached;
   let obj = emptyArchive(chatId);
   if (env && env.R2) {
     const raw = await storeGet(env, arKey(chatId));
@@ -63,7 +64,12 @@ export async function arGet(env, chatId) {
       try { obj = normalizeArchive(JSON.parse(raw), chatId, memLimits(env).l3); } catch (e) { obj = emptyArchive(chatId); }
     }
   }
-  mapSetBounded(arCache, chatId, cloneArchive(obj), AR_CACHE_MAX, arExp, AR_CACHE_TTL_MS);
+  mapSetBounded(arCache, chatId, cloneArchive(obj), AR_CACHE_MAX, arExp, memCacheTtl(env));
+  return obj;
+}
+
+export async function arGet(env, chatId) {
+  const obj = await singleFlight('ar', chatId, () => arLoad(env, chatId), AR_CACHE_MAX);
   return cloneArchive(obj);
 }
 

@@ -10,20 +10,27 @@
 //    agent_mem_<chatId> 仍会自动读取并迁移，迁移后旧键保留（体积很小，留作回滚副本）。
 // 4) md 镜像照旧：每条记忆一个 Markdown 文件，供在 R2 控制台直接翻阅。
 
-import { mapSetBounded, mapGetBounded } from '../utils.js';
+import { mapSetBounded, mapGetBounded, singleFlight } from '../utils.js';
 import { storeGet, storePutChecked, storeDelete } from '../store/r2.js';
 import { agentMemKey, agentMemKeyLegacy, kbMemDir, kbNewMemFile, kbMemMarkdown,
   kbBackfillMd, kbDeleteKeys } from '../store/kb.js';
 import {
   ltKey, memNorm, memSubjectKey, memDecayScore, memTokens,
-  clampNum, clipText, memLimits, LT_MAX_ITEMS, MEM_KINDS, MEM_KIND_LABEL
+  clampNum, clipText, memLimits, memCacheTtl, LT_MAX_ITEMS, MEM_KINDS, MEM_KIND_LABEL
 } from './layers.js';
 import { arPush } from './archive.js';
 
 const ltCache = new Map();
 const ltExp = new Map();
-const LT_CACHE_TTL_MS = 60 * 1000;
 const LT_CACHE_MAX = 500;
+// 单飞：一轮对话里 loop.js 与工具层可能同时读 L2，只该打一次 R2
+const ltLoads = new Map();
+// 「这个 chatId 已经确认过没有旧键」的短期记忆。
+// 旧版每次冷加载都要依次探测 kb/agent_mem_ 与根目录 agent_mem_ 两个旧键：
+// 新用户/新会话没有任何旧数据，于是每次冷启动白打 2 次 R2（还要串行等）。
+// 探测过一次全空后就记住，之后只读新键；下次写入新键时清掉这条记忆。
+const ltNoLegacy = new Set();
+const LT_NO_LEGACY_MAX = 500;
 
 function normalizeEntry(m) {
   if (!(m && typeof m.fact === 'string' && m.fact)) return null;
@@ -50,9 +57,14 @@ function cloneEntry(m) {
 function cloneList(arr) { return arr.map(cloneEntry); }
 
 // 读索引：新键 → kb/agent_mem_ → 根目录 agent_mem_（逐级回退，读到就迁移）
-export async function ltGet(env, chatId) {
+//
+// v7.20.0 性能：
+//   · 单飞，一轮内多处并发读只打一次 R2；
+//   · 旧键探测只做一次（ltNoLegacy），没有历史数据的会话不再每次冷启动白打 2 次；
+//   · 迁移写与 md 回补写合并成一次 PUT（旧版最多写 3 次索引）。
+async function ltLoad(env, chatId) {
   const cached = mapGetBounded(ltCache, chatId, env && env.R2 ? ltExp : null);
-  if (Array.isArray(cached)) return cloneList(cached);
+  if (Array.isArray(cached)) return cached;
 
   let arr = [];
   let raw = null;
@@ -60,16 +72,26 @@ export async function ltGet(env, chatId) {
 
   if (env && env.R2) {
     raw = await storeGet(env, ltKey(chatId));
-    if (!raw) {
+    if (!raw && !ltNoLegacy.has(chatId)) {
       const legacy = await storeGet(env, agentMemKey(chatId));
-      if (legacy) { raw = legacy; migratedFrom = 'kb'; }
-    }
-    if (!raw) {
-      const oldest = await storeGet(env, agentMemKeyLegacy(chatId));
-      if (oldest) { raw = oldest; migratedFrom = 'root'; }
+      if (legacy) {
+        raw = legacy;
+        migratedFrom = 'kb';
+      } else {
+        const oldest = await storeGet(env, agentMemKeyLegacy(chatId));
+        if (oldest) {
+          raw = oldest;
+          migratedFrom = 'root';
+        }
+      }
+      if (!raw) {
+        if (ltNoLegacy.size >= LT_NO_LEGACY_MAX) ltNoLegacy.clear();
+        ltNoLegacy.add(chatId);
+      }
     }
   }
 
+  let needIndexWrite = false;
   if (raw) {
     try {
       const parsed = JSON.parse(raw);
@@ -99,35 +121,41 @@ export async function ltGet(env, chatId) {
         arr = clean;
         if (clean.length !== parsed.length) {
           // 索引写成功才删孤儿 md：写失败时保持原样，下次加载会重试
-          try {
-            if (await storePutChecked(env, ltKey(chatId), JSON.stringify(clean))) {
-              if (orphanMd.length) await kbDeleteKeys(env, orphanMd);
-            }
-          } catch (e) {}
+          if (await storePutChecked(env, ltKey(chatId), JSON.stringify(clean))) {
+            needIndexWrite = false;
+            if (orphanMd.length) await kbDeleteKeys(env, orphanMd);
+          }
         }
       }
     } catch (e) {}
   }
 
   // 迁移：读到了旧键就写一份到新键（旧键保留，出问题可直接回滚）
-  if (migratedFrom && env && env.R2) {
-    await storePutChecked(env, ltKey(chatId), JSON.stringify(arr));
-  }
+  if (migratedFrom && env && env.R2) needIndexWrite = true;
 
-  // 回补 md 镜像：给缺 file 字段的老条目分配文件名并补建
+  // 回补 md 镜像：给缺 file 字段的老条目分配文件名并补建（内部已并发写，且不会做 list）
   try {
-    if (await kbBackfillMd(env, chatId, arr)) {
-      await storePutChecked(env, ltKey(chatId), JSON.stringify(arr));
-    }
+    if (await kbBackfillMd(env, chatId, arr)) needIndexWrite = true;
   } catch (e) {}
 
-  mapSetBounded(ltCache, chatId, cloneList(arr), LT_CACHE_MAX, ltExp, LT_CACHE_TTL_MS);
+  // 迁移 + 回补只写一次索引
+  if (needIndexWrite && env && env.R2) {
+    if (await storePutChecked(env, ltKey(chatId), JSON.stringify(arr))) ltNoLegacy.delete(chatId);
+  }
+
+  mapSetBounded(ltCache, chatId, cloneList(arr), LT_CACHE_MAX, ltExp, memCacheTtl(env));
   return arr;
+}
+
+export async function ltGet(env, chatId) {
+  const arr = await singleFlight('lt', chatId, () => ltLoad(env, chatId), LT_CACHE_MAX);
+  // 返回副本：调用方（ltSave / ltForget）会就地 push / splice，绝不能污染共享快照
+  return cloneList(arr);
 }
 
 // 只写索引（用于命中计数这类高频小改动，不重写 md 镜像）
 async function ltPutIndex(env, chatId, arr) {
-  mapSetBounded(ltCache, chatId, cloneList(arr), LT_CACHE_MAX, ltExp, LT_CACHE_TTL_MS);
+  mapSetBounded(ltCache, chatId, cloneList(arr), LT_CACHE_MAX, ltExp, memCacheTtl(env));
   if (!env || !env.R2) return false;
   return await storePutChecked(env, ltKey(chatId), JSON.stringify(arr));
 }
@@ -199,7 +227,7 @@ export async function ltSave(env, chatId, fact, opts) {
 
   // 未绑定 R2：只留内存，必须如实告知
   if (!env || !env.R2) {
-    mapSetBounded(ltCache, chatId, cloneList(next), LT_CACHE_MAX, ltExp, LT_CACHE_TTL_MS);
+    mapSetBounded(ltCache, chatId, cloneList(next), LT_CACHE_MAX, ltExp, memCacheTtl(env));
     return '已暂存于内存（R2 未绑定，Worker 重启后会丢失；按 README 第二步绑定 R2 后可永久记住）'
       + replNote + '：' + text;
   }
@@ -209,7 +237,7 @@ export async function ltSave(env, chatId, fact, opts) {
     storePutChecked(env, kbMemDir(chatId) + entry.file, kbMemMarkdown(chatId, text, entry.ts, { kind, weight })),
     storePutChecked(env, ltKey(chatId), JSON.stringify(next))
   ]);
-  mapSetBounded(ltCache, chatId, cloneList(next), LT_CACHE_MAX, ltExp, LT_CACHE_TTL_MS);
+  mapSetBounded(ltCache, chatId, cloneList(next), LT_CACHE_MAX, ltExp, memCacheTtl(env));
 
   if (!okMd || !okIdx) {
     return '记忆写入 R2 失败，已暂存于内存' + replNote + '；请检查 R2 绑定与权限后重试：' + text;
@@ -249,7 +277,7 @@ export async function ltForget(env, chatId, keyword) {
   }
 
   if (!env || !env.R2) {
-    mapSetBounded(ltCache, chatId, cloneList(kept), LT_CACHE_MAX, ltExp, LT_CACHE_TTL_MS);
+    mapSetBounded(ltCache, chatId, cloneList(kept), LT_CACHE_MAX, ltExp, memCacheTtl(env));
     if (files.length) await kbDeleteKeys(env, files);
     return { removed };
   }
@@ -257,7 +285,7 @@ export async function ltForget(env, chatId, keyword) {
   if (!okIdx) {
     return { removed: 0, persistError: '记忆索引写入 R2 失败，未删除任何记忆；请检查 R2 绑定与权限后重试' };
   }
-  mapSetBounded(ltCache, chatId, cloneList(kept), LT_CACHE_MAX, ltExp, LT_CACHE_TTL_MS);
+  mapSetBounded(ltCache, chatId, cloneList(kept), LT_CACHE_MAX, ltExp, memCacheTtl(env));
   if (files.length) await kbDeleteKeys(env, files);
   return { removed };
 }
@@ -279,7 +307,7 @@ export async function ltTouch(env, chatId, facts) {
       changed = true;
     }
   }
-  if (changed) mapSetBounded(ltCache, chatId, cached, LT_CACHE_MAX, ltExp, LT_CACHE_TTL_MS);
+  if (changed) mapSetBounded(ltCache, chatId, cached, LT_CACHE_MAX, ltExp, memCacheTtl(env));
 }
 
 // 按相关性打分（供 memory search 与提示词排序共用）

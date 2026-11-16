@@ -12,18 +12,21 @@
 // 3) 自动过期：7 天没有活动视为会话结束，读出来直接当空处理（R2 里的对象仍在，
 //    由 kb/mem3/ 目录的人工清理或生命周期规则处理，代码不做后台删除，避免额外写操作）。
 
-import { mapSetBounded, mapGetBounded } from '../utils.js';
+import { mapSetBounded, mapGetBounded, singleFlight } from '../utils.js';
 import { storeGet, storePutChecked, storeDelete } from '../store/r2.js';
 import {
-  wmKey, WM_MAX_ITEMS, WM_PIN_MAX, WM_TTL_MS, memLimits,
+  wmKey, WM_MAX_ITEMS, WM_PIN_MAX, WM_TTL_MS, memLimits, memCacheTtl,
   extractTopic, extractGist, jaccard, clipText
 } from './layers.js';
 import { arPush } from './archive.js';
 
 const wmCache = new Map();
 const wmExp = new Map();
-const WM_CACHE_TTL_MS = 60 * 1000;
 const WM_CACHE_MAX = 500;
+// 单飞：同一轮里 loop.js 与工具层并发要同一份 L1 时只读一次 R2
+const wmLoads = new Map();
+// 上次成功落盘的 JSON：内容没变就不再 PUT（/pin 重复、命令无实际改动等场景）
+const wmPersisted = new Map();
 
 function emptyWm(chatId) {
   return { v: 1, chatId: String(chatId == null ? '' : chatId), updatedAt: 0, items: [], pins: [] };
@@ -72,22 +75,37 @@ function cloneWm(w) {
 
 async function wmPut(env, chatId, obj) {
   // 先更新内存缓存：即使 R2 写失败，本 isolate 内的后续轮次也能看到最新脉络
-  mapSetBounded(wmCache, chatId, cloneWm(obj), WM_CACHE_MAX, wmExp, WM_CACHE_TTL_MS);
+  mapSetBounded(wmCache, chatId, cloneWm(obj), WM_CACHE_MAX, wmExp, memCacheTtl(env));
   if (!env || !env.R2) return false;
-  return await storePutChecked(env, wmKey(chatId), JSON.stringify(obj));
+  const json = JSON.stringify(obj);
+  // 内容与上次落盘完全一致 → 省掉一次 PUT（R2 写入是 A 类操作，且是用户可见延迟）
+  if (wmPersisted.get(chatId) === json) return true;
+  const ok = await storePutChecked(env, wmKey(chatId), json);
+  if (ok) {
+    if (wmPersisted.size >= WM_CACHE_MAX) wmPersisted.clear();
+    wmPersisted.set(chatId, json);
+  }
+  return ok;
 }
 
-export async function wmGet(env, chatId) {
+// 真正加载：命中 isolate 缓存直接返回（缓存里存的是快照，调用方各自 clone）
+async function wmLoad(env, chatId) {
   const cached = mapGetBounded(wmCache, chatId, env && env.R2 ? wmExp : null);
-  if (cached) return cloneWm(cached);
+  if (cached) return cached;
   let obj = emptyWm(chatId);
   if (env && env.R2) {
     const raw = await storeGet(env, wmKey(chatId));
     if (raw) {
       try { obj = normalizeWm(JSON.parse(raw), chatId, memLimits(env).l1); } catch (e) { obj = emptyWm(chatId); }
+      wmPersisted.set(chatId, JSON.stringify(obj));
     }
   }
-  mapSetBounded(wmCache, chatId, cloneWm(obj), WM_CACHE_MAX, wmExp, WM_CACHE_TTL_MS);
+  mapSetBounded(wmCache, chatId, cloneWm(obj), WM_CACHE_MAX, wmExp, memCacheTtl(env));
+  return obj;
+}
+
+export async function wmGet(env, chatId) {
+  const obj = await singleFlight('wm', chatId, () => wmLoad(env, chatId), WM_CACHE_MAX);
   return cloneWm(obj);
 }
 
@@ -161,6 +179,7 @@ export async function wmUnpin(env, chatId, keyword) {
 export async function wmClear(env, chatId) {
   wmCache.delete(chatId);
   wmExp.delete(chatId);
+  wmPersisted.delete(chatId);
   if (env && env.R2) {
     try { await storeDelete(env, wmKey(chatId)); } catch (e) {}
   }
