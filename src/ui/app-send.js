@@ -50,20 +50,22 @@ export default `  async function sendMessage() {
     currentAbortController = localAbortController;
     sendBtn.classList.remove('active');
     sendBtn.classList.add('stop-mode');
+    updateSendButton();
     sendBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12" rx="2" ry="2"></rect></svg>';
+
+    let aiContent = '';
+    let reasoningContent = '';
+    const rWrap = bubble.querySelector('.reasoning');
 
     try {
       const reqHeaders = { 'Content-Type': 'application/json' };
       if (accessToken) reqHeaders['X-Access-Token'] = accessToken;
 
-      let aiContent = '';
-      let reasoningContent = '';
       let gotDone = false; // 是否收到 SSE 正常结束标记 data: [DONE]
       const AGENT_IDLE_TIMEOUT_MS = 90000;
       let idleTimedOut = false; // 区分"用户手动中止"与"看门狗中止"
 
       const rBox = bubble.querySelector('.reasoning-box');
-      const rWrap = bubble.querySelector('.reasoning');
       const rTitle = bubble.querySelector('.reasoning-title');
       const tBox = bubble.querySelector('.message-text');
 
@@ -533,9 +535,9 @@ export default `  async function sendMessage() {
       syncRegenButtons();
       
       sendBtn.classList.remove('stop-mode');
-      sendBtn.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>';
+      sendBtn.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5m-6 6 6-6 6 6"></path></svg>';
       
-      if (userInput.value.trim().length > 0) sendBtn.classList.add('active'); 
+      updateSendButton();
       if (isCurrentActiveSession()) userInput.focus();
     }
   }
@@ -548,7 +550,8 @@ export default `  async function sendMessage() {
     }
   });
 
-  userInput.addEventListener('keydown', (e) => { 
+  userInput.addEventListener('keydown', (e) => {
+    if (e.isComposing) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault(); 
       if (sendBtn.classList.contains('active') && !isCurrentlyStreaming) { 

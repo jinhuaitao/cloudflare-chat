@@ -6,14 +6,19 @@ export default `  function renderSessionList() {
     sessions.forEach(session => {
       const item = document.createElement('div');
       item.className = 'session-item ' + (session.id === currentSessionId ? 'active' : '');
-      item.onclick = () => switchSession(session.id);
-      
-      const titleSpan = document.createElement('span'); 
-      titleSpan.className = 'session-title'; 
+      const titleSpan = document.createElement('button');
+      titleSpan.type = 'button';
+      titleSpan.className = 'session-title';
       titleSpan.innerText = session.title;
+      titleSpan.title = session.title;
+      if (session.id === currentSessionId) titleSpan.setAttribute('aria-current', 'true');
+      titleSpan.onclick = () => switchSession(session.id);
       
       const delBtn = document.createElement('button'); 
-      delBtn.className = 'delete-btn'; 
+      delBtn.className = 'delete-btn';
+      delBtn.type = 'button';
+      delBtn.title = '删除对话：' + session.title;
+      delBtn.setAttribute('aria-label', delBtn.title);
       delBtn.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4h4v2"></path></svg>';
       delBtn.onclick = (e) => deleteSession(e, session.id);
       

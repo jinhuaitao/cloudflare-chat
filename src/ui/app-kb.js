@@ -45,10 +45,10 @@ export default `  // ===== 知识库只读面板（📚） =====
 
   function kbRenderRow(doc, idx) {
     const row = document.createElement('div');
-    row.style.cssText = 'padding:9px 0;border-bottom:1px dashed var(--border);';
+    row.className = 'kb-doc';
 
     const title = document.createElement('div');
-    title.style.cssText = 'font-weight:600;word-break:break-all;';
+    title.className = 'kb-doc-title';
     title.textContent = (idx + 1) + '. ' + doc.title;
     row.appendChild(title);
 
@@ -57,13 +57,13 @@ export default `  // ===== 知识库只读面板（📚） =====
     if (day) bits.push(day);
     if (doc.chars) bits.push(doc.chars + ' 字符');
     const meta = document.createElement('div');
-    meta.style.cssText = 'font-size:11.5px;color:var(--muted);margin-top:2px;';
+    meta.className = 'kb-doc-meta';
     meta.textContent = bits.join(' · ');
     row.appendChild(meta);
 
     if (doc.tags && doc.tags.length) {
       const tag = document.createElement('div');
-      tag.style.cssText = 'font-size:11.5px;color:var(--brand-color);margin-top:2px;';
+      tag.className = 'kb-doc-tags';
       tag.textContent = '🏷 ' + doc.tags.join('、');
       row.appendChild(tag);
     }
@@ -92,7 +92,7 @@ export default `  // ===== 知识库只读面板（📚） =====
       }
       kbListBox.innerHTML = '';
       const head = document.createElement('div');
-      head.style.cssText = 'font-weight:600;margin-bottom:4px;';
+      head.className = 'kb-list-heading';
       head.textContent = '共 ' + data.count + ' 篇'
         + (data.docs.length < data.count ? '（按更新时间显示最近 ' + data.docs.length + ' 篇）' : '');
       kbListBox.appendChild(head);
@@ -109,14 +109,15 @@ export default `  // ===== 知识库只读面板（📚） =====
   function kbOpenModal() {
     if (!kbModal) return;
     kbModal.style.display = 'flex';
-    setTimeout(function () { kbModal.classList.add('active'); }, 10);
+    manageModalFocus(kbModal, kbCloseModal);
     kbLoadList();
   }
 
   function kbCloseModal() {
     if (!kbModal) return;
     kbModal.classList.remove('active');
-    setTimeout(function () { kbModal.style.display = 'none'; }, 300);
+    manageModalFocus(kbModal);
+    setTimeout(function () { if (!kbModal.classList.contains('active')) kbModal.style.display = 'none'; }, 300);
   }
 
   if (kbModalToggle) kbModalToggle.addEventListener('click', kbOpenModal);

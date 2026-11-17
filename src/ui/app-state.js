@@ -50,7 +50,7 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
   
   const themeToggle = document.getElementById('themeToggle');
   const themeIcon = document.getElementById('themeIcon');
-  let currentTheme = localStorage.getItem('theme') || 'light';
+  let currentTheme = localStorage.getItem('theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
   applyTheme(currentTheme);
 
   themeToggle.addEventListener('click', () => {
@@ -72,10 +72,19 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
     setTimeout(function () { document.body.classList.remove('theme-anim'); }, 400);
   }
 
+  function updateSendButton() {
+    const canSend = userInput.value.trim().length > 0;
+    sendBtn.classList.toggle('active', canSend && !isCurrentlyStreaming);
+    sendBtn.setAttribute('aria-disabled', String(!canSend && !isCurrentlyStreaming));
+    const label = isCurrentlyStreaming ? '停止生成' : '发送消息';
+    sendBtn.setAttribute('aria-label', label);
+    sendBtn.title = label;
+  }
+
   userInput.addEventListener('input', function() {
     this.style.height = 'auto';
-    this.style.height = Math.min(this.scrollHeight, 200) + 'px';
-    sendBtn.classList.toggle('active', this.value.trim().length > 0);
+    this.style.height = Math.min(this.scrollHeight, 190) + 'px';
+    updateSendButton();
   });
 
   function init() {
@@ -97,8 +106,21 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
     } catch (e) {}
   }
 
-  menuToggle.addEventListener('click', () => { sidebar.classList.toggle('open'); sidebarOverlay.classList.toggle('active'); });
-  sidebarOverlay.addEventListener('click', () => { sidebar.classList.remove('open'); sidebarOverlay.classList.remove('active'); });
+  function setSidebarOpen(open) {
+    sidebar.classList.toggle('open', open);
+    sidebarOverlay.classList.toggle('active', open);
+    menuToggle.setAttribute('aria-expanded', String(open));
+    menuToggle.setAttribute('aria-label', open ? '收起历史对话' : '打开历史对话');
+  }
+  menuToggle.addEventListener('click', () => setSidebarOpen(!sidebar.classList.contains('open')));
+  sidebarOverlay.addEventListener('click', () => setSidebarOpen(false));
+  window.matchMedia('(max-width: 768px)').addEventListener('change', () => setSidebarOpen(false));
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && sidebar.classList.contains('open') && !document.querySelector('.settings-modal-overlay.active, .modal-mask')) {
+      setSidebarOpen(false);
+      menuToggle.focus();
+    }
+  });
 
   // ===== v6.9.0 交互增强 =====
   // 智能滚动：记录用户是否停在底部附近。向上翻历史时流式输出不再拽走滚动位置，
@@ -149,7 +171,7 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
     saveSessions();
     switchSession(newId);
     renderSessionList();
-    if(window.innerWidth <= 768) sidebar.classList.remove('open');
+    if(window.innerWidth <= 768) setSidebarOpen(false);
   }
 
   function switchSession(id) {
@@ -188,7 +210,7 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
     updateHeaderDisplay();
     renderMessages();
     renderSessionList();
-    if(window.innerWidth <= 768) { sidebar.classList.remove('open'); sidebarOverlay.classList.remove('active'); userInput.blur(); }
+    if(window.innerWidth <= 768) { setSidebarOpen(false); userInput.blur(); }
   }
 
   function onModelChange() {
@@ -208,7 +230,8 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
   function renderAgentToggle() {
     if (!agentToggle) return;
     agentToggle.classList.toggle('active', agentMode);
-    agentToggle.textContent = agentMode ? '🤖 Agent 开' : '🤖 Agent';
+    agentToggle.textContent = agentMode ? 'Agent 开启' : 'Agent 关闭';
+    agentToggle.setAttribute('aria-pressed', String(agentMode));
     agentToggle.title = agentMode
       ? 'Agent 模式已开启：自主规划并调用工具（🔍 搜索 / 📄 网页 / 🧮 计算 / 🌤 天气 / 🕐 时间），回答优先查知识库文档；知识库在本端只读，保存文档/记住信息请通过 Telegram 机器人。点击关闭。'
       : 'Agent 模式已关闭：普通对话，不调用工具。点击开启。';

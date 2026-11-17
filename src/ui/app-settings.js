@@ -18,7 +18,7 @@ export default `  const settingsModal = document.getElementById('settingsModal')
 
   function openSettings() {
     settingsModal.style.display = 'flex';
-    setTimeout(() => settingsModal.classList.add('active'), 10);
+    manageModalFocus(settingsModal, () => closeSettingsBtn.click());
   }
 
   settingsToggle.addEventListener('click', openSettings);
@@ -33,7 +33,8 @@ export default `  const settingsModal = document.getElementById('settingsModal')
       if (accessToken) localStorage.setItem(ACCESS_TOKEN_KEY, accessToken);
       else localStorage.removeItem(ACCESS_TOKEN_KEY);
     }
-    setTimeout(() => settingsModal.style.display = 'none', 300);
+    manageModalFocus(settingsModal);
+    setTimeout(() => { if (!settingsModal.classList.contains('active')) settingsModal.style.display = 'none'; }, 300);
   });
 
   settingsModal.addEventListener('click', (e) => {
@@ -101,6 +102,7 @@ export default `  const settingsModal = document.getElementById('settingsModal')
         wxAuthErrorBox.textContent = '';
       }
     }
+    if (modalFocusStates.has(wxModal)) manageModalFocus(wxModal, closeWxModal);
   }
 
   function showWxMainPanel() {
@@ -111,6 +113,7 @@ export default `  const settingsModal = document.getElementById('settingsModal')
       wxAuthErrorBox.style.display = 'none';
       wxAuthErrorBox.textContent = '';
     }
+    if (modalFocusStates.has(wxModal)) manageModalFocus(wxModal, closeWxModal);
   }
 
   function getEffectiveWxSecret() {
@@ -282,7 +285,7 @@ export default `  const settingsModal = document.getElementById('settingsModal')
     const candidate = (wxAdminTokenInput && wxAdminTokenInput.value.trim()) || '';
     if (!candidate) {
       showWxAuthGate('⚠️ 请先输入管理员密码（WX_ADMIN_SECRET 或 ACCESS_PASSWORD）');
-      if (wxAdminTokenInput) wxAdminTokenInput.focus();
+      if (wxAdminTokenInput && getTopModalFocus()?.modal === wxModal) wxAdminTokenInput.focus();
       return;
     }
     const origText = wxVerifyAdminBtn ? wxVerifyAdminBtn.textContent : '';
@@ -295,7 +298,7 @@ export default `  const settingsModal = document.getElementById('settingsModal')
       const data = await res.json();
       if (!data || !data.adminAuthorized) {
         showWxAuthGate('❌ 密码验证失败：' + ((data && data.authReason) || '密码不正确，请核对后重试'));
-        if (wxAdminTokenInput) wxAdminTokenInput.focus();
+        if (wxAdminTokenInput && getTopModalFocus()?.modal === wxModal) wxAdminTokenInput.focus();
         return;
       }
       // 验证成功：保存密钥并切换到微信绑定与管理页面
@@ -330,7 +333,7 @@ export default `  const settingsModal = document.getElementById('settingsModal')
       try { localStorage.removeItem(WX_ADMIN_TOKEN_KEY); } catch (e) {}
       if (wxAdminTokenInput) wxAdminTokenInput.value = '';
       showWxAuthGate('');
-      if (wxAdminTokenInput) wxAdminTokenInput.focus();
+      if (wxAdminTokenInput && getTopModalFocus()?.modal === wxModal) wxAdminTokenInput.focus();
     });
   }
 
@@ -570,24 +573,24 @@ export default `  const settingsModal = document.getElementById('settingsModal')
     stopWxQrPolling();
     if (!wxModal) return;
     wxModal.classList.remove('active');
-    setTimeout(() => wxModal.style.display = 'none', 300);
+    manageModalFocus(wxModal);
+    setTimeout(() => { if (!wxModal.classList.contains('active')) wxModal.style.display = 'none'; }, 300);
   }
 
   if (wxModalToggle && wxModal) {
     wxModalToggle.addEventListener('click', () => {
       wxModal.style.display = 'flex';
-      setTimeout(() => wxModal.classList.add('active'), 10);
       // 严格遵循「先验证密码，再出现微信绑定页面」：未在当前会话解锁时，一律先展示密码验证门禁页
       if (!wxSessionUnlocked) {
         if (wxAdminTokenInput && !wxAdminTokenInput.value && wxAdminToken) {
           wxAdminTokenInput.value = wxAdminToken;
         }
         showWxAuthGate('');
-        setTimeout(() => { if (wxAdminTokenInput) wxAdminTokenInput.focus(); }, 60);
       } else {
         showWxMainPanel();
         refreshWxStatus(false);
       }
+      manageModalFocus(wxModal, closeWxModal);
     });
   }
   if (closeWxModalBtn) closeWxModalBtn.addEventListener('click', closeWxModal);
