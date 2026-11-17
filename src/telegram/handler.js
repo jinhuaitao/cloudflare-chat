@@ -9,7 +9,7 @@ import { storeGet, storePut, storePutChecked } from '../store/r2.js';
 import { getChannelConfig, buildAIRequest } from '../channel.js';
 import { tgTrimHistory, tgGetHistory, tgSaveHistory, tgClearHistory } from '../tg-history.js';
 import { agentForgetMemory } from '../agent/memory.js';
-import { memoryReport, memoryClearSession, memoryStats } from '../memory/index.js';
+import { memoryReport, memoryClearSession, memoryStats, memoryLoad } from '../memory/index.js';
 import { agentGetMode, agentSetMode, agentGetPersona, agentSetPersona } from '../agent/mode.js';
 import {
   PERSONA_COUNT, formatPersonaList, formatPersonaBadge, formatRouteWhy, getPersona, personaById,
@@ -21,6 +21,7 @@ import { agentLoadResumeState, agentClearResumeState, tgAgentResumeKey } from '.
 import { tgAgentChat, tgAgentResume } from '../agent/loop.js';
 import { readErrorBody } from '../agent/stability.js';
 import { toolListDocs, toolSaveDoc, toolReadDoc, toolDeleteDoc } from '../kb/doc-tools.js';
+import { kbGetRegistry } from '../kb/registry.js';
 import { autoOrganizeAndSaveKbDoc, deriveFileDocTitle } from '../kb/organize.js';
 import {
   DEFAULT_ILINK_BASE_URL,
@@ -835,6 +836,18 @@ export async function handleTgWebhook(request, env, ctx) {
             mapSetBounded(tgUserModels, chatId, targetModelId, undefined, tgUserModelsExp);
           }
 
+          // 预取 Agent 分支要用的三份状态（三层记忆 / 知识库索引 / 人格）。
+          // 从这里到真正进 tgAgentChat 之间还有「断点读取 + sendChatAction + 占位消息」
+          // 两条 Telegram 网络往返，足够把这三读跑完；等进到 loop 里再读就是白等一个 RTT。
+          // 非 Agent 模式不预取 —— 否则那三次读就纯属浪费。
+          const agentPrefetch = useAgent
+            ? {
+                memory: memoryLoad(env, chatId, userText, {}).catch(() => null),
+                kbDocs: kbGetRegistry(env).catch(() => null),
+                persona: agentGetPersona(env, chatId).catch(() => 'auto'),
+              }
+            : null;
+
           const wantResume = useAgent && !multimodalContent && userText.trim() === '继续';
           let resumeState = null;
           if (wantResume) resumeState = await agentLoadResumeState(env, chatId);
@@ -873,7 +886,7 @@ export async function handleTgWebhook(request, env, ctx) {
           let webhookBudgetMs = parseInt(env.TG_WEBHOOK_BUDGET_MS || '55000', 10);
           if (!(webhookBudgetMs >= 10000)) webhookBudgetMs = 55000;
           if (webhookBudgetMs > 240000) webhookBudgetMs = 240000;
-          const agentOpts = { maxRuntimeMs: webhookBudgetMs, resumeKey: tgAgentResumeKey(chatId), origUserText: historyUserText, ctx: ctx || null };
+          const agentOpts = { maxRuntimeMs: webhookBudgetMs, resumeKey: tgAgentResumeKey(chatId), origUserText: historyUserText, ctx: ctx || null, prefetch: agentPrefetch };
 
           if (useAgent) {
             let lastProgressEdit = 0;

@@ -73,28 +73,33 @@ function kbFmtTags(tags) {
   return list.length ? '｜标签：' + list.join('、') : '';
 }
 // 列出 kb/docs/ 下全部文档对象（分页取全量；自动排除 registry.json）
+// 返回 null 表示「列不出来」，与「目录确实是空的」严格区分：
+// 旧版 catch 后返回 []，于是 list 一抖动就会被当成"库里没有文档"，
+// 重建出一个空注册表并写回 R2 —— 用户看到的就是「文档全都不见了」。
 async function kbListDocObjects(env) {
   const objs = [];
   if (!env.R2) return objs;
-  try {
-    let cursor;
-    do {
-      const listed = await storeList(env, { prefix: KB_DOCS_PREFIX, limit: 1000, cursor: cursor });
-      for (const o of (listed.objects || [])) {
-        if (o.key !== KB_REGISTRY_KEY) objs.push(o);
-      }
-      cursor = listed.truncated ? listed.cursor : undefined;
-    } while (cursor);
-  } catch (e) {}
+  let cursor;
+  do {
+    const listed = await storeList(env, { prefix: KB_DOCS_PREFIX, limit: 1000, cursor: cursor });
+    if (listed && listed.failed) return null;
+    for (const o of (listed.objects || [])) {
+      if (o.key !== KB_REGISTRY_KEY) objs.push(o);
+    }
+    cursor = listed.truncated ? listed.cursor : undefined;
+  } while (cursor);
   return objs;
 }
 // 从现有文件重建注册表（读每篇前 4096 字节的 frontmatter），并写回。
 // v7.7.0：并发读取（上限 8），文档多时重建耗时从 N × RTT 降到约 N/8 × RTT。
 // v7.11.1：支持传入已列好的对象列表，避免校验时重复 list（Class A 操作）；
 //          并从 frontmatter 还原 fp / version，让重建后的索引仍能去重与显示版本。
-async function kbRebuildRegistry(env, objs) {
+// v7.21.0：opts.save=false 时只算不写——保存路径本来就要写注册表，
+//          让它多写一次等于白付一个 RTT；列不出来时返回 null 且不写（见 kbListDocObjects）。
+async function kbRebuildRegistry(env, objs, opts) {
   if (!env.R2) return [];
   const list = Array.isArray(objs) ? objs : await kbListDocObjects(env);
+  if (!list) return null;
   const reg = await mapLimit(list, 8, async (o) => {
     let fm = {};
     try {
@@ -118,7 +123,15 @@ async function kbRebuildRegistry(env, objs) {
     if (ver > 0) entry.version = ver;
     return entry;
   });
-  await kbSaveRegistry(env, reg);
+  if (!opts || opts.save !== false) {
+    await kbSaveRegistry(env, reg);
+  } else {
+    // 没写盘：缓存可以用（内容就是当前真相），但 etag 未知，条件写会退化为普通写
+    cachedRegistry = reg.slice();
+    cachedRegistryBucket = env.R2;
+    cachedRegistryExp = Date.now() + KB_REG_CACHE_TTL_MS;
+    cachedRegistryEtag = '';
+  }
   return reg.slice();
 }
 
@@ -175,7 +188,7 @@ async function kbGetRegistryEx(env, opts) {
   const now = Date.now();
   if (!o.fresh && cachedRegistry && cachedRegistryBucket === env.R2 && now < cachedRegistryExp) {
     const hit = cachedRegistry.slice();
-    if (o.verify || !hit.length) {
+    if (o.verify) {
       const r = await kbVerifyRegistry(env, hit);
       return { reg: r.reg, etag: cachedRegistryEtag };
     }
@@ -195,7 +208,11 @@ async function kbGetRegistryEx(env, opts) {
         cachedRegistryBucket = env.R2;
         cachedRegistryExp = Date.now() + KB_REG_CACHE_TTL_MS;
         cachedRegistryEtag = obj.etag || '';
-        if (o.verify || !p.length) {
+        // 只有调用方明确要求核对时才 list。
+        // 旧版对「注册表为空」也无条件核对：知识库还没建的空库，每 30 秒就要为
+        // 一次 list（A 类操作）付一个 RTT，而这恰好落在每轮对话的关键路径上。
+        // 现在空注册表是可信的——重建路径不会再因 list 失败而写入空索引（见 kbListDocObjects）。
+        if (o.verify) {
           const r = await kbVerifyRegistry(env, p.slice());
           return { reg: r.reg, etag: cachedRegistryEtag };
         }
@@ -204,7 +221,13 @@ async function kbGetRegistryEx(env, opts) {
     }
   } catch (e) {}
   // 缺失或损坏 → 自动重建（自愈）
-  const rebuilt = await kbRebuildRegistry(env);
+  const rebuilt = await kbRebuildRegistry(env, null, { save: o.deferHealWrite !== true });
+  if (!rebuilt) {
+    // 列不出来：保留缓存，宁可让本次读到旧索引，也不能把索引清空
+    // （缓存必须属于同一个桶，否则会读到别的环境/别的测试的索引）
+    const usable = cachedRegistry && cachedRegistryBucket === env.R2 ? cachedRegistry.slice() : [];
+    return { reg: usable, etag: usable.length ? cachedRegistryEtag : '' };
+  }
   return { reg: rebuilt, etag: cachedRegistryEtag };
 }
 

@@ -15,7 +15,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { storeGet, storePutCas, storePutChecked, r2Snapshot, r2ResetStats } from '../src/store/r2.js';
-import { kbGetRegistryEx, kbSaveRegistry, kbMutateRegistry } from '../src/kb/registry.js';
+import { kbGetRegistry, kbGetRegistryEx, kbSaveRegistry, kbMutateRegistry } from '../src/kb/registry.js';
 import { toolSaveDoc } from '../src/kb/doc-tools.js';
 import { memoryLoad } from '../src/memory/index.js';
 
@@ -23,10 +23,16 @@ import { memoryLoad } from '../src/memory/index.js';
 function makeR2(initial = {}) {
   const data = new Map();
   const etags = new Map();
-  const stats = { get: 0, put: 0, list: 0, del: 0, casFail: 0 };
+  const stats = { get: 0, put: 0, list: 0, del: 0, casFail: 0, concurrent: 0, maxConcurrent: 0 };
   let seq = 0;
   const bytes = (s) => new TextEncoder().encode(String(s)).byteLength;
   const bump = (key) => { seq += 1; etags.set(key, 'e' + seq); return etags.get(key); };
+  // 记录"同时在飞的 GET 数"：用来断言两次读取是并发的（并发度 ≥2）还是串行的
+  const track = async (fn) => {
+    stats.concurrent += 1;
+    if (stats.concurrent > stats.maxConcurrent) stats.maxConcurrent = stats.concurrent;
+    try { return await fn(); } finally { stats.concurrent -= 1; }
+  };
   for (const [k, v] of Object.entries(initial)) { data.set(k, String(v)); bump(k); }
   return {
     stats,
@@ -34,12 +40,14 @@ function makeR2(initial = {}) {
     etags,
     async get(key, opts) {
       stats.get += 1;
-      await new Promise(r => setTimeout(r, 1));
-      if (!data.has(key)) return null;
-      const etag = etags.get(key);
-      if (opts && opts.onlyIf && opts.onlyIf.etagMatches && opts.onlyIf.etagMatches !== etag) return null;
-      const text = String(data.get(key));
-      return { key, size: bytes(text), etag, text: async () => text };
+      return await track(async () => {
+        await new Promise(r => setTimeout(r, 1));
+        if (!data.has(key)) return null;
+        const etag = etags.get(key);
+        if (opts && opts.onlyIf && opts.onlyIf.etagMatches && opts.onlyIf.etagMatches !== etag) return null;
+        const text = String(data.get(key));
+        return { key, size: bytes(text), etag, text: async () => text };
+      });
     },
     async put(key, value, opts) {
       stats.put += 1;
@@ -194,4 +202,98 @@ test('写入失败会重试并如实返回 false', async () => {
   const ok = await storePutChecked({ R2: r2 }, 'retry/put', 'v');
   assert.equal(ok, true, '一次瞬时失败后应重试成功');
   assert.equal(r2.data.get('retry/put'), 'v');
+});
+
+test('旧键探测并发执行：新会话冷加载只吃一个往返，不再串行三次', async () => {
+  const r2 = makeR2();
+  const env = { R2: r2 };
+  const chatId = 'perf-legacy-' + Math.random().toString(36).slice(2, 8);
+  await memoryLoad(env, chatId, '你好');
+  assert.equal(r2.stats.get >= 3, true, '三个键都应被探测');
+  assert.equal(r2.stats.maxConcurrent >= 2, true,
+    '旧键探测必须并发（实测最大并发 ' + r2.stats.maxConcurrent + '）——串行会多付 2 个 RTT');
+
+  // 探测过全空后应记住：同一 isolate 的后续冷加载不再探旧键
+  const { ltGet } = await import('../src/memory/longterm.js');
+  const before = r2.stats.get;
+  await ltGet(env, chatId);
+  assert.equal(r2.stats.get - before, 0, '同 chatId 二次加载不应再回源');
+});
+
+test('list 失败时不把空注册表写回 R2（避免"文档全没了"）', async () => {
+  const r2 = makeR2({ 'kb/docs/甲.md': '---\ntitle: "甲"\n---\n\n正文' });
+  const env = { R2: r2 };
+  // 非瞬时错误：storeList 立即放弃，kbListDocObjects 返回 null
+  r2.list = async () => { throw new Error('list unavailable'); };
+  const reg = await kbGetRegistry(env);
+  assert.deepEqual(reg, [], '列不出来时本次只能返回空');
+  assert.equal(r2.data.has('kb/docs/registry.json'), false,
+    '绝不能在 list 失败后写入空索引——那会把"暂时读不到"变成"永久丢了"');
+  assert.equal(r2.stats.put, 0, '失败路径不应产生任何写入');
+});
+
+test('空注册表不再每次读取都 list 目录', async () => {
+  const r2 = makeR2();
+  const env = { R2: r2 };
+  await kbSaveRegistry(env, []);
+  const before = r2.stats.list;
+  const a = await kbGetRegistry(env, { fresh: true });
+  const b = await kbGetRegistry(env, { fresh: true });
+  assert.deepEqual(a, []);
+  assert.deepEqual(b, []);
+  assert.equal(r2.stats.list, before,
+    '空索引是可信的，不该每轮为它付一次 list（新增 ' + (r2.stats.list - before) + ' 次）');
+});
+
+test('首次保存：索引自愈的重建不额外写一次注册表', async () => {
+  const r2 = makeR2();
+  const env = { R2: r2 };
+  const out = await toolSaveDoc(env, 'perf', { title: '首篇', content: '正文' });
+  assert.ok(out.startsWith('已保存为知识库文档'), out);
+  assert.equal(r2.stats.list, 1, '空桶需要一次 list 确认目录状态');
+  assert.equal(r2.stats.put, 2, '只该有正文 + 注册表两次写（实际 ' + r2.stats.put + ' 次）');
+  assert.equal(JSON.parse(r2.data.get('kb/docs/registry.json')).length, 1);
+});
+
+test('Agent 状态预取已接到两端 handler 与 loop', async () => {
+  const fs = await import('node:fs');
+  const tg = fs.readFileSync(new URL('../src/telegram/handler.js', import.meta.url), 'utf8');
+  const wx = fs.readFileSync(new URL('../src/wechat/handler.js', import.meta.url), 'utf8');
+  const loop = fs.readFileSync(new URL('../src/agent/loop.js', import.meta.url), 'utf8');
+  for (const [name, src] of [['telegram', tg], ['wechat', wx]]) {
+    assert.ok(/const agentPrefetch = useAgent/.test(src), name + '：未在确定走 Agent 后预取');
+    assert.ok(src.includes('memory: memoryLoad('), name + '：预取里没有三层记忆');
+    assert.ok(src.includes('kbDocs: kbGetRegistry('), name + '：预取里没有知识库索引');
+    assert.ok(src.includes('persona: agentGetPersona('), name + '：预取里没有人格');
+    assert.ok(src.includes('prefetch: agentPrefetch'), name + '：预取结果没传给 agentOpts');
+  }
+  assert.ok(loop.includes('opts.prefetch') || loop.includes('opts && opts.prefetch'),
+    'loop 未消费 prefetch');
+  assert.ok(loop.includes('pre.memory') && loop.includes('pre.kbDocs') && loop.includes('pre.persona'),
+    'loop 应优先使用预取结果');
+});
+
+test('Agent 状态预取：命中预取时不再重复回源', async () => {
+  const { tgAgentChat } = await import('../src/agent/loop.js');
+  const r2 = makeR2();
+  const env = { R2: r2 };
+  const chatId = 'perf-prefetch-' + Math.random().toString(36).slice(2, 8);
+  const { memoryLoad } = await import('../src/memory/index.js');
+  const { kbGetRegistry } = await import('../src/kb/registry.js');
+  const { agentGetPersona } = await import('../src/agent/mode.js');
+  // 预取：三读提前发出
+  const prefetch = {
+    memory: memoryLoad(env, chatId, '你好', {}),
+    kbDocs: kbGetRegistry(env),
+    persona: agentGetPersona(env, chatId),
+  };
+  await Promise.all([prefetch.memory, prefetch.kbDocs, prefetch.persona]);
+  const before = r2.stats.get;
+
+  // 上游是假的：第一次调用就返回错误，不会真的联网；我们只关心它之前读了几次 R2
+  const fakeApi = async () => { throw new Error('no network'); };
+  await tgAgentChat(env, fakeApi, chatId, 'm', [{ role: 'user', content: '你好' }], false,
+    null, { prefetch, r2BudgetMs: 1000 }).catch(() => {});
+  assert.equal(r2.stats.get, before,
+    '预取已就绪时 tgAgentChat 不应再打 R2（新增 ' + (r2.stats.get - before) + ' 次）');
 });

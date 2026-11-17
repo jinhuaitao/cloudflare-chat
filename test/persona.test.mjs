@@ -657,15 +657,22 @@ test('拿到 ctx 时记忆写入挂 waitUntil，不在返回前串行等待', as
 
 test('路由打分性能护栏：预编译词表 + 单次小写，1000 次路由应远在 300ms 内', () => {
   const q = '帮我用 Python 写一个脚本读取 CSV 文件并画出折线图，服务器上跑 '.repeat(3);
+  // 护栏取多轮最小值：测试是并行跑的，CPU 被其它用例抢占时单轮会出现尖峰，
+  // 那不代表代码退化。护栏要看的是"最好能有多快"，所以取最小值而不是平均值。
+  const bestOf = (rounds, fn) => {
+    let best = Infinity;
+    for (let r = 0; r < rounds; r++) {
+      const t = performance.now();
+      fn();
+      best = Math.min(best, performance.now() - t);
+    }
+    return best;
+  };
   routePersona(q); // 预热
-  const t0 = performance.now();
-  for (let i = 0; i < 1000; i++) routePersona(q);
-  const ms = performance.now() - t0;
+  const ms = bestOf(3, () => { for (let i = 0; i < 1000; i++) routePersona(q); });
   assert.ok(ms < 300, '1000 次路由耗时 ' + ms.toFixed(0) + 'ms，超出性能护栏（预编译词表可能失效）');
   // explainRoute 与 routePersona 共享打分，不应再出现 2 倍开销
-  const t1 = performance.now();
-  for (let i = 0; i < 1000; i++) explainRoute(q);
-  const ms2 = performance.now() - t1;
+  const ms2 = bestOf(3, () => { for (let i = 0; i < 1000; i++) explainRoute(q); });
   assert.ok(ms2 < 600, '1000 次 explainRoute 耗时 ' + ms2.toFixed(0) + 'ms，超出性能护栏（疑似重复打分）');
 });
 

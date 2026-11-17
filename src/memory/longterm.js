@@ -32,6 +32,12 @@ const ltLoads = new Map();
 const ltNoLegacy = new Set();
 const LT_NO_LEGACY_MAX = 500;
 
+// 记「这个会话不需要再探旧键」：读到了新键、迁移写完新键、或确认全空都算。
+function rememberNoLegacy(chatId) {
+  if (ltNoLegacy.size >= LT_NO_LEGACY_MAX) ltNoLegacy.clear();
+  ltNoLegacy.add(chatId);
+}
+
 function normalizeEntry(m) {
   if (!(m && typeof m.fact === 'string' && m.fact)) return null;
   const fact = clipText(m.fact.trim(), 200);
@@ -71,22 +77,33 @@ async function ltLoad(env, chatId) {
   let migratedFrom = '';
 
   if (env && env.R2) {
-    raw = await storeGet(env, ltKey(chatId));
-    if (!raw && !ltNoLegacy.has(chatId)) {
-      const legacy = await storeGet(env, agentMemKey(chatId));
-      if (legacy) {
+    if (ltNoLegacy.has(chatId)) {
+      raw = await storeGet(env, ltKey(chatId));
+      // 新键被外部清掉（/forget 全部、手动删对象）时允许下次重新探测旧键
+      if (!raw) ltNoLegacy.delete(chatId);
+    } else {
+      // 新键 + 两个旧键一次性并发探测。
+      // 旧版是「新键 → kb 旧键 → 根目录旧键」串行回退：三个键都不存在时（新会话的常态）
+      // 要连吃 3 个 RTT，这是冷启动里最贵的一段。并发后压到 1 个 RTT，
+      // 代价是最坏多读 2 个空对象（Class B 操作，成本可忽略）——RTT 才是真正贵的东西。
+      // 优先级不变：新键 > kb/agent_mem_ > 根目录 agent_mem_。
+      const [cur, legacy, oldest] = await Promise.all([
+        storeGet(env, ltKey(chatId)),
+        storeGet(env, agentMemKey(chatId)),
+        storeGet(env, agentMemKeyLegacy(chatId))
+      ]);
+      if (cur) {
+        raw = cur;
+        rememberNoLegacy(chatId);
+      } else if (legacy) {
         raw = legacy;
         migratedFrom = 'kb';
+      } else if (oldest) {
+        raw = oldest;
+        migratedFrom = 'root';
       } else {
-        const oldest = await storeGet(env, agentMemKeyLegacy(chatId));
-        if (oldest) {
-          raw = oldest;
-          migratedFrom = 'root';
-        }
-      }
-      if (!raw) {
-        if (ltNoLegacy.size >= LT_NO_LEGACY_MAX) ltNoLegacy.clear();
-        ltNoLegacy.add(chatId);
+        // 确认这个会话没有任何历史数据，之后冷加载只读新键
+        rememberNoLegacy(chatId);
       }
     }
   }
@@ -138,9 +155,9 @@ async function ltLoad(env, chatId) {
     if (await kbBackfillMd(env, chatId, arr)) needIndexWrite = true;
   } catch (e) {}
 
-  // 迁移 + 回补只写一次索引
+  // 迁移 + 回补只写一次索引；写成功后新键已存在，之后不必再探旧键
   if (needIndexWrite && env && env.R2) {
-    if (await storePutChecked(env, ltKey(chatId), JSON.stringify(arr))) ltNoLegacy.delete(chatId);
+    if (await storePutChecked(env, ltKey(chatId), JSON.stringify(arr))) rememberNoLegacy(chatId);
   }
 
   mapSetBounded(ltCache, chatId, cloneList(arr), LT_CACHE_MAX, ltExp, memCacheTtl(env));
@@ -157,7 +174,9 @@ export async function ltGet(env, chatId) {
 async function ltPutIndex(env, chatId, arr) {
   mapSetBounded(ltCache, chatId, cloneList(arr), LT_CACHE_MAX, ltExp, memCacheTtl(env));
   if (!env || !env.R2) return false;
-  return await storePutChecked(env, ltKey(chatId), JSON.stringify(arr));
+  const ok = await storePutChecked(env, ltKey(chatId), JSON.stringify(arr));
+  if (ok) rememberNoLegacy(chatId);
+  return ok;
 }
 
 // 超容量时按衰减分淘汰，返回 { kept, dropped }
