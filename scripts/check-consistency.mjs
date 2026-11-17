@@ -107,7 +107,11 @@ function checkTestCount() {
     );
     const m = (r.stdout || '').match(/^# tests (\d+)$/m);
     const actual = m ? m[1] : null;
-    if (r.status !== 0) return fail('测试套件未全部通过（先修失败用例，再核对用例数）');
+    if (r.status !== 0) {
+      for (const block of (r.stdout || '').match(/^not ok [\s\S]*?^\s+\.\.\.$/gm) || []) console.error(block);
+      if (r.stderr) console.error(r.stderr.trim());
+      return fail('测试套件未全部通过（先修失败用例，再核对用例数）');
+    }
     if (!actual) return fail('没从 tap 输出解析到用例总数（报告器格式变了？）');
     if (claimed !== actual) {
       fail(`README 宣称 ${claimed} 个用例，实测 ${actual} 个 —— 请更新 README`);

@@ -14,7 +14,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { storeGet, storePutCas, storePutChecked, r2Snapshot, r2ResetStats } from '../src/store/r2.js';
+import { storeGet, storeGetMeta, storePutCas, storePutChecked, storeList, r2Snapshot, r2ResetStats } from '../src/store/r2.js';
 import { kbGetRegistryEx, kbSaveRegistry, kbMutateRegistry } from '../src/kb/registry.js';
 import { toolSaveDoc } from '../src/kb/doc-tools.js';
 import { memoryLoad } from '../src/memory/index.js';
@@ -44,7 +44,8 @@ function makeR2(initial = {}) {
     async put(key, value, opts) {
       stats.put += 1;
       await new Promise(r => setTimeout(r, 1));
-      if (opts && opts.onlyIf && opts.onlyIf.etagMatches && etags.get(key) !== opts.onlyIf.etagMatches) {
+      if (opts && opts.onlyIf && ((opts.onlyIf.etagMatches && etags.get(key) !== opts.onlyIf.etagMatches)
+        || (opts.onlyIf.etagDoesNotMatch === '*' && data.has(key)))) {
         stats.casFail += 1;
         return null;
       }
@@ -69,6 +70,92 @@ function makeR2(initial = {}) {
     },
   };
 }
+
+test('单飞按桶隔离：相同 key 不共享不同桶的数据', async () => {
+  const a = { R2: makeR2({ same: '甲' }) };
+  const b = { R2: makeR2({ same: '乙' }) };
+  const values = await Promise.all([storeGet(a, 'same'), storeGet(b, 'same')]);
+  assert.deepEqual(values, ['甲', '乙']);
+});
+
+test('正文与元数据并发读取共享一次 GET', async () => {
+  const env = { R2: makeR2({ meta: '正文' }) };
+  const [text, meta] = await Promise.all([storeGet(env, 'meta'), storeGetMeta(env, 'meta')]);
+  assert.equal(text, '正文');
+  assert.equal(meta.text, text);
+  assert.ok(meta.etag);
+  assert.equal(env.R2.stats.get, 1);
+});
+
+test('首次 CAS 创建只允许一个写入者成功', async () => {
+  const env = { R2: makeR2() };
+  const results = await Promise.all([
+    storePutCas(env, 'new', '甲', ''), storePutCas(env, 'new', '乙', '')
+  ]);
+  assert.equal(results.filter(r => r.ok).length, 1);
+  assert.equal(results.filter(r => r.conflict).length, 1);
+});
+
+test('条件写异常不能退回无条件写', async () => {
+  const env = { R2: makeR2({ guarded: '原始内容' }) };
+  const put = env.R2.put;
+  let attempts = 0;
+  env.R2.put = async (key, value, opts) => {
+    attempts += 1;
+    if (opts?.onlyIf) throw new Error('permission denied');
+    return put(key, value, opts);
+  };
+  const result = await storePutCas(env, 'guarded', '不应覆盖', env.R2.etags.get('guarded'));
+  assert.equal(result.ok, false);
+  assert.equal(env.R2.data.get('guarded'), '原始内容');
+  assert.equal(attempts, 1);
+});
+
+test('写入后读取不复用写入前尚未完成的 GET', async () => {
+  const env = { R2: makeR2({ changing: '旧正文' }) };
+  const get = env.R2.get;
+  const started = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  let first = true;
+  env.R2.get = async (key, opts) => {
+    const obj = await get(key, opts);
+    if (first) {
+      first = false;
+      started.resolve();
+      await release.promise;
+    }
+    return obj;
+  };
+  const old = storeGet(env, 'changing');
+  try {
+    await started.promise;
+    await storePutChecked(env, 'changing', '新正文');
+    const current = storeGet(env, 'changing');
+    release.resolve();
+    assert.equal(await current, '新正文');
+    assert.equal(await old, '旧正文');
+  } finally { release.resolve(); }
+});
+
+test('正文消费失败会重新 GET，指标包含实际重试与 list', async () => {
+  const env = { R2: makeR2({ retryBody: '完整正文' }) };
+  const get = env.R2.get;
+  let first = true;
+  env.R2.get = async (key, opts) => {
+    const obj = await get(key, opts);
+    if (first) {
+      first = false;
+      obj.text = async () => { throw new Error('network connection lost'); };
+    }
+    return obj;
+  };
+  r2ResetStats();
+  assert.equal(await storeGet(env, 'retryBody'), '完整正文');
+  await storeList(env, {});
+  assert.equal(r2Snapshot().get, 2);
+  assert.equal(r2Snapshot().retry, 1);
+  assert.equal(r2Snapshot().list, 1);
+});
 
 test('单飞：并发读同一个 key 只打一次 R2', async () => {
   const r2 = makeR2({ 'shared/key': '同一个对象' });

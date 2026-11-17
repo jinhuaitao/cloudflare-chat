@@ -8,18 +8,19 @@
 // 5) 注册表新增 chars（字符数）与准确的 size（字节数），列表按更新时间限流展示。
 
 import { mapSetBounded, mapGetBounded, mapLimit } from '../utils.js';
-import { storePutChecked, storeList, storeDelete } from '../store/r2.js';
+import { storeGet, storePutChecked, storeList, storeDelete } from '../store/r2.js';
 import { kbSafeChatId } from '../store/kb.js';
 import { KB_DOCS_PREFIX, kbDocSlug, kbNormSource, kbDocTitleOf, kbGetRegistry,
   kbGetRegistryEx, kbMutateRegistry, kbSaveRegistry, kbFindRegEntry, kbRegistryVersion,
-  kbFmtSize, kbFmtDate, kbTakeRepairCount } from './registry.js';
+  kbFmtSize, kbFmtDate, kbTakeRepairCount, kbExpireRegistryVerification } from './registry.js';
 
 // v7.1.0：知识库文档正文 L1 内存缓存（每桶最多 64 篇，TTL 300 秒），写入或删除时自动失效/更新
 // v7.20.0：缓存项带上注册表的 updated_at，读取时比对——文档被别的实例改过就自动失效。
 // 有了这层校验，TTL 才能放心从 120 秒放宽到 300 秒（检索与翻页几乎全部命中内存）。
 const KB_DOC_CACHE_MAX = 64;
 const KB_DOC_CACHE_TTL_MS = 300 * 1000;
-const KB_DOC_CACHE_TEXT_MAX = 150000;
+const KB_DOC_CACHE_TEXT_MAX = 210000; // 20 万字符正文 + frontmatter
+const KB_DOC_CACHE_CHARS_MAX = 4000000; // 包含按需生成的小写副本
 const KB_SEARCH_CACHE_MAX = 40;
 const KB_SEARCH_CACHE_TTL_MS = 60 * 1000;
 const KB_SEARCH_BUDGET_MS = 4000;
@@ -40,10 +41,33 @@ function docCacheFor(env) {
   return c;
 }
 
+// 最多扫描 64 项，统一清理 TTL 与字符预算；不另记总量，避免替换 / 删除时账目漂移。
+function kbTrimDocCache(c) {
+  const now = Date.now();
+  let chars = 0;
+  for (const [key, doc] of c.docs) {
+    if (now > c.docsExp.get(key)) {
+      c.docs.delete(key);
+      c.docsExp.delete(key);
+    } else {
+      chars += doc.text.length + (doc.lower ? doc.lower.length : 0);
+    }
+  }
+  for (const [key, doc] of c.docs) {
+    if (chars <= KB_DOC_CACHE_CHARS_MAX) break;
+    chars -= doc.text.length + (doc.lower ? doc.lower.length : 0);
+    c.docs.delete(key);
+    c.docsExp.delete(key);
+  }
+}
+
 function kbCacheDoc(env, key, text, at) {
   const c = docCacheFor(env);
-  if (!c || text.length > KB_DOC_CACHE_TEXT_MAX) return;
+  if (!c) return;
+  kbDropDocCache(env, key);
+  if (text.length > KB_DOC_CACHE_TEXT_MAX) return;
   mapSetBounded(c.docs, key, { text: text, lower: null, at: String(at || '') }, KB_DOC_CACHE_MAX, c.docsExp, KB_DOC_CACHE_TTL_MS);
+  kbTrimDocCache(c);
 }
 
 // at：注册表里该文档的 updated_at。给了就必须匹配，否则视为过期（别的实例改过正文）。
@@ -52,7 +76,10 @@ function kbCacheHit(env, key, at) {
   if (!c) return undefined;
   const hit = mapGetBounded(c.docs, key, c.docsExp);
   if (!hit || typeof hit.text !== 'string') return undefined;
-  if (at !== undefined && at !== null && String(hit.at || '') !== String(at || '')) return undefined;
+  if (at !== undefined && at !== null && String(hit.at || '') !== String(at || '')) {
+    kbDropDocCache(env, key);
+    return undefined;
+  }
   return hit;
 }
 
@@ -65,18 +92,12 @@ function kbDropDocCache(env, key) {
 
 async function kbReadDocTextCached(env, key, at) {
   if (!env || !env.R2) return null;
-  const c = docCacheFor(env);
   const hit = kbCacheHit(env, key, at);
   if (hit) return hit.text;
-  try {
-    const obj = await env.R2.get(key);
-    if (!obj) return null;
-    const text = await obj.text();
-    kbCacheDoc(env, key, text, at);
-    return text;
-  } catch (e) {
-    return null;
-  }
+  const text = await storeGet(env, key);
+  if (text === null) return null;
+  kbCacheDoc(env, key, text, at);
+  return text;
 }
 
 // 检索用：返回 { text, lower }，小写正文有缓存就复用，避免每次检索整篇 toLowerCase
@@ -84,14 +105,20 @@ async function kbReadDocForSearch(env, key, at) {
   const c = docCacheFor(env);
   const hit = kbCacheHit(env, key, at);
   if (hit) {
-    if (typeof hit.lower !== 'string') hit.lower = hit.text.toLowerCase();
+    if (typeof hit.lower !== 'string') {
+      hit.lower = hit.text.toLowerCase();
+      kbTrimDocCache(c);
+    }
     return hit;
   }
   const text = await kbReadDocTextCached(env, key, at);
   if (text === null) return null;
   const again = kbCacheHit(env, key, at);
   if (again) {
-    if (typeof again.lower !== 'string') again.lower = again.text.toLowerCase();
+    if (typeof again.lower !== 'string') {
+      again.lower = again.text.toLowerCase();
+      kbTrimDocCache(c);
+    }
     return again;
   }
   return { text: text, lower: text.toLowerCase() };
@@ -242,6 +269,7 @@ async function doSaveDoc(env, chatId, args) {
   // 现在由 kbMutateRegistry 的条件写（etag CAS）承担同一职责：冲突就重读重算，
   // 保存路径少一次 list，延迟直接降一个往返。
   const cur = await kbGetRegistryEx(env, { fresh: true });
+  if (cur.failed) return '知识库注册表读取失败，请稍后重试；本次内容未保存。';
   const reg = cur.reg;
   const prevEntry = reg.find(e => e.file === file);
   const existed = !!prevEntry;
@@ -314,6 +342,8 @@ async function doSaveDoc(env, chatId, args) {
   ]);
   versionKey = snapshotKey || '';
   if (!okDoc) return '知识库文档写入 R2 失败（' + key + '），请检查 R2 绑定与权限后重试；本次内容未保存。';
+  // 正文已变化：即使随后索引写失败，下次自动核对也必须重新检查实际文件。
+  kbExpireRegistryVerification(env);
   // 穿透更新 L1 正文缓存
   kbCacheDoc(env, key, body, nowIso);
   const prevCount = Number(prevEntry && prevEntry.vcount);
@@ -397,8 +427,8 @@ async function toolReadDoc(env, args, maxChars) {
   let hit = kbFindRegEntry(reg, query);
   if (!hit) {
     // v7.11.1：索引可能落后于实际文件（别的实例刚写入、旧版本遗留）。
-    // 未命中时先核对一次索引再判「没有」，避免文档明明在库里却回「未找到」。
-    reg = await kbGetRegistry(env, { verify: true });
+    // 未命中时自动核对；30 秒内复用成功核对，避免每次正文检索都 list。
+    reg = await kbGetRegistry(env, { verify: 'auto' });
     hit = kbFindRegEntry(reg, query);
   }
   if (hit) {
@@ -591,6 +621,7 @@ async function toolDeleteDoc(env, args) {
   }
   const key = KB_DOCS_PREFIX + hit.file;
   if (!(await storeDelete(env, key))) return '删除失败：' + (hit.title || hit.file);
+  kbExpireRegistryVerification(env);
   kbDropDocCache(env, key);
   const okReg = await kbSaveRegistry(env, reg.filter(e => e !== hit));
   if (!okReg) return '文档文件已删除，但注册表更新失败，列表可能仍显示旧条目；下次读取会自动重建注册表。《' + (hit.title || hit.file) + '》';

@@ -173,7 +173,9 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
   const [memoryBundle, kbDocs, savedPersona] = await Promise.all([
     withTimeout(memoryLoad(env, chatId, query, { readOnly: kbReadOnly }), r2BudgetMs, null),
     withTimeout(kbGetRegistry(env), r2BudgetMs, null),
-    withTimeout(agentGetPersona(env, chatId), r2BudgetMs, 'auto')
+    // 显式人格沿用 truthy 语义：既然不会用存档，就不发起可能阻塞的 R2 读取。
+    (opts && opts.persona) ? Promise.resolve(opts.persona)
+      : withTimeout(agentGetPersona(env, chatId), r2BudgetMs, 'auto')
   ]);
   const hasKbDocs = Array.isArray(kbDocs) ? kbDocs.length > 0 : undefined;
   // 显式指定（本次调用参数）优先，其次是用户固定的人格，最后按提问自动路由。
@@ -609,9 +611,6 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
     });
     fireProgress(stepLabel + '\n' + descs.join('\n'), true);
 
-    // 预算感知：把本轮剩余时间折进单工具超时，最后时刻不再为一个工具空等
-    const remainBeforeTools = deadline - Date.now();
-    const toolTimeoutCap = Math.max(800, Math.min(limits.toolTimeoutMs, remainBeforeTools - 1500));
     // 单步工具输出按预算分摊，避免一步顶满上下文导致下一步被迫全量压缩
     const perToolCap = toolResultCap(ctxBudget, toolCalls.length);
 
@@ -654,10 +653,13 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
           ms: 0
         };
       }
-      if (remainBeforeTools < 2000) {
+      // 并发闸门内按真正开始执行的时刻计算，不能复用整批入队时的预算。
+      const t0 = Date.now();
+      const remainBeforeTool = deadline - t0;
+      if (remainBeforeTool < 2000) {
         return { tc, result: '剩余时间不足，已跳过本次工具调用；请直接基于已有信息作答', failed: true, ms: 0 };
       }
-      const t0 = Date.now();
+      const toolTimeoutCap = Math.max(800, Math.min(limits.toolTimeoutMs, remainBeforeTool - 1500));
       const result = await execAgentTool(fn.name, args, env, chatId, kbReadOnly,
         { timeoutMs: toolTimeoutCap, maxChars: Math.max(600, perToolCap - 160) });
       const ms = Math.max(1, Date.now() - t0);

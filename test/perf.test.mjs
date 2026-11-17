@@ -9,7 +9,9 @@ import { getAgentTools } from '../src/agent/tools.js';
 import { buildAgentSystemPrompt } from '../src/agent/prompt.js';
 import { toolResultCap } from '../src/agent/limits.js';
 import { readUpstreamMessage } from '../src/agent/upstream.js';
-import { tgAgentChat } from '../src/agent/loop.js';
+import { tgAgentChat, tgAgentRunLoop } from '../src/agent/loop.js';
+import { personaById } from '../src/agent/personas.js';
+import { toolWebFetch } from '../src/agent/tools-web.js';
 import { handleWebAgent } from '../src/web-agent.js';
 
 const ENV = {
@@ -25,6 +27,273 @@ function sseResp(events) {
 }
 
 const noopTgApi = async () => ({ ok: true, json: async () => ({}) });
+
+function gate() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
+// 只排空有限的 Promise/流读取链，不推进时钟，也不依赖机器的墙钟速度。
+async function flushMicrotasks() {
+  for (let i = 0; i < 100; i++) await Promise.resolve();
+}
+
+const CLOCK_START = 1800000000000;
+function freezeTimers(t) {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: CLOCK_START });
+  return {
+    set: t.mock.method(globalThis, 'setTimeout'),
+    clear: t.mock.method(globalThis, 'clearTimeout'),
+  };
+}
+
+function assertTimersCleared(timers) {
+  const cleared = new Set(timers.clear.mock.calls.map(c => c.arguments[0]));
+  for (const call of timers.set.mock.calls) {
+    assert.ok(cleared.has(call.result), '完成/取消后必须清理每个超时 timer');
+  }
+}
+
+for (const persona of ['writer', 'auto']) {
+  test('显式 persona=' + persona + ' 不读取悬挂的人格存档', async (t) => {
+    freezeTimers(t);
+    const personaRead = gate();
+    const reads = [];
+    const chatId = 'perf-explicit-persona-' + persona;
+    const personaKey = 'agent_persona_' + chatId;
+    const env = {
+      ...ENV,
+      R2: {
+        async get(key) { reads.push(key); return key === personaKey ? personaRead.promise : null; },
+        async list() { return { objects: [], truncated: false }; },
+      },
+    };
+    const upstream = t.mock.method(globalThis, 'fetch', async () =>
+      sseResp([{ choices: [{ delta: { content: '完成。' } }] }]));
+    let result;
+    const pending = tgAgentChat(env, noopTgApi, chatId, 'mock-model',
+      [{ role: 'user', content: '服务器 502 怎么排查' }], true, null,
+      { persona, workingMemory: false }).then(r => { result = r; });
+    try {
+      await flushMicrotasks();
+      assert.equal(reads.includes(personaKey), false, '显式人格不应访问 agent_persona 键');
+      assert.equal(upstream.mock.callCount(), 1, '不释放存档 gate、不推进时钟也应请求上游');
+      assert.equal(result?.personaId, persona === 'auto' ? 'ops' : 'writer');
+      assert.equal(result.text, '完成。');
+      assert.equal(Date.now(), CLOCK_START);
+    } finally {
+      personaRead.resolve(null);
+      await pending;
+    }
+  });
+}
+
+for (const persona of [undefined, '', null, false, 0]) {
+  test('未指定或 falsy persona=' + String(persona) + ' 保留存档偏好', async (t) => {
+    freezeTimers(t);
+    const reads = [];
+    const chatId = 'perf-saved-persona-' + String(persona);
+    const personaKey = 'agent_persona_' + chatId;
+    const env = {
+      ...ENV,
+      R2: {
+        async get(key) {
+          reads.push(key);
+          return key === personaKey ? { text: async () => 'writer' } : null;
+        },
+        async list() { return { objects: [], truncated: false }; },
+      },
+    };
+    t.mock.method(globalThis, 'fetch', async () =>
+      sseResp([{ choices: [{ delta: { content: '按存档作答。' } }] }]));
+    const opts = { workingMemory: false };
+    if (persona !== undefined) opts.persona = persona;
+    const result = await tgAgentChat(env, noopTgApi, chatId, 'mock-model',
+      [{ role: 'user', content: '服务器 502 怎么排查' }], true, null, opts);
+    assert.equal(reads.filter(k => k === personaKey).length, 1);
+    assert.equal(result.personaId, 'writer', '存档偏好必须优先于当前提问的自动路由');
+  });
+}
+
+function toolEvent(index, name, args) {
+  return { choices: [{ delta: { tool_calls: [{
+    index, id: 'budget-' + index, type: 'function',
+    function: { name, arguments: typeof args === 'string' ? args : JSON.stringify(args) },
+  }] } }] };
+}
+
+const PAGE_BODY = 'A complete page with enough useful content to avoid the fallback chain. '.repeat(3);
+
+test('工具队列按执行时刻缩短超时并跳过过期调用，保留各类短路', async (t) => {
+  const timers = freezeTimers(t);
+  const first = gate();
+  const second = gate();
+  const urls = ['first', 'second', 'skipped'].map(s => 'https://budget.example.com/' + s);
+  const pageCalls = [];
+  const upstreamCalls = [];
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    if (String(url) === ENV.API_URL_1) {
+      upstreamCalls.push(JSON.parse(init.body));
+      if (upstreamCalls.length === 1) return sseResp([
+        toolEvent(0, 'calculate', { expression: '7*7' }),
+        toolEvent(1, 'web_fetch', { url: urls[0] }),
+        toolEvent(2, 'web_fetch', { url: urls[1] }),
+        toolEvent(3, 'web_fetch', { url: urls[2] }),
+        toolEvent(4, 'calculate', { expression: '7*7' }),
+        toolEvent(5, 'net_lookup', { target: 'example.com' }),
+        toolEvent(6, 'web_fetch', '{"url":invalid}'),
+      ]);
+      return sseResp([{ choices: [{ delta: { content: '已有结果。' } }] }]);
+    }
+    pageCalls.push(String(url));
+    if (url === urls[0]) await first.promise;
+    if (url === urls[1]) await second.promise;
+    return new Response(PAGE_BODY, { headers: { 'content-type': 'text/html' } });
+  });
+  const env = { ...ENV, AGENT_MAX_STEPS: '1', AGENT_TOOL_CONCURRENCY: '1', AGENT_WRAP_RESERVE_MS: '1500' };
+  const persona = personaById('coder');
+  const pending = tgAgentRunLoop(env, noopTgApi, 'perf-tool-queue', 'mock-model',
+    [{ role: 'system', content: 'sys' }, { role: 'user', content: '读取网页' }],
+    getAgentTools(false, { persona }), true, null, CLOCK_START + 20000,
+    null, false, undefined, null, null, false, '读取网页', false, persona);
+  try {
+    await flushMicrotasks();
+    assert.deepEqual(pageCalls, [urls[0]], '并发闸门必须先阻塞后续工具');
+    t.mock.timers.setTime(CLOCK_START + 11000);
+    first.resolve();
+    await flushMicrotasks();
+    assert.deepEqual(pageCalls, urls.slice(0, 2));
+    // calculate 和第一篇网页上限 18500；第二篇入队等待了 11000，只剩 7500。
+    // 8800 是 web_fetch 自身的直连 timer，不是循环层的执行上限。
+    assert.deepEqual(timers.set.mock.calls.map(c => c.arguments[1]), [18500, 8800, 18500, 8800, 7500]);
+    t.mock.timers.setTime(CLOCK_START + 18001); // 剩余 1999ms，第三个真实工具必须跳过
+    second.resolve();
+    const result = await pending;
+    assert.equal(result.text, '已有结果。');
+    assert.deepEqual(pageCalls, urls.slice(0, 2), '过期的排队工具不得发起请求');
+    const results = upstreamCalls[1].messages.filter(m => m.role === 'tool');
+    assert.deepEqual(results.map(m => m.tool_call_id), Array.from({ length: 7 }, (_, i) => 'budget-' + i));
+    assert.match(results[3].content, /剩余时间不足/);
+    assert.match(results[4].content, /已执行过完全相同的调用/);
+    assert.match(results[5].content, /不适用于当前专家角色/);
+    assert.match(results[6].content, /参数解析失败/);
+    assert.equal(timers.set.mock.callCount(), 5, '短路分支不得启动执行 timer');
+    assertTimersCleared(timers);
+  } finally {
+    first.resolve();
+    second.resolve();
+    await pending;
+  }
+});
+
+function archiveResponse(target) {
+  return Response.json({ archived_snapshots: { closest: {
+    available: true,
+    url: 'https://web.archive.org/web/20250101000000/' + target,
+    timestamp: '20250101000000',
+  } } });
+}
+
+for (const stage of ['available', 'snapshot']) {
+  test('Jina 完整正文立即返回并取消挂起的 Wayback ' + stage, async (t) => {
+    const timers = freezeTimers(t);
+    const jina = gate();
+    const archive = gate();
+    const target = 'https://fallback.example.com/fast-jina-' + stage;
+    const body = '有效实时正文内容'.repeat(10); // 恰好 80 字符，验证 >=80 边界
+    const waybackSignals = [];
+    let archiveStarted = false;
+    t.mock.method(globalThis, 'fetch', async (url, init) => {
+      if (url === target) return new Response('blocked', { status: 403 });
+      if (String(url).startsWith('https://r.jina.ai/')) {
+        await jina.promise;
+        return new Response('Markdown Content:\n' + body);
+      }
+      waybackSignals.push(init.signal);
+      const isAvailable = String(url).startsWith('https://archive.org/wayback/available');
+      if ((stage === 'available') === isAvailable) {
+        archiveStarted = true;
+        init.signal.addEventListener('abort', () => archive.reject(init.signal.reason), { once: true });
+        await archive.promise;
+      }
+      return isAvailable ? archiveResponse(target) : new Response(PAGE_BODY);
+    });
+    let result;
+    const pending = toolWebFetch(target).then(r => { result = r; });
+    try {
+      await flushMicrotasks();
+      assert.equal(archiveStarted, true, 'Jina 未完成时 Wayback 应已并发启动');
+      jina.resolve();
+      await flushMicrotasks();
+      assert.equal(result, body, '不能等待快照 gate 或任意超时 timer 才返回正文');
+      assert.equal(waybackSignals.length, stage === 'available' ? 1 : 2);
+      assert.ok(waybackSignals.every(s => s === waybackSignals[0] && s.aborted));
+      assert.equal(Date.now(), CLOCK_START);
+      assert.equal(timers.set.mock.callCount(), 3);
+      assertTimersCleared(timers);
+    } finally {
+      jina.resolve();
+      archive.resolve();
+      await pending;
+    }
+  });
+}
+
+const shortJina = 's'.repeat(79);
+const jinaCases = [
+  ['short', () => new Response('Title: ' + 'metadata'.repeat(20) + '\n\nMarkdown Content:\n' + shortJina), shortJina],
+  ['empty', () => new Response('Title: ' + 'metadata'.repeat(20) + '\n\nMarkdown Content:\n  '), ''],
+  ['error-page', () => new Response('Warning: Target URL returned error 403\n\nMarkdown Content:\n' + PAGE_BODY), ''],
+  ['http-failure', () => new Response(PAGE_BODY, { status: 503 }), ''],
+  ['network-failure', () => { throw new Error('reader unavailable'); }, ''],
+];
+for (const [label, response, fallback] of jinaCases) {
+  for (const hasSnapshot of [true, false]) {
+    test('Jina ' + label + ' 等待 Wayback，快照' + (hasSnapshot ? '优先' : '不可用才回落'), async (t) => {
+      const timers = freezeTimers(t);
+      const archive = gate();
+      const target = 'https://fallback.example.com/' + label + '-' + hasSnapshot;
+      let waybackSignal;
+      let jinaRead = false;
+      t.mock.method(globalThis, 'fetch', async (url, init) => {
+        if (url === target) return new Response('blocked', { status: 403 });
+        if (String(url).startsWith('https://r.jina.ai/')) { jinaRead = true; return response(); }
+        if (String(url).startsWith('https://archive.org/wayback/available')) {
+          waybackSignal = init.signal;
+          await archive.promise;
+          return hasSnapshot ? archiveResponse(target) : Response.json({ archived_snapshots: {} });
+        }
+        return new Response('<p>' + PAGE_BODY + '</p>');
+      });
+      let result;
+      const pending = toolWebFetch(target).then(r => { result = r; });
+      try {
+        await flushMicrotasks();
+        assert.equal(jinaRead, true);
+        assert.ok(waybackSignal);
+        assert.equal(result, undefined, '短/空/错误 Jina 不能提前当完整正文返回');
+        assert.equal(waybackSignal.aborted, false, 'Jina 不足时必须继续等待快照');
+        archive.resolve();
+        await pending;
+        if (hasSnapshot) {
+          assert.match(result, /网页快照 20250101000000/);
+          assert.ok(result.includes(PAGE_BODY.trim()), '应返回历史快照而不是短 Jina');
+        } else if (fallback) {
+          assert.equal(result, fallback, '快照不可用时才使用短 Jina');
+        } else {
+          assert.match(result, /^抓取失败/);
+          assert.equal(result.includes(PAGE_BODY), false, 'Jina HTTP/200 错误页不能作为正文回落');
+        }
+        assertTimersCleared(timers);
+      } finally {
+        archive.resolve();
+        await pending;
+      }
+    });
+  }
+}
 
 // 每步都要重发的固定开销：工具定义 + 系统提示
 // v7.10.0：断言从「总量 < 6000」改为「单工具平均 < 340 字符」。
@@ -186,25 +455,55 @@ test('思维链默认不回灌上下文，AGENT_KEEP_REASONING=1 才回灌', asy
 // 有 ctx 时挂 waitUntil 立即返回，没有时也要并行等（不再逐个串行 await）。
 test('deferOrAwait：有 ctx 挂 waitUntil 立即返回，任务仍跑完', async () => {
   const { deferOrAwait } = await import('../src/utils.js');
+  const a = gate();
+  const b = gate();
   const order = [];
-  const task = (name, ms) => new Promise(res => setTimeout(() => { order.push(name); res(); }, ms));
   const held = [];
   const ctx = { waitUntil: (p) => held.push(p) };
-  const t0 = Date.now();
-  await deferOrAwait(ctx, [task('a', 40), task('b', 40)]);
-  assert.ok(Date.now() - t0 < 25, '挂了 waitUntil 后不应原地等待任务完成');
-  assert.equal(held.length, 1, '必须真的挂进 waitUntil');
-  await held[0];
-  assert.deepEqual(order.sort(), ['a', 'b'], '后台任务必须全部跑完');
+  let returned = false;
+  let finished = false;
+  const pending = deferOrAwait(ctx, [a.promise.then(() => order.push('a')), b.promise.then(() => order.push('b'))])
+    .then(() => { returned = true; });
+  try {
+    await flushMicrotasks();
+    assert.equal(returned, true, '后台任务尚未完成时调用方就应继续');
+    assert.equal(held.length, 1, '必须真的挂进 waitUntil');
+    held[0].then(() => { finished = true; });
+    b.resolve();
+    await flushMicrotasks();
+    assert.deepEqual(order, ['b']);
+    assert.equal(finished, false, 'waitUntil 必须等待所有后台任务');
+    a.resolve();
+    await held[0];
+    assert.deepEqual(order, ['b', 'a']);
+  } finally {
+    a.resolve();
+    b.resolve();
+    await pending;
+    await Promise.all(held);
+  }
 });
 
-test('deferOrAwait：无 ctx 时并行等待（总时长取 max 而非 sum）', async () => {
+test('deferOrAwait：无 ctx 时等待所有任务，允许逆序完成', async () => {
   const { deferOrAwait } = await import('../src/utils.js');
-  const task = (ms) => new Promise(res => setTimeout(res, ms));
-  const t0 = Date.now();
-  await deferOrAwait(null, [task(40), task(40)]);
-  const cost = Date.now() - t0;
-  assert.ok(cost < 70, '两个 40ms 任务串行要 80ms+，并行应明显小于（实测 ' + cost + 'ms）');
+  const a = gate();
+  const b = gate();
+  let returned = false;
+  const pending = deferOrAwait(null, [a.promise, b.promise]).then(() => { returned = true; });
+  try {
+    await flushMicrotasks();
+    assert.equal(returned, false);
+    b.resolve();
+    await flushMicrotasks();
+    assert.equal(returned, false, '不能只等一个任务就提前返回');
+    a.resolve();
+    await pending;
+    assert.equal(returned, true);
+  } finally {
+    a.resolve();
+    b.resolve();
+    await pending;
+  }
 });
 
 test('收尾写入延后已接到 TG / 微信双端的四条回复路径', async () => {

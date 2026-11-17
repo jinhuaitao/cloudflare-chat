@@ -20,7 +20,7 @@ const R2_RETRY_DELAYS_MS = [50, 150];
 // 单飞表上限：isolate 内存有限，超过就整体清空（在飞请求各自仍会正常返回）
 const R2_INFLIGHT_MAX = 512;
 
-const r2Stats = { get: 0, getShared: 0, getMiss: 0, put: 0, del: 0, retry: 0, fail: 0, conflict: 0 };
+const r2Stats = { get: 0, getShared: 0, getMiss: 0, put: 0, list: 0, del: 0, retry: 0, fail: 0, conflict: 0 };
 
 function isTransientError(err) {
   const m = String((err && (err.message || err)) || '').toLowerCase();
@@ -45,16 +45,20 @@ async function withRetry(fn) {
   throw lastErr;
 }
 
-// 单飞：并发读同一个 key 复用同一个 promise。注意返回值必须是不可变的字符串，
-// 上层拿到后各自解析，不会互相污染。
-const inflight = new Map();
-function shareInflight(key, fn) {
+const inflightBuckets = new WeakMap();
+
+function shareInflight(env, key, fn) {
+  let inflight = inflightBuckets.get(env.R2);
+  if (!inflight) {
+    inflight = new Map();
+    inflightBuckets.set(env.R2, inflight);
+  }
   const hit = inflight.get(key);
   if (hit) {
     r2Stats.getShared += 1;
     return hit;
   }
-  const wrapped = (async () => fn())().finally(() => {
+  const wrapped = Promise.resolve().then(fn).finally(() => {
     if (inflight.get(key) === wrapped) inflight.delete(key);
   });
   if (inflight.size >= R2_INFLIGHT_MAX) inflight.clear();
@@ -62,44 +66,43 @@ function shareInflight(key, fn) {
   return wrapped;
 }
 
-async function rawGet(env, key, range) {
-  r2Stats.get += 1;
-  const obj = await withRetry(() => env.R2.get(key, range ? { range } : undefined));
-  // 条件读（onlyIf 不满足）与对象不存在都会走到这里：body 为 null 表示没有内容
-  if (!obj || obj.body === null) {
-    r2Stats.getMiss += 1;
-    return null;
+function invalidateReads(env, keys) {
+  const inflight = inflightBuckets.get(env.R2);
+  if (!inflight) return;
+  const prefixes = (Array.isArray(keys) ? keys : [keys]).map(key => JSON.stringify(key) + '|');
+  for (const key of inflight.keys()) {
+    if (prefixes.some(prefix => key.startsWith(prefix))) inflight.delete(key);
   }
-  return await obj.text();
 }
 
-async function storeGet(env, key, opts) {
-  if (!env || !env.R2) return null;
-  const o = opts || {};
-  const range = o.range || null;
-  // 不同 range 不能共用同一次请求
-  const shareKey = range ? key + '|' + (range.offset || 0) + ':' + (range.length || '') : key;
-  const load = () => rawGet(env, key, range).catch(() => null);
-  return o.share === false ? await load() : await shareInflight(shareKey, load);
-}
-
-// 带元数据的读：etag 供条件写（CAS）使用，size 供调用方做预算判断。
-// failed=true 表示「读失败」而不是「对象不存在」—— 这两件事对调用方含义完全不同
-// （读失败不该被当成空数据，否则会触发无谓的全量重建甚至覆盖写）。
-async function storeGetMeta(env, key) {
-  if (!env || !env.R2) return { text: null, etag: '', size: 0, failed: false };
+async function rawGetMeta(env, key, range) {
   try {
-    r2Stats.get += 1;
-    const obj = await withRetry(() => env.R2.get(key));
-    if (!obj) {
-      r2Stats.getMiss += 1;
-      return { text: null, etag: '', size: 0, failed: false };
-    }
-    const text = obj.body === null ? null : await obj.text();
-    return { text, etag: String(obj.etag || ''), size: Number(obj.size) || 0, failed: false };
+    return await withRetry(async () => {
+      r2Stats.get += 1;
+      const obj = await env.R2.get(key, range ? { range } : undefined);
+      if (!obj) {
+        r2Stats.getMiss += 1;
+        return { text: null, etag: '', size: 0, failed: false };
+      }
+      const text = obj.body === null ? null : await obj.text();
+      return { text, etag: String(obj.etag || ''), size: Number(obj.size) || 0, failed: false };
+    });
   } catch (e) {
     return { text: null, etag: '', size: 0, failed: true };
   }
+}
+
+async function storeGetMeta(env, key, opts) {
+  if (!env || !env.R2) return { text: null, etag: '', size: 0, failed: false };
+  const range = (opts && opts.range) || null;
+  const shareKey = JSON.stringify(key) + '|' + JSON.stringify(range);
+  const load = () => rawGetMeta(env, key, range);
+  const meta = opts && opts.share === false ? await load() : await shareInflight(env, shareKey, load);
+  return { ...meta };
+}
+
+async function storeGet(env, key, opts) {
+  return (await storeGetMeta(env, key, opts)).text;
 }
 
 // 字节范围读：只取需要的一段，避免为了看 200 字把 20 万字的文档整篇拉下来
@@ -112,8 +115,11 @@ async function storeGetRange(env, key, offset, length) {
 async function storePut(env, key, value, opts) {
   if (!env || !env.R2) return;
   try {
-    r2Stats.put += 1;
-    await withRetry(() => env.R2.put(key, String(value), opts));
+    await withRetry(() => {
+      r2Stats.put += 1;
+      return env.R2.put(key, String(value), opts);
+    });
+    invalidateReads(env, key);
   } catch (e) {}
 }
 
@@ -122,45 +128,47 @@ async function storePut(env, key, value, opts) {
 async function storePutChecked(env, key, value, opts) {
   if (!env || !env.R2) return false;
   try {
-    r2Stats.put += 1;
-    await withRetry(() => env.R2.put(key, String(value), opts));
+    await withRetry(() => {
+      r2Stats.put += 1;
+      return env.R2.put(key, String(value), opts);
+    });
+    invalidateReads(env, key);
     return true;
   } catch (e) {
     return false;
   }
 }
 
-// 条件写（compare-and-set）：只有 R2 里的对象 etag 仍是 expectEtag 时才写入。
-// 返回 { ok, conflict, cas, etag }：
-//   · ok=true            写入成功（cas=true 表示真的走了条件写），etag 为新对象的 etag
-//   · ok=false, conflict 预条件失败：别人先改了，调用方应重读后重算
-//   · ok=false, cas=false 运行时不支持条件写时已退化为普通写（不会丢数据，只是失去互斥）
-// expectEtag 为空时走普通写（首次创建），同样带回新 etag 供后续 CAS 使用。
+// 空 etag 表示仅在对象不存在时创建；条件写失败绝不能退回覆盖写。
 async function storePutCas(env, key, value, expectEtag, opts) {
   if (!env || !env.R2) return { ok: false, conflict: false, cas: false, etag: '' };
   const body = String(value);
-  r2Stats.put += 1;
+  const onlyIf = expectEtag ? { etagMatches: expectEtag } : { etagDoesNotMatch: '*' };
   try {
-    const putOpts = expectEtag ? Object.assign({}, opts, { onlyIf: { etagMatches: expectEtag } }) : opts;
-    const res = await withRetry(() => env.R2.put(key, body, putOpts));
-    // 真实 R2 在预条件失败时返回 null；内存桶（测试）返回 undefined 视为成功
+    const res = await withRetry(() => {
+      r2Stats.put += 1;
+      return env.R2.put(key, body, { ...opts, onlyIf });
+    });
+    invalidateReads(env, key);
     if (res === null) {
       r2Stats.conflict += 1;
       return { ok: false, conflict: true, cas: true, etag: '' };
     }
-    return { ok: true, conflict: false, cas: !!expectEtag, etag: String((res && res.etag) || '') };
+    return { ok: true, conflict: false, cas: true, etag: String((res && res.etag) || '') };
   } catch (e) {
-    // onlyIf 不被支持（老运行时 / 参数非法）→ 退化成普通写，绝不让优化变成丢数据
-    const ok = await storePutChecked(env, key, body, opts);
-    return { ok, conflict: false, cas: false, etag: '' };
+    invalidateReads(env, key);
+    return { ok: false, conflict: false, cas: true, etag: '' };
   }
 }
 
 async function storeDelete(env, key) {
   if (!env || !env.R2) return false;
   try {
-    r2Stats.del += 1;
-    await withRetry(() => env.R2.delete(key));
+    await withRetry(() => {
+      r2Stats.del += 1;
+      return env.R2.delete(key);
+    });
+    invalidateReads(env, key);
     return true;
   } catch (e) {
     return false;
@@ -171,7 +179,10 @@ async function storeDelete(env, key) {
 async function storeList(env, opts) {
   if (!env || !env.R2) return { objects: [], truncated: false };
   try {
-    return await withRetry(() => env.R2.list(opts || {}));
+    return await withRetry(() => {
+      r2Stats.list += 1;
+      return env.R2.list(opts || {});
+    });
   } catch (e) {
     return { objects: [], truncated: false, failed: true };
   }
@@ -189,7 +200,7 @@ function r2ResetStats() {
 function r2StatsLine() {
   const s = r2Stats;
   return 'R2 get=' + s.get + '（单飞复用 ' + s.getShared + '，空 ' + s.getMiss + '）'
-    + ' put=' + s.put + ' del=' + s.del
+    + ' put=' + s.put + ' list=' + s.list + ' del=' + s.del
     + ' 重试=' + s.retry + ' 失败=' + s.fail + ' 条件写冲突=' + s.conflict;
 }
 

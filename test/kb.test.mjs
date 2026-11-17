@@ -5,19 +5,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { kbGetRegistry, kbFindRegEntry, kbParseTags, kbFmtTags } from '../src/kb/registry.js';
-import { toolSaveDoc, toolReadDoc, toolListDocs, toolDeleteDoc } from '../src/kb/doc-tools.js';
+import { kbGetRegistry, kbGetRegistryEx, kbSaveRegistry, kbMutateRegistry,
+  kbRegistryVersion, kbFindRegEntry, kbParseTags, kbFmtTags } from '../src/kb/registry.js';
+import { toolSaveDoc, toolReadDoc, toolListDocs, toolDeleteDoc,
+  kbReadDocTextCached, kbSearchDocBodyEx } from '../src/kb/doc-tools.js';
 import { extractTagLine, cleanDocTitle, deriveFileDocTitle, autoOrganizeAndSaveKbDoc } from '../src/kb/organize.js';
 
 function makeR2(initial = {}) {
   const data = new Map(Object.entries(initial));
-  const stats = { get: 0, put: 0, delete: 0, list: 0 };
+  const stats = { get: 0, put: 0, delete: 0, list: 0, getByKey: new Map() };
   const bytes = (s) => new TextEncoder().encode(String(s)).byteLength;
   return {
     stats,
     data,
     async get(key) {
       stats.get += 1;
+      stats.getByKey.set(key, (stats.getByKey.get(key) || 0) + 1);
       if (!data.has(key)) return null;
       const text = String(data.get(key));
       return { key: key, size: bytes(text), text: async () => text };
@@ -472,4 +475,372 @@ test('frontmatter 记录 fp 与 version，重建后版本号不倒退', async ()
   const entry = list.find(e => e.file === '版本测试.md');
   assert.equal(entry.version, 2);
   assert.ok(entry.fp, '重建后 fp 应保留');
+});
+
+// ==================== 自动核对、失败保护与正文缓存操作预算 ====================
+
+function indexedR2(content = 'needle 原始正文', title = '说明') {
+  const body = docBody(title, content);
+  const entry = { file: title + '.md', title, updated_at: 'v1', chars: body.length, size: body.length };
+  return makeR2({
+    ['kb/docs/' + entry.file]: body,
+    'kb/docs/registry.json': JSON.stringify([entry]),
+  });
+}
+
+test('重复全文查询只核对一次：1 LIST、1 注册表 GET、1 正文 GET', async () => {
+  const r2 = indexedR2('needle alpha beta gamma delta');
+  const env = { R2: r2 };
+  for (const query of ['needle', 'alpha', 'beta', 'gamma', 'delta', 'needle', 'alpha', 'beta']) {
+    assert.match(await toolReadDoc(env, { query }), /【命中 1/);
+  }
+  assert.equal(r2.stats.list, 1);
+  assert.equal(r2.stats.get, 2);
+  assert.equal(r2.stats.getByKey.get('kb/docs/说明.md'), 1);
+  assert.equal(r2.stats.put, 0);
+});
+
+test('空注册表多次读取及交替访问不同桶，每桶只 LIST 一次', async () => {
+  const buckets = [makeR2({ 'kb/docs/registry.json': '[]' }), makeR2({ 'kb/docs/registry.json': '[]' })];
+  for (let i = 0; i < 6; i++) {
+    for (const r2 of buckets) {
+      assert.match(await toolReadDoc({ R2: r2 }, { query: '不存在' }), /知识库文档为空/);
+    }
+  }
+  for (const r2 of buckets) {
+    assert.equal(r2.stats.list, 1);
+    assert.equal(r2.stats.put, 0);
+  }
+});
+
+test('缺失索引的空库只重建一次，后续读取不再 LIST', async () => {
+  const r2 = makeR2();
+  for (let i = 0; i < 6; i++) assert.deepEqual(await kbGetRegistry({ R2: r2 }), []);
+  assert.equal(r2.stats.list, 1);
+  assert.equal(r2.stats.get, 1);
+  assert.equal(r2.stats.put, 1);
+  assert.equal(r2.data.get('kb/docs/registry.json'), '[]');
+});
+
+test('verify:true 忽略成功核对窗口，立即补回外部文档且每次强制 LIST', async () => {
+  const r2 = makeR2({ 'kb/docs/registry.json': '[]' });
+  const env = { R2: r2 };
+  assert.deepEqual(await kbGetRegistry(env), []);
+  r2.data.set('kb/docs/外部.md', docBody('外部', '刚刚写入'));
+  assert.deepEqual(await kbGetRegistry(env, { verify: 'auto' }), []);
+  assert.equal(r2.stats.list, 1);
+  assert.equal((await kbGetRegistry(env, { verify: true }))[0].title, '外部');
+  assert.equal(r2.stats.list, 2);
+  assert.equal(r2.stats.put, 1);
+  await kbGetRegistry(env, { verify: true });
+  assert.equal(r2.stats.list, 3);
+  assert.equal(r2.stats.put, 1);
+});
+
+test('空库自动核对 TTL 到期发现只有正文、未登记的外部新增', async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  const r2 = makeR2({ 'kb/docs/registry.json': '[]' });
+  const env = { R2: r2 };
+  await kbGetRegistry(env);
+  r2.data.set('kb/docs/外部.md', docBody('外部', '空库新增正文'));
+  now += 29999;
+  assert.deepEqual(await kbGetRegistry(env), []);
+  assert.equal(r2.stats.list, 1);
+  now += 2;
+  assert.match(await toolReadDoc(env, { query: '外部' }), /空库新增正文/);
+  assert.equal(r2.stats.list, 2);
+  assert.equal(r2.stats.put, 1);
+});
+
+test('非空库 read_doc 自动核对 TTL 到期补回外部文档', async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  const r2 = indexedR2();
+  const env = { R2: r2 };
+  await toolReadDoc(env, { query: 'needle' });
+  r2.data.set('kb/docs/外部.md', docBody('外部', '新文档完整正文'));
+  assert.match(await toolReadDoc(env, { query: '外部' }), /未找到/);
+  assert.equal(r2.stats.list, 1);
+  now += 30001;
+  assert.match(await toolReadDoc(env, { query: '外部' }), /新文档完整正文/);
+  assert.equal(r2.stats.list, 2);
+  assert.equal(r2.stats.put, 1);
+  assert.equal(JSON.parse(r2.data.get('kb/docs/registry.json')).length, 2);
+});
+
+test('本地写入和删除使自动核对立即过期', async () => {
+  const r2 = makeR2({ 'kb/docs/registry.json': '[]' });
+  const env = { R2: r2 };
+  await kbGetRegistry(env);
+  assert.equal(r2.stats.list, 1);
+  assert.match(await toolSaveDoc(env, 'c', { title: '本地', content: '本地内容' }), /已保存/);
+  assert.equal(r2.stats.list, 1, '保存前 fresh 空索引复用成功核对');
+  await kbGetRegistry(env, { verify: 'auto' });
+  assert.equal(r2.stats.list, 2);
+  assert.match(await toolDeleteDoc(env, { query: '本地' }), /已删除/);
+  assert.equal(r2.stats.list, 3, '删除前仍强制核对');
+  assert.deepEqual(await kbGetRegistry(env), []);
+  assert.equal(r2.stats.list, 4, '删除后的空库必须重新核对一次');
+  await kbGetRegistry(env);
+  assert.equal(r2.stats.list, 4);
+});
+
+test('并发 auto / 强制核对合并为 1 LIST 和 1 次自愈写入', async () => {
+  const r2 = indexedR2();
+  const env = { R2: r2 };
+  await kbGetRegistry(env);
+  r2.data.set('kb/docs/补回.md', docBody('补回', '正文'));
+  const gate = Promise.withResolvers();
+  const originalList = r2.list;
+  r2.list = async (opts) => { await gate.promise; return originalList(opts); };
+  const pending = Array.from({ length: 8 }, (_, i) => kbGetRegistry(env, { verify: i % 2 ? true : 'auto' }));
+  gate.resolve();
+  const results = await Promise.all(pending);
+  for (const reg of results) assert.deepEqual(reg.map(e => e.file).sort(), ['补回.md', '说明.md']);
+  results[0].pop();
+  assert.equal(results[1].length, 2, '合并核对后调用者仍各自拥有列表副本');
+  assert.equal(r2.stats.list, 1);
+  assert.equal(r2.stats.put, 1);
+});
+
+test('LIST 首页失败保留完整旧索引且不记为成功，下次 auto 仍能自愈', async () => {
+  const r2 = indexedR2();
+  const env = { R2: r2 };
+  const original = await kbGetRegistry(env);
+  const originalJson = r2.data.get('kb/docs/registry.json');
+  r2.data.set('kb/docs/新增.md', docBody('新增', '正文'));
+  const originalList = r2.list;
+  r2.list = async () => { r2.stats.list += 1; throw new Error('permission denied'); };
+  assert.deepEqual(await kbGetRegistry(env, { verify: 'auto' }), original);
+  assert.equal(r2.stats.put, 0);
+  assert.equal(r2.data.get('kb/docs/registry.json'), originalJson);
+  r2.list = originalList;
+  assert.equal((await kbGetRegistry(env, { verify: 'auto' })).length, 2);
+  assert.equal(r2.stats.list, 2);
+  assert.equal(r2.stats.put, 1);
+});
+
+test('LIST 后续页失败不能用部分对象覆盖旧索引，也不能重建缺失索引', async () => {
+  for (const missing of [false, true]) {
+    const r2 = indexedR2();
+    if (missing) r2.data.delete('kb/docs/registry.json');
+    const before = r2.data.get('kb/docs/registry.json');
+    r2.list = async ({ cursor }) => {
+      r2.stats.list += 1;
+      if (cursor) throw new Error('permission denied');
+      return { objects: [{ key: 'kb/docs/半页.md', size: 20 }], truncated: true, cursor: 'next-page' };
+    };
+    const result = await kbGetRegistryEx({ R2: r2 }, { verify: true });
+    assert.equal(result.failed, true);
+    assert.equal(result.reg.length, missing ? 0 : 1);
+    assert.equal(r2.stats.list, 2);
+    assert.equal(r2.stats.get, 1, '失败后不应读取部分列表的文档头');
+    assert.equal(r2.stats.put, 0);
+    assert.equal(r2.data.get('kb/docs/registry.json'), before);
+  }
+});
+
+test('首次注册表 GET 失败无缓存，不 LIST、不重建、不允许后续写空', async () => {
+  const r2 = indexedR2();
+  const env = { R2: r2 };
+  const before = r2.data.get('kb/docs/registry.json');
+  const originalGet = r2.get;
+  r2.get = async (key) => { await originalGet(key); throw new Error('permission denied'); };
+  const result = await kbGetRegistryEx(env, { verify: true });
+  assert.equal(result.failed, true);
+  assert.deepEqual(result.reg, []);
+  assert.equal((await kbMutateRegistry(env, () => [])).ok, false);
+  assert.match(await toolSaveDoc(env, 'c', { title: '新文档', content: '正文' }), /注册表读取失败/);
+  assert.equal(r2.stats.get, 3);
+  assert.equal(r2.stats.list, 0);
+  assert.equal(r2.stats.put, 0);
+  assert.equal(r2.data.get('kb/docs/registry.json'), before);
+});
+
+test('注册表 GET 失败有缓存，fresh 强制核对也不因失败重建', async () => {
+  const r2 = indexedR2();
+  const env = { R2: r2 };
+  const before = await kbGetRegistry(env);
+  r2.get = async () => { throw new Error('permission denied'); };
+  const result = await kbGetRegistryEx(env, { fresh: true, verify: true });
+  assert.equal(result.failed, true);
+  assert.deepEqual(result.reg, before);
+  assert.equal(r2.stats.list, 0);
+  assert.equal(r2.stats.put, 0);
+});
+
+test('200000 字符正文加 frontmatter 全文翻页只需 1 次正文 GET', async () => {
+  const r2 = indexedR2('正'.repeat(199999) + '尾', '长文');
+  const env = { R2: r2 };
+  const body = r2.data.get('kb/docs/长文.md');
+  assert.ok(body.length > 200000);
+  for (let offset = 0; offset < body.length; offset += 8000) {
+    const out = await toolReadDoc(env, { query: '长文', offset });
+    assert.ok(out.includes(body.slice(offset, offset + 8000)), '每页必须保留完整正文片段');
+  }
+  assert.equal(r2.stats.getByKey.get('kb/docs/长文.md'), 1);
+  assert.equal(r2.stats.get, 2);
+  assert.equal(r2.stats.list, 0);
+});
+
+test('并发 10 页冷正文读取通过 storeGet 合并为 1 GET', async () => {
+  const r2 = indexedR2('正'.repeat(200000), '长文');
+  const env = { R2: r2 };
+  await kbGetRegistry(env);
+  const gate = Promise.withResolvers();
+  const originalGet = r2.get;
+  r2.get = async (key) => {
+    const obj = await originalGet(key);
+    if (key === 'kb/docs/长文.md') await gate.promise;
+    return obj;
+  };
+  const pending = Array.from({ length: 10 }, (_, i) => toolReadDoc(env, { query: '长文', offset: i * 8000 }));
+  gate.resolve();
+  const pages = await Promise.all(pending);
+  assert.equal(pages.length, 10);
+  for (const page of pages) assert.match(page, /【知识库文档《长文》】/);
+  assert.equal(r2.stats.getByKey.get('kb/docs/长文.md'), 1);
+  assert.equal(r2.stats.get, 2);
+});
+
+test('保存 200000 字符后立即翻页命中穿透缓存，正文 GET 为零', async () => {
+  const r2 = makeR2();
+  const env = { R2: r2 };
+  assert.match(await toolSaveDoc(env, 'c', { title: '长文', content: '正'.repeat(200000) }), /200000 字符/);
+  for (const offset of [0, 8000, 192000]) {
+    assert.match(await toolReadDoc(env, { query: '长文', offset }), /正/);
+  }
+  assert.equal(r2.stats.getByKey.get('kb/docs/长文.md') || 0, 0);
+});
+
+test('回源发现外部注册表内容改变，旧命中和未命中搜索缓存及正文版本都失效', async () => {
+  const r2 = indexedR2('needle OLD');
+  const env = { R2: r2 };
+  let reg = await kbGetRegistry(env);
+  assert.match((await kbSearchDocBodyEx(env, reg, 'needle')).snippet, /OLD/);
+  assert.equal((await kbSearchDocBodyEx(env, reg, 'needle')).cached, true);
+  assert.equal((await kbSearchDocBodyEx(env, reg, 'freshword')).snippet, null);
+  assert.equal((await kbSearchDocBodyEx(env, reg, 'freshword')).cached, true);
+  const version = kbRegistryVersion();
+  r2.data.set('kb/docs/说明.md', docBody('说明', 'needle NEW freshword'));
+  r2.data.set('kb/docs/registry.json', JSON.stringify([{ ...reg[0], updated_at: 'v2', version: 2 }]));
+  reg = await kbGetRegistry(env, { fresh: true });
+  assert.ok(kbRegistryVersion() > version);
+  const found = await kbSearchDocBodyEx(env, reg, 'needle');
+  assert.notEqual(found.cached, true);
+  assert.match(found.snippet, /NEW/);
+  assert.doesNotMatch(found.snippet, /OLD/);
+  assert.match((await kbSearchDocBodyEx(env, reg, 'freshword')).snippet, /freshword/);
+  assert.equal(r2.stats.getByKey.get('kb/docs/说明.md'), 2);
+  assert.equal(r2.stats.put, 0);
+});
+
+test('仅 etag 改变也使搜索缓存失效，CAS 成功缓存新 etag，未变回源不增版本', async () => {
+  const r2 = indexedR2();
+  const env = { R2: r2 };
+  let etag = 'etag-1';
+  const originalGet = r2.get;
+  const originalPut = r2.put;
+  r2.get = async (key) => {
+    const obj = await originalGet(key);
+    return obj ? { ...obj, etag } : null;
+  };
+  r2.put = async (key, value, opts) => {
+    assert.equal(opts.onlyIf.etagMatches, etag);
+    await originalPut(key, value);
+    etag = 'etag-3';
+    return { etag };
+  };
+  let cur = await kbGetRegistryEx(env);
+  await kbSearchDocBodyEx(env, cur.reg, 'needle');
+  assert.equal((await kbSearchDocBodyEx(env, cur.reg, 'needle')).cached, true);
+  const version = kbRegistryVersion();
+  etag = 'etag-2';
+  cur = await kbGetRegistryEx(env, { fresh: true });
+  assert.ok(kbRegistryVersion() > version);
+  assert.notEqual((await kbSearchDocBodyEx(env, cur.reg, 'needle')).cached, true);
+  assert.equal(await kbSaveRegistry(env, cur.reg, { expectEtag: cur.etag }), true);
+  assert.equal((await kbGetRegistryEx(env)).etag, 'etag-3');
+  const afterWrite = kbRegistryVersion();
+  await kbGetRegistryEx(env, { fresh: true });
+  assert.equal(kbRegistryVersion(), afterWrite);
+  assert.equal(r2.stats.put, 1);
+  assert.equal(r2.stats.getByKey.get('kb/docs/说明.md'), 1);
+});
+
+async function fillBodyCache(env, count, chars = 200000, at = 'v1') {
+  for (let i = 0; i < count; i++) {
+    const key = 'kb/docs/budget' + i + '.md';
+    env.R2.data.set(key, 'A'.repeat(chars));
+    assert.equal((await kbReadDocTextCached(env, key, at)).length, chars);
+  }
+}
+
+test('总字符预算 400 万：21 篇各 20 万字符淘汰最旧一篇', async () => {
+  const r2 = makeR2();
+  const env = { R2: r2 };
+  await fillBodyCache(env, 21);
+  assert.equal(r2.stats.get, 21);
+  for (let i = 1; i < 21; i++) await kbReadDocTextCached(env, 'kb/docs/budget' + i + '.md', 'v1');
+  assert.equal(r2.stats.get, 21, '预算内 20 篇仍命中');
+  await kbReadDocTextCached(env, 'kb/docs/budget0.md', 'v1');
+  assert.equal(r2.stats.get, 22, '超预算的最旧一篇已被淘汰');
+});
+
+test('400 万预算也计算搜索生成的小写副本', async () => {
+  const r2 = makeR2();
+  const env = { R2: r2 };
+  await fillBodyCache(env, 20);
+  await kbSearchDocBodyEx(env, [{ file: 'budget19.md', updated_at: 'v1' }], 'absentword');
+  assert.equal(r2.stats.get, 20, '搜索正文原已缓存');
+  for (let i = 1; i < 20; i++) await kbReadDocTextCached(env, 'kb/docs/budget' + i + '.md', 'v1');
+  assert.equal(r2.stats.get, 20);
+  await kbReadDocTextCached(env, 'kb/docs/budget0.md', 'v1');
+  assert.equal(r2.stats.get, 21, '小写副本占 20 万字符，应淘汰最旧正文');
+});
+
+test('缓存替换不重复占预算，版本不符重新 GET，超大新版本不保留旧缓存', async () => {
+  const r2 = makeR2();
+  const env = { R2: r2 };
+  await fillBodyCache(env, 20);
+  const key = 'kb/docs/budget0.md';
+  r2.data.set(key, 'B'.repeat(200000));
+  assert.equal((await kbReadDocTextCached(env, key, 'v2'))[0], 'B');
+  for (let i = 1; i < 20; i++) await kbReadDocTextCached(env, 'kb/docs/budget' + i + '.md', 'v1');
+  assert.equal(r2.stats.get, 21, '替换后其他 19 篇不能被错误淘汰');
+  r2.data.set(key, 'C'.repeat(210001));
+  assert.equal((await kbReadDocTextCached(env, key, 'v3')).length, 210001);
+  assert.equal((await kbReadDocTextCached(env, key))[0], 'C', '超大替换不能残留旧版本');
+  assert.equal(r2.stats.get, 23);
+});
+
+test('插入时清除过期正文并回收字符预算，不误淘汰仍有效正文', async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  const r2 = makeR2();
+  const env = { R2: r2 };
+  await fillBodyCache(env, 1);
+  now += 1000;
+  await fillBodyCache(env, 20);
+  now += 299001;
+  r2.data.set('kb/docs/new.md', 'B'.repeat(200000));
+  await kbReadDocTextCached(env, 'kb/docs/new.md', 'v1');
+  for (let i = 1; i < 20; i++) await kbReadDocTextCached(env, 'kb/docs/budget' + i + '.md', 'v1');
+  assert.equal(r2.stats.get, 21, '过期项释放预算后，19 篇仍有效正文应全部命中');
+  await kbReadDocTextCached(env, 'kb/docs/budget0.md', 'v1');
+  assert.equal(r2.stats.get, 22, 'TTL 到期正文必须重新 GET');
+});
+
+test('小文档仍受 64 篇容量限制，且各桶正文缓存隔离', async () => {
+  const r2 = makeR2();
+  const env = { R2: r2 };
+  await fillBodyCache(env, 65, 10);
+  await kbReadDocTextCached(env, 'kb/docs/budget64.md', 'v1');
+  assert.equal(r2.stats.get, 65);
+  await kbReadDocTextCached(env, 'kb/docs/budget0.md', 'v1');
+  assert.equal(r2.stats.get, 66);
+  const other = makeR2({ 'kb/docs/budget0.md': '独立桶正文' });
+  assert.equal(await kbReadDocTextCached({ R2: other }, 'kb/docs/budget0.md', 'v1'), '独立桶正文');
+  assert.equal(other.stats.get, 1);
 });

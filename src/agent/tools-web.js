@@ -430,8 +430,7 @@ async function tryJinaFallback(targetUrl, budgetMs) {
 }
 
 // 回退二：Wayback Machine 网页快照。对反爬站点（403/429/JS 墙）常能拿到历史版本。
-async function tryWaybackFallback(targetUrl, budgetMs) {
-  const ctrl = new AbortController();
+async function tryWaybackFallback(targetUrl, budgetMs, ctrl = new AbortController()) {
   const timer = setTimeout(() => ctrl.abort(), Math.max(1500, Math.min(9000, budgetMs)));
   try {
     const api = 'https://archive.org/wayback/available?url=' + encodeURIComponent(targetUrl);
@@ -473,16 +472,20 @@ async function tryWaybackFallback(targetUrl, budgetMs) {
 
 // 回退链：Jina 与 Wayback 并发（串行时最坏要等两条链路各自超时，
 // 403 站点上实测能拖到 10 秒以上）。两者都有结果时优先用 Jina：它是实时正文，
-// Wayback 只是历史快照。
+// Wayback 只是历史快照。Jina 正文足够时立即返回并取消快照，短正文仍等快照兜底。
 async function fallbackExtract(targetUrl, budgetMs) {
   if (budgetMs < 1500) return '';
-  const [jina, wayback] = await Promise.all([
-    tryJinaFallback(targetUrl, budgetMs - 600),
-    tryWaybackFallback(targetUrl, budgetMs - 300),
-  ]);
-  if (jina && jina.length >= 80) return jina;
-  if (wayback) return wayback;
-  return jina || '';
+  const waybackCtrl = new AbortController();
+  const jinaPending = tryJinaFallback(targetUrl, budgetMs - 600);
+  const waybackPending = tryWaybackFallback(targetUrl, budgetMs - 300, waybackCtrl);
+  try {
+    const jina = await jinaPending;
+    if (jina && jina.length >= 80) return jina;
+    const wayback = await waybackPending;
+    return wayback || jina || '';
+  } finally {
+    waybackCtrl.abort();
+  }
 }
 
 function sliceWebPageText(text, offset, pageSize) {

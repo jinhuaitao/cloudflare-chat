@@ -12,8 +12,9 @@ import {
   extractTopic, extractGist, jaccard, memDecayScore, memTokens, memSubjectKey, memNorm,
   memKey, wmKey, ltKey, arKey, memLimits, memBudgets, WM_MAX_ITEMS, WM_PIN_MAX, LT_MAX_ITEMS
 } from '../src/memory/layers.js';
+import { memSnapshot, memMutate } from '../src/memory/store.js';
 import { wmGet, wmRecordTurn, wmPin, wmUnpin, wmClear } from '../src/memory/working.js';
-import { ltGet, ltSave, ltForget, rankLongterm } from '../src/memory/longterm.js';
+import { ltGet, ltSave, ltForget, ltTouch, rankLongterm } from '../src/memory/longterm.js';
 import { arGet, arPush, rankArchive } from '../src/memory/archive.js';
 import {
   memoryLoad, memoryPromptBlock, memorySearchText, memoryReport, memoryStatsText, pickLongterm
@@ -43,7 +44,8 @@ function makeR2(initial = {}) {
     },
     async put(key, value, opts) {
       stats.put += 1;
-      if (opts && opts.onlyIf && opts.onlyIf.etagMatches && etags.get(key) !== opts.onlyIf.etagMatches) {
+      if (opts && opts.onlyIf && ((opts.onlyIf.etagMatches && etags.get(key) !== opts.onlyIf.etagMatches)
+        || (opts.onlyIf.etagDoesNotMatch === '*' && data.has(key)))) {
         stats.casFail += 1;
         return null;
       }
@@ -635,6 +637,210 @@ test('注入跨层去重：已被 L2 事实覆盖的归档不再重复注入', (
   assert.ok(block.includes('讨论过 R2 生命周期规则配置'), '未被覆盖的归档应正常注入');
   const l3Section = block.split('【三层记忆 · L3')[1] || '';
   assert.equal(l3Section.includes('用户的猫叫汤圆'), false, '已被 L2 覆盖的归档不应重复出现');
+});
+
+test('同会话并发写串行复用快照：8 次写只有 1 GET、8 PUT、0 冲突', async () => {
+  const id = 'queued-memory';
+  const env = { R2: makeR2({ [memKey(id)]: JSON.stringify({ v: 2, work: {}, long: [], archive: {} }) }) };
+  const results = await Promise.all(Array.from({ length: 8 }, (_, i) => memMutate(env, id, draft => {
+    draft.long.push({ fact: '并发事实' + i, ts: i });
+  })));
+  assert.ok(results.every(r => r.ok));
+  assert.equal(JSON.parse(env.R2.data.get(memKey(id))).long.length, 8);
+  assert.equal(env.R2.stats.get, 1);
+  assert.equal(env.R2.stats.put, 8);
+  assert.equal(env.R2.stats.casFail, 0);
+});
+
+test('同名会话的缓存与写队列按桶隔离', async () => {
+  const a = { R2: makeR2() };
+  const b = { R2: makeR2() };
+  await Promise.all([
+    memMutate(a, 'same-bucket-id', s => { s.long.push({ fact: '甲桶' }); }),
+    memMutate(b, 'same-bucket-id', s => { s.long.push({ fact: '乙桶' }); })
+  ]);
+  const [left, right] = await Promise.all([memSnapshot(a, 'same-bucket-id'), memSnapshot(b, 'same-bucket-id')]);
+  assert.deepEqual(left.long.map(x => x.fact), ['甲桶']);
+  assert.deepEqual(right.long.map(x => x.fact), ['乙桶']);
+});
+
+test('跨实例首次创建遇到竞争时重读，不覆盖抢先写入者', async () => {
+  const r2 = makeR2();
+  const env = { R2: r2 };
+  const id = 'create-race';
+  const put = r2.put;
+  let first = true;
+  r2.put = async (key, value, opts) => {
+    if (key === memKey(id) && first) {
+      first = false;
+      await put(key, JSON.stringify({ v: 2, work: {}, long: [{ fact: '另一实例' }], archive: {} }));
+    }
+    return put(key, value, opts);
+  };
+  const result = await memMutate(env, id, s => { s.long.push({ fact: '本实例' }); });
+  assert.equal(result.ok, true);
+  assert.deepEqual(JSON.parse(r2.data.get(memKey(id))).long.map(x => x.fact), ['另一实例', '本实例']);
+  assert.equal(r2.stats.casFail, 1);
+});
+
+test('旧键读取失败不创建不完整统一快照，恢复后能重新迁移', async () => {
+  const id = 'legacy-read-failed';
+  const env = { R2: makeR2({ [ltKey(id)]: JSON.stringify([{ fact: '旧的事实', file: 'old.md' }]) }) };
+  const get = env.R2.get;
+  env.R2.get = async (key, opts) => {
+    if (key === ltKey(id)) throw new Error('permission denied');
+    return get(key, opts);
+  };
+  const failed = await memMutate(env, id, s => { s.long.push({ fact: '新事实' }); });
+  assert.equal(failed.ok, false);
+  assert.equal(env.R2.data.has(memKey(id)), false);
+  env.R2.get = get;
+  const recovered = await memMutate(env, id, s => { s.long.push({ fact: '新事实' }); });
+  assert.equal(recovered.ok, true);
+  assert.deepEqual(JSON.parse(env.R2.data.get(memKey(id))).long.map(x => x.fact), ['旧的事实', '新事实']);
+});
+
+test('损坏的统一对象不能当空数据覆盖', async () => {
+  const id = 'invalid-json';
+  const env = { R2: makeR2({ [memKey(id)]: '{incomplete' }) };
+  const result = await memMutate(env, id, s => { s.long.push({ fact: '新事实' }); });
+  assert.equal(result.ok, false);
+  assert.equal(env.R2.stats.put, 0);
+  assert.equal(env.R2.data.get(memKey(id)), '{incomplete');
+});
+
+test('写失败不会缓存成成功，重试相同 pin 会真实落盘', async () => {
+  const env = { R2: makeR2() };
+  const id = 'retry-pin';
+  const put = env.R2.put;
+  env.R2.put = async () => { throw new Error('permission denied'); };
+  assert.equal((await wmPin(env, id, '本次使用中文')).ok, false);
+  env.R2.put = put;
+  const result = await wmPin(env, id, '本次使用中文');
+  assert.equal(result.ok, true);
+  assert.equal(result.persisted, true);
+  assert.equal(JSON.parse(env.R2.data.get(memKey(id))).work.pins[0].text, '本次使用中文');
+});
+
+test('写队列异常后释放且不同会话不会互相阻塞', async () => {
+  const env = { R2: makeR2() };
+  const started = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const put = env.R2.put;
+  env.R2.put = async (key, value, opts) => {
+    if (key === memKey('slow-queue')) { started.resolve(); await release.promise; }
+    return put(key, value, opts);
+  };
+  const slow = memMutate(env, 'slow-queue', s => { s.long.push({ fact: '慢写入' }); });
+  try {
+    await started.promise;
+    const fast = await memMutate(env, 'fast-queue', s => { s.long.push({ fact: '快写入' }); });
+    assert.equal(fast.ok, true);
+  } finally { release.resolve(); await slow; }
+  await assert.rejects(memMutate(env, 'fast-queue', () => { throw new Error('mutator failed'); }), /mutator failed/);
+  assert.equal((await memMutate(env, 'fast-queue', s => { s.long.push({ fact: '恢复写入' }); })).ok, true);
+});
+
+test('迁移遇到别的实例先创建统一对象时保留新对象', async () => {
+  const id = 'migration-create-race';
+  const env = { R2: makeR2({ [ltKey(id)]: JSON.stringify([{ fact: '旧副本', file: 'old.md' }]) }) };
+  const put = env.R2.put;
+  let first = true;
+  env.R2.put = async (key, value, opts) => {
+    if (key === memKey(id) && first) {
+      first = false;
+      await put(key, JSON.stringify({ v: 2, work: {}, long: [{ fact: '最新记忆', file: 'new.md' }], archive: {} }));
+    }
+    return put(key, value, opts);
+  };
+  assert.deepEqual((await memSnapshot(env, id)).long.map(x => x.fact), ['最新记忆']);
+  assert.equal(env.R2.stats.casFail, 1);
+  assert.equal(env.R2.data.has(ltKey(id)), true);
+});
+
+test('PUT 期间新增命中保留到下一次写入，无额外 PUT', async () => {
+  const id = 'touch-during-write';
+  const env = { R2: makeR2() };
+  await ltSave(env, id, '用户喜欢喝茶');
+  const started = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const put = env.R2.put;
+  env.R2.put = async (key, value, opts) => {
+    if (key === memKey(id)) { started.resolve(); await release.promise; }
+    return put(key, value, opts);
+  };
+  const writes = env.R2.stats.put;
+  const pending = wmPin(env, id, '本次使用中文');
+  try {
+    await started.promise;
+    await ltTouch(env, id, ['用户喜欢喝茶']);
+  } finally { release.resolve(); await pending; }
+  assert.equal((await memSnapshot(env, id)).long[0].hits, 1);
+  assert.equal(env.R2.stats.put - writes, 1);
+  await wmPin(env, id, '本次答案简洁');
+  assert.equal(JSON.parse(env.R2.data.get(memKey(id))).long[0].hits, 1);
+});
+
+test('重复记忆更新失败也必须报告未保存', async () => {
+  const env = { R2: makeR2() };
+  const id = 'duplicate-failure';
+  await ltSave(env, id, '用户喜欢喝茶');
+  env.R2.put = async () => { throw new Error('permission denied'); };
+  const result = await ltSave(env, id, '用户喜欢喝茶');
+  assert.match(result, /失败/);
+  assert.equal((await memSnapshot(env, id)).long[0].hits, 0);
+});
+
+test('PUT 期间过期的旧读取不会回填缓存或被写后读取复用', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1800000000000 });
+  const id = 'late-memory-read';
+  const env = { MEM_CACHE_TTL_MS: '5000', R2: makeR2({ [memKey(id)]: JSON.stringify({ v: 2, work: {}, long: [], archive: {} }) }) };
+  await memSnapshot(env, id);
+  const putStarted = Promise.withResolvers();
+  const readStarted = Promise.withResolvers();
+  const releasePut = Promise.withResolvers();
+  const releaseRead = Promise.withResolvers();
+  const put = env.R2.put;
+  const get = env.R2.get;
+  env.R2.put = async (key, value, opts) => {
+    putStarted.resolve();
+    await releasePut.promise;
+    return put(key, value, opts);
+  };
+  env.R2.get = async (key, opts) => {
+    const obj = await get(key, opts);
+    readStarted.resolve();
+    await releaseRead.promise;
+    return obj;
+  };
+  const writing = wmPin(env, id, '已保存的新固定项');
+  let oldRead;
+  try {
+    await putStarted.promise;
+    t.mock.timers.setTime(1800000006000);
+    oldRead = memSnapshot(env, id);
+    await readStarted.promise;
+    releasePut.resolve();
+    assert.equal((await writing).persisted, true);
+    const afterWrite = memSnapshot(env, id);
+    releaseRead.resolve();
+    assert.equal((await afterWrite).work.pins[0]?.text, '已保存的新固定项');
+    await oldRead;
+    assert.equal((await memSnapshot(env, id)).work.pins[0]?.text, '已保存的新固定项');
+  } finally {
+    releasePut.resolve();
+    releaseRead.resolve();
+    await writing;
+    if (oldRead) await oldRead;
+  }
+});
+
+test('forget 读取失败时报告存储失败而非无匹配', async () => {
+  const env = { R2: makeR2() };
+  env.R2.get = async () => { throw new Error('permission denied'); };
+  const result = await ltForget(env, 'forget-read-failure', '喝茶');
+  assert.match(result.persistError, /失败/);
+  assert.equal(env.R2.stats.put, 0);
 });
 
 test('统一键同样防路径穿越', () => {

@@ -187,6 +187,9 @@ export async function ltSave(env, chatId, fact, opts) {
     }
   });
 
+  if (env && env.R2 && !res.ok) {
+    return '记忆写入 R2 失败，本次修改未确认保存；请检查 R2 绑定与权限后重试：' + text;
+  }
   const replNote = replaced ? '（本条自动覆盖了旧记忆《' + oldFact + '》）' : '';
   if (isDup) {
     return '已记住过，无需重复保存（已把命中次数提到 ' + dupHits + ' 次）：' + text;
@@ -196,15 +199,12 @@ export async function ltSave(env, chatId, fact, opts) {
     return '已暂存于内存（R2 未绑定，Worker 重启后会丢失；按 README 第二步绑定 R2 后可永久记住）'
       + replNote + '：' + text;
   }
-  if (!res.ok) {
-    return '记忆写入 R2 失败，已暂存于内存' + replNote + '；请检查 R2 绑定与权限后重试：' + text;
-  }
 
   // md 镜像在索引落盘后写（索引是唯一可信源，镜像只是可读副本）
   const okMd = await storePutChecked(env, kbMemDir(chatId) + entry.file,
     kbMemMarkdown(chatId, text, entry.ts, { kind, weight }));
   if (!okMd) {
-    return '记忆写入 R2 失败，已暂存于内存' + replNote + '；请检查 R2 绑定与权限后重试：' + text;
+    return '记忆索引已保存，但 Markdown 镜像写入失败' + replNote + '；请检查 R2 绑定与权限：' + text;
   }
   // 索引落盘成功后才清理被覆盖条目的 md 镜像
   if (replacedFiles.length) await kbDeleteKeys(env, replacedFiles);
@@ -232,10 +232,10 @@ export async function ltForget(env, chatId, keyword) {
     }
     draft.long = kept;
   });
-  if (!removed) return { removed: 0 };
   if (env && env.R2 && !res.ok) {
-    return { removed: 0, persistError: '记忆索引写入 R2 失败，未删除任何记忆；请检查 R2 绑定与权限后重试' };
+    return { removed: 0, persistError: '记忆索引读取或写入 R2 失败，未确认删除；请检查 R2 绑定与权限后重试' };
   }
+  if (!removed) return { removed: 0 };
   if (files.length) await kbDeleteKeys(env, files);
   return { removed };
 }

@@ -20,9 +20,26 @@ let cachedRegistryBucket = null;
 let cachedRegistryExp = 0;
 // 注册表当前版本在 R2 里的 etag：条件写（CAS）的前提，写路径用它判断"读到之后有没有人改过"
 let cachedRegistryEtag = '';
-// 注册表版本号：每次成功写入 +1，供正文检索缓存判断结果是否过期
+// 成功写入或回源发现内容 / etag 改变时递增，供正文检索缓存判断结果是否过期。
 let kbRegVersion = 0;
 function kbRegistryVersion() { return kbRegVersion; }
+
+// 核对成功才记住 30 秒；失败不记忆。同桶并发核对共享一次 list / 重建。
+const kbVerification = new WeakMap();
+function verificationFor(env) {
+  let state = kbVerification.get(env.R2);
+  if (!state) {
+    state = { exp: 0, inflight: null, revision: 0 };
+    kbVerification.set(env.R2, state);
+  }
+  return state;
+}
+function kbExpireRegistryVerification(env) {
+  if (!env || !env.R2) return;
+  const state = verificationFor(env);
+  state.exp = 0;
+  state.revision += 1;
+}
 
 // 文件名由标题清洗得到（去掉 / \ : * ? " < > | # 与控制字符，中文保留；
 // 空格直接去掉——避免"甲骨文云 ARM"与"甲骨文云ARM"生成两个文件），超长截断；
@@ -76,16 +93,19 @@ function kbFmtTags(tags) {
 async function kbListDocObjects(env) {
   const objs = [];
   if (!env.R2) return objs;
-  try {
-    let cursor;
-    do {
-      const listed = await storeList(env, { prefix: KB_DOCS_PREFIX, limit: 1000, cursor: cursor });
-      for (const o of (listed.objects || [])) {
-        if (o.key !== KB_REGISTRY_KEY) objs.push(o);
-      }
-      cursor = listed.truncated ? listed.cursor : undefined;
-    } while (cursor);
-  } catch (e) {}
+  let cursor;
+  do {
+    const listed = await storeList(env, { prefix: KB_DOCS_PREFIX, limit: 1000, cursor: cursor });
+    // 任一页失败都必须丢弃部分列表，不能把它当作空库或完整快照重建。
+    if (!listed || listed.failed || !Array.isArray(listed.objects)
+      || (listed.truncated && (!listed.cursor || listed.cursor === cursor))) {
+      throw new Error('知识库文档列表读取失败');
+    }
+    for (const o of listed.objects) {
+      if (o.key !== KB_REGISTRY_KEY) objs.push(o);
+    }
+    cursor = listed.truncated ? listed.cursor : undefined;
+  } while (cursor);
   return objs;
 }
 // 从现有文件重建注册表（读每篇前 4096 字节的 frontmatter），并写回。
@@ -94,6 +114,8 @@ async function kbListDocObjects(env) {
 //          并从 frontmatter 还原 fp / version，让重建后的索引仍能去重与显示版本。
 async function kbRebuildRegistry(env, objs) {
   if (!env.R2) return [];
+  const state = verificationFor(env);
+  const revision = state.revision;
   const list = Array.isArray(objs) ? objs : await kbListDocObjects(env);
   const reg = await mapLimit(list, 8, async (o) => {
     let fm = {};
@@ -118,7 +140,8 @@ async function kbRebuildRegistry(env, objs) {
     if (ver > 0) entry.version = ver;
     return entry;
   });
-  await kbSaveRegistry(env, reg);
+  const ok = await kbSaveRegistry(env, reg, { verified: true });
+  if (ok && state.revision === revision) state.exp = Date.now() + KB_REG_CACHE_TTL_MS;
   return reg.slice();
 }
 
@@ -139,31 +162,46 @@ function kbTakeRepairCount() {
   return n;
 }
 
-async function kbVerifyRegistry(env, reg) {
+async function kbVerifyRegistry(env, reg, verify = true) {
   const safe = Array.isArray(reg) ? reg : [];
   if (!env || !env.R2) return { reg: safe, repaired: 0 };
-  let objs = null;
-  try { objs = await kbListDocObjects(env); } catch (e) { objs = null; }
-  // list 失败时宁可用旧索引，也不能把好索引重建没了
-  if (!objs) return { reg: safe, repaired: 0 };
+  const state = verificationFor(env);
+  if (state.inflight) return state.inflight;
+  if (verify === 'auto' && Date.now() < state.exp) return { reg: safe, repaired: 0 };
+  const revision = state.revision;
+  const pending = (async () => {
+    let objs;
+    try { objs = await kbListDocObjects(env); } catch (e) {
+      // list 失败时宁可用旧索引，也不能把好索引重建没了。
+      return { reg: safe, repaired: 0, failed: true };
+    }
+    const files = new Set(objs.map(o => String(o.key).slice(KB_DOCS_PREFIX.length)));
+    const regFiles = new Set(safe.map(e => e && e.file).filter(Boolean));
+    // null 表示索引缺失 / 损坏：即便真实文件为空也应生成合法索引。
+    let drift = !Array.isArray(reg) || files.size !== regFiles.size;
+    if (!drift) { for (const f of files) { if (!regFiles.has(f)) { drift = true; break; } } }
+    if (!drift) {
+      if (state.revision === revision) state.exp = Date.now() + KB_REG_CACHE_TTL_MS;
+      return { reg: safe, repaired: 0 };
+    }
 
-  const files = new Set(objs.map(o => String(o.key).slice(KB_DOCS_PREFIX.length)));
-  const regFiles = new Set(safe.map(e => e && e.file).filter(Boolean));
-  let drift = files.size !== regFiles.size;
-  if (!drift) { for (const f of files) { if (!regFiles.has(f)) { drift = true; break; } } }
-  if (!drift) { for (const f of regFiles) { if (!files.has(f)) { drift = true; break; } } }
-  if (!drift) return { reg: safe, repaired: 0 };
-
-  let repaired = 0;
-  for (const f of files) if (!regFiles.has(f)) repaired += 1;
-  const rebuilt = await kbRebuildRegistry(env, objs);
-  if (repaired > 0) lastRepair += repaired;
-  return { reg: rebuilt, repaired: repaired };
+    let repaired = 0;
+    for (const f of files) if (!regFiles.has(f)) repaired += 1;
+    const rebuilt = await kbRebuildRegistry(env, objs);
+    // list 期间发生本地写删时，不能让较旧的核对重新延长有效期。
+    if (state.revision !== revision) state.exp = 0;
+    if (Array.isArray(reg) && repaired > 0) lastRepair += repaired;
+    return { reg: rebuilt, repaired: repaired };
+  })();
+  state.inflight = pending;
+  try { return await pending; } finally {
+    if (state.inflight === pending) state.inflight = null;
+  }
 }
 
 // opts.fresh：跳过 30 秒内存缓存，直接读 R2。写路径必须用（否则会覆盖别的实例刚写入的条目）。
-// opts.verify：读完再和实际文件核对一次，不一致就重建。
-// 另外：注册表为空但 kb/docs/ 下有文件时，无论是否传 verify 都会自动核对修复。
+// opts.verify：true 强制核对；'auto' 仅在最近 30 秒未成功核对时核对，不一致就重建。
+// 空注册表默认走 auto，既能发现外部新增，也不必每次读取都 list。
 //
 // v7.20.0：读路径带出 etag，写路径改「条件写」——
 // 旧版为了防丢更新，每次 save 都要 verify（= 一次 R2 list + 漂移时读全部文档头），
@@ -176,8 +214,8 @@ async function kbGetRegistryEx(env, opts) {
   if (!o.fresh && cachedRegistry && cachedRegistryBucket === env.R2 && now < cachedRegistryExp) {
     const hit = cachedRegistry.slice();
     if (o.verify || !hit.length) {
-      const r = await kbVerifyRegistry(env, hit);
-      return { reg: r.reg, etag: cachedRegistryEtag };
+      const r = await kbVerifyRegistry(env, hit, o.verify === true ? true : 'auto');
+      return { reg: r.reg.slice(), etag: cachedRegistryBucket === env.R2 ? cachedRegistryEtag : '', failed: r.failed };
     }
     return { reg: hit, etag: cachedRegistryEtag };
   }
@@ -186,26 +224,38 @@ async function kbGetRegistryEx(env, opts) {
     // 读失败 ≠ 索引不存在：有上一份缓存就先顶着用，绝不因为一次抖动就去重建索引
     if (obj.failed) {
       if (cachedRegistry && cachedRegistryBucket === env.R2) {
-        return { reg: cachedRegistry.slice(), etag: cachedRegistryEtag };
+        return { reg: cachedRegistry.slice(), etag: cachedRegistryEtag, failed: true };
       }
+      return { reg: [], etag: '', failed: true };
     } else if (obj.text) {
       const p = JSON.parse(obj.text);
       if (Array.isArray(p)) {
+        if (cachedRegistryBucket !== env.R2 || !cachedRegistry
+          || cachedRegistryEtag !== (obj.etag || '')
+          || JSON.stringify(cachedRegistry) !== JSON.stringify(p)) {
+          kbRegVersion += 1;
+          if (cachedRegistryBucket === env.R2 && cachedRegistry) kbExpireRegistryVerification(env);
+        }
         cachedRegistry = p.slice();
         cachedRegistryBucket = env.R2;
         cachedRegistryExp = Date.now() + KB_REG_CACHE_TTL_MS;
         cachedRegistryEtag = obj.etag || '';
         if (o.verify || !p.length) {
-          const r = await kbVerifyRegistry(env, p.slice());
-          return { reg: r.reg, etag: cachedRegistryEtag };
+          const r = await kbVerifyRegistry(env, p.slice(), o.verify === true ? true : 'auto');
+          return { reg: r.reg.slice(), etag: cachedRegistryBucket === env.R2 ? cachedRegistryEtag : '', failed: r.failed };
         }
         return { reg: p.slice(), etag: cachedRegistryEtag };
       }
     }
   } catch (e) {}
-  // 缺失或损坏 → 自动重建（自愈）
-  const rebuilt = await kbRebuildRegistry(env);
-  return { reg: rebuilt, etag: cachedRegistryEtag };
+  // 缺失或损坏 → 自动重建（自愈）；失败时保留上一份缓存，不写空索引。
+  const r = await kbVerifyRegistry(env, null);
+  const sameBucket = cachedRegistryBucket === env.R2;
+  return {
+    reg: r.failed && sameBucket && cachedRegistry ? cachedRegistry.slice() : r.reg.slice(),
+    etag: sameBucket ? cachedRegistryEtag : '',
+    failed: r.failed,
+  };
 }
 
 async function kbGetRegistry(env, opts) {
@@ -219,6 +269,8 @@ async function kbGetRegistry(env, opts) {
 async function kbSaveRegistry(env, reg, opts) {
   if (!env || !env.R2) return false;
   const o = opts || {};
+  // verified 仅供按完整文件列表重建使用；普通写（包括失败）使自动核对过期。
+  if (!o.verified) kbExpireRegistryVerification(env);
   try {
     const list = Array.isArray(reg) ? reg.slice() : [];
     const body = JSON.stringify(list);
@@ -234,6 +286,7 @@ async function kbSaveRegistry(env, reg, opts) {
       cachedRegistry = list;
       cachedRegistryBucket = env.R2;
       cachedRegistryExp = Date.now() + KB_REG_CACHE_TTL_MS;
+      cachedRegistryEtag = res.etag || '';
       kbRegVersion += 1;
       return true;
     }
@@ -269,6 +322,7 @@ async function kbMutateRegistry(env, mutate, opts) {
   for (let i = 0; i < tries; i++) {
     if (!seed) {
       const cur = await kbGetRegistryEx(env, { fresh: true });
+      if (cur.failed) return { ok: false, reg: cur.reg };
       seed = cur.reg;
       etag = cur.etag;
     }
@@ -339,6 +393,7 @@ export {
   kbListDocObjects,
   kbRebuildRegistry,
   kbVerifyRegistry,
+  kbExpireRegistryVerification,
   kbTakeRepairCount,
   kbGetRegistry,
   kbGetRegistryEx,
