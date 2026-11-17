@@ -169,18 +169,11 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
   // v7.10.0：原来是"一次读长期记忆 + 一次读注册表"，现在 L1/L2/L3 三层在 memoryLoad
   // 内部并行读取，外层仍然只占一个等待位——多读两层不等于多等两轮。
   // v7.13.0：人格也走同一个等待位，命中 L1 缓存时零成本，冷缓存时与另外两读重叠。
-  // 历史不在这里读：TG/微信 handler 已经把它和"模型选择 / Agent 开关"放在同一批并发里，
-  // 挪进来只是换一个等待位，不会少一个往返。
-  //
-  // opts.prefetch：handler 在决定走 Agent 之后、发占位消息之前就把这三读发出去了。
-  // 那两条 Telegram 网络往返（sendChatAction + sendMessage）足够覆盖它们，
-  // 到这里 await 基本已经就绪 —— 冷启动的等待位从 2 个降到 1 个。
-  const pre = (opts && opts.prefetch) || null;
   const r2BudgetMs = Math.max(500, Math.min(3000, (opts && opts.r2BudgetMs) || 1500));
   const [memoryBundle, kbDocs, savedPersona] = await Promise.all([
-    withTimeout(pre && pre.memory ? pre.memory : memoryLoad(env, chatId, query, { readOnly: kbReadOnly }), r2BudgetMs, null),
-    withTimeout(pre && pre.kbDocs ? pre.kbDocs : kbGetRegistry(env), r2BudgetMs, null),
-    withTimeout(pre && pre.persona ? pre.persona : agentGetPersona(env, chatId), r2BudgetMs, 'auto')
+    withTimeout(memoryLoad(env, chatId, query, { readOnly: kbReadOnly }), r2BudgetMs, null),
+    withTimeout(kbGetRegistry(env), r2BudgetMs, null),
+    withTimeout(agentGetPersona(env, chatId), r2BudgetMs, 'auto')
   ]);
   const hasKbDocs = Array.isArray(kbDocs) ? kbDocs.length > 0 : undefined;
   // 显式指定（本次调用参数）优先，其次是用户固定的人格，最后按提问自动路由。

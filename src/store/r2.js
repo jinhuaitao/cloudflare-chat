@@ -131,30 +131,28 @@ async function storePutChecked(env, key, value, opts) {
 }
 
 // 条件写（compare-and-set）：只有 R2 里的对象 etag 仍是 expectEtag 时才写入。
-// 返回 { ok, conflict, cas }：
-//   · ok=true            写入成功（cas=true 表示真的走了条件写）
+// 返回 { ok, conflict, cas, etag }：
+//   · ok=true            写入成功（cas=true 表示真的走了条件写），etag 为新对象的 etag
 //   · ok=false, conflict 预条件失败：别人先改了，调用方应重读后重算
 //   · ok=false, cas=false 运行时不支持条件写时已退化为普通写（不会丢数据，只是失去互斥）
+// expectEtag 为空时走普通写（首次创建），同样带回新 etag 供后续 CAS 使用。
 async function storePutCas(env, key, value, expectEtag, opts) {
-  if (!env || !env.R2) return { ok: false, conflict: false, cas: false };
+  if (!env || !env.R2) return { ok: false, conflict: false, cas: false, etag: '' };
   const body = String(value);
-  if (!expectEtag) {
-    const ok = await storePutChecked(env, key, body, opts);
-    return { ok, conflict: false, cas: false };
-  }
   r2Stats.put += 1;
   try {
-    const res = await env.R2.put(key, body, Object.assign({}, opts, { onlyIf: { etagMatches: expectEtag } }));
+    const putOpts = expectEtag ? Object.assign({}, opts, { onlyIf: { etagMatches: expectEtag } }) : opts;
+    const res = await withRetry(() => env.R2.put(key, body, putOpts));
     // 真实 R2 在预条件失败时返回 null；内存桶（测试）返回 undefined 视为成功
     if (res === null) {
       r2Stats.conflict += 1;
-      return { ok: false, conflict: true, cas: true };
+      return { ok: false, conflict: true, cas: true, etag: '' };
     }
-    return { ok: true, conflict: false, cas: true };
+    return { ok: true, conflict: false, cas: !!expectEtag, etag: String((res && res.etag) || '') };
   } catch (e) {
     // onlyIf 不被支持（老运行时 / 参数非法）→ 退化成普通写，绝不让优化变成丢数据
     const ok = await storePutChecked(env, key, body, opts);
-    return { ok, conflict: false, cas: false };
+    return { ok, conflict: false, cas: false, etag: '' };
   }
 }
 

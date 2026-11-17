@@ -201,17 +201,10 @@ test('deferOrAwait：有 ctx 挂 waitUntil 立即返回，任务仍跑完', asyn
 test('deferOrAwait：无 ctx 时并行等待（总时长取 max 而非 sum）', async () => {
   const { deferOrAwait } = await import('../src/utils.js');
   const task = (ms) => new Promise(res => setTimeout(res, ms));
-  // 先在同一台机器上量一次串行基线，再量并行，只比较两者的相对关系。
-  // 旧版写死「< 70ms」：本机或 CI 负载一高，定时器整体漂移就会偶发报红。
-  const s0 = Date.now();
-  await task(40);
-  await task(40);
-  const serial = Date.now() - s0;
   const t0 = Date.now();
   await deferOrAwait(null, [task(40), task(40)]);
-  const parallel = Date.now() - t0;
-  assert.ok(parallel < serial * 0.75,
-    '并行应明显快于串行（串行 ' + serial + 'ms，并行 ' + parallel + 'ms）');
+  const cost = Date.now() - t0;
+  assert.ok(cost < 70, '两个 40ms 任务串行要 80ms+，并行应明显小于（实测 ' + cost + 'ms）');
 });
 
 test('收尾写入延后已接到 TG / 微信双端的四条回复路径', async () => {

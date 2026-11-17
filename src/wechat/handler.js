@@ -20,7 +20,7 @@ import { storeGet, storePut, storePutChecked, storeDelete } from '../store/r2.js
 import { getChannelConfig, resolveModelKey, buildAIRequest } from '../channel.js';
 import { tgTrimHistory, tgGetHistory, tgSaveHistory, tgClearHistory } from '../tg-history.js';
 import { agentForgetMemory } from '../agent/memory.js';
-import { memoryReport, memoryClearSession, memoryStats, memoryLoad } from '../memory/index.js';
+import { memoryReport, memoryClearSession, memoryStats } from '../memory/index.js';
 import { agentGetMode, agentSetMode, agentGetPersona, agentSetPersona } from '../agent/mode.js';
 import {
   PERSONA_COUNT, formatPersonaList, formatPersonaBadge, formatRouteWhy, getPersona, personaById,
@@ -1162,16 +1162,6 @@ async function processWechatMessage(env, creds, rawMsg, ctx) {
       tgGetHistory(env, chatId),
     ]);
     const useAgent = !isDirectImageModel && agentModeOn;
-    // 预取 Agent 分支要用的三份状态（三层记忆 / 知识库索引 / 人格）。
-    // 从确定走 Agent 到真正调用之间还有断点读取、typing 心跳等网络往返，
-    // 足够把这三读跑完；等进到 loop 里再读就是白等一个 RTT。
-    const agentPrefetch = useAgent
-      ? {
-          memory: memoryLoad(env, chatId, userText, {}).catch(() => null),
-          kbDocs: kbGetRegistry(env).catch(() => null),
-          persona: agentGetPersona(env, chatId).catch(() => 'auto'),
-        }
-      : null;
     const wantResume = useAgent && !multimodalContent && userText.trim() === '继续';
     let resumeState = null;
     if (wantResume) resumeState = await agentLoadResumeState(env, chatId);
@@ -1216,7 +1206,6 @@ async function processWechatMessage(env, creds, rawMsg, ctx) {
         resumeKey: tgAgentResumeKey(chatId),
         origUserText: historyUserText,
         ctx: ctx || null,
-        prefetch: agentPrefetch,
       };
       const runAgentTurn = (allowTools) => {
         if (resumeState) {

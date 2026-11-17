@@ -19,6 +19,12 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 
 // 应用版本号（/help 显示；发版时同步 package.json 与 README.md 的版本号，
 // CI 会用 npm run check 校验三处一致，防止文档与代码再次脱节）
+// 7.20.0：R2 提速 + 三层记忆能力升级——L1/L2/L3 合并为单对象 kb/mem3/<chatId>.json
+//         （稳态冷读 3 次 GET → 1 次；每轮要点、溢出沉淀、L2 淘汰归档、命中计数
+//         同一次 CAS 写入，原子且不丢）；写路径全部 etag 条件写，跨 isolate 冲突
+//         重读重算不互相覆盖；旧三键 + 两代 L2 旧键一次性并行迁移（保留回滚）；
+//         读失败不再拿空快照覆盖写；hits 搭每轮写入免费落盘（重启不清零）；
+//         L1 检索升级分词打分（词序/插字查询不漏检）；L3 注入与 L2/L1 跨层去重。
 // 7.19.0：回复关键路径减负——历史保存 / 断点清理从回复发送前的串行 await 改为
 //         deferOrAwait（有 ctx 挂 waitUntil 后台跑，无 ctx 并行等待），TG / 微信
 //         四条回复路径统一接入；微信诊断日志落盘按 30 秒合并（error/login 保持立即），
@@ -81,7 +87,7 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain;charset=UTF-8' };
 //        断点起点修正、流式读取不阻塞、抓取失败语义统一）。
 // 7.5.0：Agent 内核加固（工具并发闸门、预算感知超时、步数感知收束、双保险空转熔断、
 //        历史轮次压缩）+ 工具箱新增 JSON/正则动作 + 全量回归测试。
-const APP_VERSION = '7.21.0';
+const APP_VERSION = '7.20.0';
 const PNG_HEADERS = {
   'Content-Type': 'image/png',
   'Cache-Control': 'public, max-age=86400',

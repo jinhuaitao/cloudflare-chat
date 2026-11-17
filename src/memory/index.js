@@ -9,8 +9,8 @@
 
 import { wmGet, wmRecordTurn, wmPin, wmUnpin, wmClear, wmDigestLines } from './working.js';
 import { ltGet, ltSave, ltForget, ltTouch, ltSearch, rankLongterm, MEM_KIND_LABEL } from './longterm.js';
-import { arGet, arSearch, rankArchive, arPush, arClear } from './archive.js';
-import { clipText, memDecayScore, memLimits, memBudgets, MEM_PROMPT_BUDGET } from './layers.js';
+import { arGet, arSearch, rankArchive, arPush } from './archive.js';
+import { clipText, memDecayScore, memLimits, memBudgets, memTokens, memNorm, MEM_PROMPT_BUDGET } from './layers.js';
 
 // 三层各自的注入预算（字符）。默认加起来 5500，占 AGENT_CONTEXT_BUDGET(24000) 的 23%，
 // 与工具输出预算互不冲突；真到极限时 trimAgentMessages 还会再兜一层。
@@ -23,8 +23,9 @@ const RECALL_INTENT = /(之前|上次|以前|那次|曾经|还记得|记得|刚�
 // ---------- 加载 ----------
 export async function memoryLoad(env, chatId, query, opts) {
   const o = opts || {};
-  // Web 只读端不读 L2/L3：它的 chatId 是 web_<sid>，本来就查不到别人的记忆，
-  // 少两次 R2 往返还能让首字更快。L1 仍然读（会话内脉络对网页端同样有用）。
+  // v7.20.0：三层同存于 kb/mem3/<chatId>.json 单对象，wmGet/ltGet/arGet 共享
+  // 同一次加载（冷读 1 次 GET）。只读端仍不注入 L2/L3：web_<sid> 的隔离靠的是
+  // 注入范围而不是少读数据——别人的记忆即使顺带读到了也不进提示词。
   const skipDeep = !!o.readOnly;
   const [working, longterm, archive] = await Promise.all([
     wmGet(env, chatId).catch(() => ({ items: [], pins: [] })),
@@ -36,7 +37,8 @@ export async function memoryLoad(env, chatId, query, opts) {
   const ar = archive || { items: [] };
   const budgets = memBudgets(memLimits(env).promptBudget);
 
-  // 命中计数只更新内存缓存（不落盘），让"常被用到的事实"在后续淘汰中更抗跌
+  // 命中计数只更新内存缓存，搭每轮 L1 写入免费落盘（store.js 合并单对象的红利），
+  // 让"常被用到的事实"在后续淘汰中更抗跌，且重启不再清零
   if (lt.length) {
     try {
       const picked = pickLongterm(lt, query, budgets.L2);
@@ -95,17 +97,15 @@ export function memoryPromptBlock(bundle, query) {
 
   // L2
   const lt = Array.isArray(bundle.longterm) ? bundle.longterm : [];
-  if (lt.length) {
-    const picked = pickLongterm(lt, q, budget.L2);
-    if (picked.length) {
-      const lines = picked.map(m => {
-        const label = m.kind && m.kind !== 'fact' ? '[' + (MEM_KIND_LABEL[m.kind] || m.kind) + '·权重' + (m.weight || 3) + '] ' : '';
-        return '- ' + label + m.fact;
-      });
-      blocks.push('【三层记忆 · L2 用户长期记忆（持久，共' + lt.length + '条'
-        + (picked.length < lt.length ? '，按相关性与强度注入' + picked.length + '条' : '') + '）】\n'
-        + lines.join('\n'));
-    }
+  const pickedLt = lt.length ? pickLongterm(lt, q, budget.L2) : [];
+  if (pickedLt.length) {
+    const lines = pickedLt.map(m => {
+      const label = m.kind && m.kind !== 'fact' ? '[' + (MEM_KIND_LABEL[m.kind] || m.kind) + '·权重' + (m.weight || 3) + '] ' : '';
+      return '- ' + label + m.fact;
+    });
+    blocks.push('【三层记忆 · L2 用户长期记忆（持久，共' + lt.length + '条'
+      + (pickedLt.length < lt.length ? '，按相关性与强度注入' + pickedLt.length + '条' : '') + '）】\n'
+      + lines.join('\n'));
   }
 
   // L3
@@ -117,6 +117,16 @@ export function memoryPromptBlock(bundle, query) {
     if (!hits.length && RECALL_INTENT.test(String(q || ''))) {
       hits = arItems.slice(-2).reverse();
     }
+    // 跨层去重：已被注入的 L2 事实 / L1 要点覆盖的归档不再重复注入。
+    // 典型场景是「被淘汰的旧事实后来又被重新记住」——同一句话在 L2 与 L3 各出现一次，
+    // 既浪费预算又可能让模型误以为两条独立证据。归一化后做包含判断（保守：短文本不去重）。
+    const covered = pickedLt.map(m => memNorm(m.fact));
+    for (const it of (wm.items || [])) covered.push(memNorm(it.t + (it.g || '')));
+    hits = hits.filter(h => {
+      const n = memNorm(String(h.text || '').replace(/^\[[^\]]*\]\s*/, '')).replace(/→/g, '');
+      if (n.length < 6) return true;
+      return !covered.some(f => f.length >= 6 && (n.indexOf(f) !== -1 || f.indexOf(n) !== -1));
+    });
     if (hits.length) {
       const lines = hits.map(h => '- ' + h.text + (h.ts ? '（' + fmtDay(h.ts) + '）' : ''));
       blocks.push('【三层记忆 · L3 历史归档（自动沉淀，共' + arItems.length + '条，命中' + hits.length + '条）】\n'
@@ -153,13 +163,19 @@ export async function memorySearchText(env, chatId, query) {
   const qLower = q.toLowerCase();
   const out = [];
 
-  // L1：要点与固定项做子串匹配（L1 只有 12 条，不值得上分词）
-  const l1 = [];
+  // L1：整句子串命中优先，其次按分词打分（与 L2/L3 同一套 memTokens 口径）。
+  // 旧版纯子串匹配会漏掉「R2 生命周期」这类词序/插字查询（原文是「R2 的生命周期规则」），
+  // 分词后按命中词长度打分，召回与排序口径和另外两层一致。
+  const qTokens = [...new Set(memTokens(q))].filter(t => t.length >= 2);
+  const l1Hits = [];
   for (const it of (wm.items || [])) {
-    if ((it.t + ' ' + (it.g || '')).toLowerCase().indexOf(qLower) !== -1) {
-      l1.push('- 问：' + it.t + (it.g ? '｜答：' + it.g : ''));
-    }
+    const text = (it.t + ' ' + (it.g || '')).toLowerCase();
+    let score = text.indexOf(qLower) !== -1 ? 1000 : 0;
+    for (const t of qTokens) if (text.indexOf(t) !== -1) score += t.length;
+    if (score > 0) l1Hits.push({ score, line: '- 问：' + it.t + (it.g ? '｜答：' + it.g : '') });
   }
+  l1Hits.sort((a, b) => b.score - a.score);
+  const l1 = l1Hits.slice(0, 5).map(h => h.line);
   for (const p of (wm.pins || [])) {
     if (String(p.text || '').toLowerCase().indexOf(qLower) !== -1) l1.push('- （固定）' + p.text);
   }
@@ -291,6 +307,6 @@ export async function memoryClearSession(env, chatId) {
 }
 
 export {
-  wmGet, ltGet, arGet, ltSave, ltForget, ltSearch, arSearch, arPush, arClear,
+  wmGet, ltGet, arGet, ltSave, ltForget, ltSearch, arSearch, arPush,
   rankLongterm, rankArchive, MEM_KIND_LABEL
 };

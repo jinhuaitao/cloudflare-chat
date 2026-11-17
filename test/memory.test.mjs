@@ -1,7 +1,8 @@
-// 三层记忆回归测试：假 R2 内存桶，验证
+// 三层记忆回归测试：假 R2 内存桶（带 etag / onlyIf，真实 exercising CAS），验证
 // L1 要点抽取 / 同话题合并 / 溢出沉淀 / TTL 过期 / 固定项，
 // L2 主题覆盖 / 命中计数 / 旧格式迁移 / 容量淘汰，
 // L3 归档去重与检索，以及统一检索、提示词渲染与统计报告。
+// v7.20.0：三层合并单对象 kb/mem3/<chatId>.json（CAS 读改写 + 旧键迁移）。
 // 不联网、不依赖 Cloudflare 运行时。
 
 import test from 'node:test';
@@ -9,7 +10,7 @@ import assert from 'node:assert/strict';
 
 import {
   extractTopic, extractGist, jaccard, memDecayScore, memTokens, memSubjectKey, memNorm,
-  wmKey, ltKey, arKey, memLimits, memBudgets, WM_MAX_ITEMS, WM_PIN_MAX, LT_MAX_ITEMS
+  memKey, wmKey, ltKey, arKey, memLimits, memBudgets, WM_MAX_ITEMS, WM_PIN_MAX, LT_MAX_ITEMS
 } from '../src/memory/layers.js';
 import { wmGet, wmRecordTurn, wmPin, wmUnpin, wmClear } from '../src/memory/working.js';
 import { ltGet, ltSave, ltForget, rankLongterm } from '../src/memory/longterm.js';
@@ -21,23 +22,38 @@ import { buildAgentSystemPrompt } from '../src/agent/prompt.js';
 import { getAgentTools } from '../src/agent/tools.js';
 
 function makeR2(initial = {}) {
-  const data = new Map(Object.entries(initial));
-  const stats = { get: 0, put: 0, delete: 0, list: 0 };
+  const data = new Map();
+  const etags = new Map();
+  const stats = { get: 0, put: 0, delete: 0, list: 0, casFail: 0 };
+  let seq = 0;
   const bytes = (s) => new TextEncoder().encode(String(s)).byteLength;
+  const bump = (key) => { seq += 1; etags.set(key, 'e' + seq); return etags.get(key); };
+  for (const [k, v] of Object.entries(initial)) { data.set(k, String(v)); bump(k); }
   return {
     stats,
     data,
-    async get(key) {
+    etags,
+    async get(key, opts) {
       stats.get += 1;
       if (!data.has(key)) return null;
+      const etag = etags.get(key);
+      if (opts && opts.onlyIf && opts.onlyIf.etagMatches && opts.onlyIf.etagMatches !== etag) return null;
       const text = String(data.get(key));
-      return { key: key, size: bytes(text), text: async () => text };
+      return { key, size: bytes(text), etag, text: async () => text };
     },
-    async put(key, value) { stats.put += 1; data.set(key, String(value)); },
+    async put(key, value, opts) {
+      stats.put += 1;
+      if (opts && opts.onlyIf && opts.onlyIf.etagMatches && etags.get(key) !== opts.onlyIf.etagMatches) {
+        stats.casFail += 1;
+        return null;
+      }
+      data.set(key, String(value));
+      return { key, etag: bump(key) };
+    },
     async delete(key) {
       stats.delete += 1;
-      if (Array.isArray(key)) key.forEach(k => data.delete(k));
-      else data.delete(key);
+      if (Array.isArray(key)) key.forEach(k => { data.delete(k); etags.delete(k); });
+      else { data.delete(key); etags.delete(key); }
     },
     async list({ prefix = '', limit = 1000, cursor } = {}) {
       stats.list += 1;
@@ -221,7 +237,8 @@ test('L2 旧格式自动迁移：kb/agent_mem_ 与根目录 agent_mem_ 都能读
   assert.equal(arr.length, 2);
   assert.equal(arr[0].kind, 'fact', '旧条目补齐默认字段');
   assert.equal(arr[0].weight, 3);
-  assert.ok(env.R2.data.has(ltKey('legacy-kb')), '读到旧键应写一份到新键');
+  assert.ok(env.R2.data.has(memKey('legacy-kb')), '读到旧键应写一份到统一键');
+  assert.ok(env.R2.data.has('kb/agent_mem_legacy-kb'), '旧键保留作回滚副本');
 
   const env2 = { R2: makeR2({ 'agent_mem_legacy-root': JSON.stringify(legacyArr) }) };
   const arr2 = await ltGet(env2, 'legacy-root');
@@ -487,4 +504,140 @@ test('用户明确在回忆但词面没命中时，L3 用最近归档兜底', ()
 
   const plain = memoryPromptBlock(bundle, '帮我写个快速排序');
   assert.equal(plain.includes('【三层记忆 · L3'), false, '普通提问不应把无关归档塞进提示词');
+});
+
+// ==================== v7.20.0 统一单对象存储 ====================
+
+test('统一键：稳态冷读只有 1 次 GET，三层共享同一次加载', async () => {
+  const now = Date.now();
+  const unified = {
+    v: 2, chatId: 'uni-read',
+    work: { updatedAt: now, items: [{ t: '话题', g: '结论', ts: now }], pins: [] },
+    long: [{ fact: '用户在杭州工作', ts: now, file: 'a.md', kind: 'fact', weight: 3, hits: 0, lastUsed: 0 }],
+    archive: { items: [{ type: 'session', text: '旧话题', ts: 1 }] }
+  };
+  const env = { R2: makeR2({ [memKey('uni-read')]: JSON.stringify(unified) }) };
+  const bundle = await memoryLoad(env, 'uni-read', '杭州');
+  assert.equal(bundle.stats.l1Items, 1);
+  assert.equal(bundle.stats.l2, 1);
+  assert.equal(bundle.stats.l3, 1);
+  assert.equal(env.R2.stats.get, 1, '三层同对象，冷读应只有 1 次 GET（实际 ' + env.R2.stats.get + '）');
+  assert.equal(env.R2.stats.put, 0, '读路径不应触发写');
+});
+
+test('统一键：三个分层旧键一次性并行迁移合并，旧键保留回滚', async () => {
+  const now = Date.now();
+  const env = { R2: makeR2({
+    [wmKey('uni-mig')]: JSON.stringify({ v: 1, chatId: 'uni-mig', updatedAt: now, items: [{ t: '旧话题', g: '旧结论', ts: now }], pins: [{ text: '用英文回答', ts: now }] }),
+    [ltKey('uni-mig')]: JSON.stringify([{ fact: '用户在杭州工作', ts: now, file: 'a.md' }]),
+    [arKey('uni-mig')]: JSON.stringify({ v: 1, chatId: 'uni-mig', items: [{ type: 'session', text: '归档话题', ts: 1 }] })
+  }) };
+  const bundle = await memoryLoad(env, 'uni-mig', '杭州');
+  assert.equal(bundle.stats.l1Items, 1);
+  assert.equal(bundle.stats.l1Pins, 1);
+  assert.equal(bundle.stats.l2, 1);
+  assert.equal(bundle.stats.l3, 1);
+  assert.ok(env.R2.data.has(memKey('uni-mig')), '迁移应写入统一键');
+  assert.ok(env.R2.data.has(wmKey('uni-mig')) && env.R2.data.has(ltKey('uni-mig')) && env.R2.data.has(arKey('uni-mig')), '旧键保留作回滚副本');
+  assert.equal(env.R2.stats.get, 6, '统一键 1 次 + 旧键并行探测 5 次（一次性成本）');
+  assert.equal(env.R2.stats.put, 1, '迁移只写一次统一键');
+});
+
+test('统一键：L1 溢出沉淀与本轮要点在同一次 PUT 里完成（原子）', async () => {
+  const now = Date.now();
+  const work = {
+    updatedAt: now,
+    items: Array.from({ length: WM_MAX_ITEMS }, (_, i) => ({ t: '历史话题' + i, g: '结论' + i, ts: now - (WM_MAX_ITEMS - i) * 60000 })),
+    pins: []
+  };
+  const env = { R2: makeR2({ [memKey('uni-atomic')]: JSON.stringify({ v: 2, chatId: 'uni-atomic', work, long: [], archive: { items: [] } }) }) };
+  const before = env.R2.stats.put;
+  const r = await wmRecordTurn(env, 'uni-atomic', '一个全新的话题：如何配置 R2 生命周期', '按前缀配置。');
+  assert.equal(r.spilled, 1);
+  assert.equal(env.R2.stats.put - before, 1, '要点 + 沉淀只该有一次 PUT');
+  const obj = JSON.parse(env.R2.data.get(memKey('uni-atomic')));
+  assert.equal(obj.work.items.length, WM_MAX_ITEMS);
+  assert.equal(obj.archive.items.length, 1);
+  assert.ok(obj.archive.items[0].text.includes('历史话题0'));
+});
+
+test('统一键：跨 isolate CAS 冲突重读重算，两边记忆都不丢', async () => {
+  const env = { R2: makeR2() };
+  const id = 'uni-cas';
+  await ltSave(env, id, '用户喜欢喝茶');
+  // 另一个 isolate 抢先写入一条（直接改桶模拟，etag 随之变化）
+  const obj = JSON.parse(env.R2.data.get(memKey(id)));
+  obj.long.push({ fact: '用户在杭州工作', ts: Date.now(), file: 'other.md', kind: 'fact', weight: 3, hits: 0, lastUsed: 0 });
+  await env.R2.put(memKey(id), JSON.stringify(obj));
+
+  const msg = await ltSave(env, id, '用户养了一只猫');
+  assert.ok(msg.includes('已记住'), msg);
+  assert.ok(env.R2.stats.casFail >= 1, '应触发至少一次条件写冲突');
+  const arr = await ltGet(env, id);
+  assert.equal(arr.length, 3, '两个 isolate 的三条记忆都必须还在');
+});
+
+test('统一键：命中计数搭每轮 L1 写入免费落盘，重启不再清零', async () => {
+  const env = { R2: makeR2() };
+  const id = 'uni-hits';
+  await ltSave(env, id, '用户的猫叫汤圆');
+  await memoryLoad(env, id, '汤圆');
+  await wmRecordTurn(env, id, '一个完全不相关的新话题：量子计算', '结论。');
+  const obj = JSON.parse(env.R2.data.get(memKey(id)));
+  assert.ok(obj.long[0].hits >= 1, 'hits 应随 L1 写入落盘（实际 ' + obj.long[0].hits + '）');
+});
+
+test('统一键：/clear 只清 work 段，L2/L3 保留且不 DELETE 统一键', async () => {
+  const env = { R2: makeR2() };
+  const id = 'uni-clear';
+  await wmRecordTurn(env, id, '如何配置 R2 存储桶', '先建桶再绑定。');
+  await ltSave(env, id, '用户在杭州工作');
+  await arPush(env, id, [{ type: 'memory', text: '旧记忆：用户曾用 Notion', ts: 1 }]);
+  await wmClear(env, id);
+  assert.equal((await wmGet(env, id)).items.length, 0);
+  assert.equal((await ltGet(env, id)).length, 1);
+  assert.equal((await arGet(env, id)).items.length, 1);
+  assert.ok(env.R2.data.has(memKey(id)), '绝不能 DELETE 整个统一键');
+});
+
+test('统一键：读失败时如实报错，绝不拿空快照覆盖已有数据', async () => {
+  const r2 = makeR2({ [memKey('uni-fail')]: JSON.stringify({
+    v: 2, chatId: 'uni-fail', work: { updatedAt: 0, items: [], pins: [] },
+    long: [{ fact: '已有记忆', ts: 1, file: 'a.md', kind: 'fact', weight: 3, hits: 0, lastUsed: 0 }],
+    archive: { items: [] }
+  }) });
+  r2.get = async () => { throw new Error('network connection lost'); };
+  const msg = await ltSave({ R2: r2 }, 'uni-fail', '一条新事实');
+  assert.ok(msg.includes('失败'), msg);
+  assert.equal(r2.stats.put, 0, '读失败时不能盲写覆盖已有记忆');
+});
+
+test('L1 检索升级为分词打分：词序/插字查询不再漏检', async () => {
+  const env = { R2: makeR2() };
+  const id = 'l1-token-search';
+  await wmRecordTurn(env, id, '帮我看下 R2 的生命周期规则怎么设', '在控制台按前缀配置。');
+  const text = await memorySearchText(env, id, 'R2 生命周期');
+  assert.ok(text.includes('L1 工作记忆'), '旧版纯子串匹配会漏掉该查询：' + text);
+});
+
+test('注入跨层去重：已被 L2 事实覆盖的归档不再重复注入', () => {
+  const bundle = {
+    working: { items: [], pins: [] },
+    longterm: [{ fact: '用户的猫叫汤圆', ts: Date.now(), weight: 3, hits: 0, kind: 'fact' }],
+    archive: { items: [
+      { type: 'memory', text: '[事实] 用户的猫叫汤圆', ts: 1 },
+      { type: 'session', text: '讨论过 R2 生命周期规则配置', ts: 2 }
+    ] },
+    budgets: { L1: 1600, L2: 3000, L3: 900 }
+  };
+  const block = memoryPromptBlock(bundle, '汤圆 R2 生命周期');
+  assert.ok(block.includes('【三层记忆 · L2'));
+  assert.ok(block.includes('讨论过 R2 生命周期规则配置'), '未被覆盖的归档应正常注入');
+  const l3Section = block.split('【三层记忆 · L3')[1] || '';
+  assert.equal(l3Section.includes('用户的猫叫汤圆'), false, '已被 L2 覆盖的归档不应重复出现');
+});
+
+test('统一键同样防路径穿越', () => {
+  assert.equal(memKey('a/../../b'), 'kb/mem3/ab.json');
+  assert.ok(memKey('../../etc').indexOf('..') === -1);
 });

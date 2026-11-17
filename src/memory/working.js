@@ -9,24 +9,19 @@
 // 1) 同话题合并：用 2-gram Jaccard 判断是不是同一件事，是就替换而不是追加，
 //    否则连问五遍"北京天气"会占满 12 条槽位。
 // 2) 溢出沉淀：超过 WM_MAX_ITEMS 时最旧的一条不是被丢弃，而是推进 L3 归档。
-// 3) 自动过期：7 天没有活动视为会话结束，读出来直接当空处理（R2 里的对象仍在，
-//    由 kb/mem3/ 目录的人工清理或生命周期规则处理，代码不做后台删除，避免额外写操作）。
+//    v7.20.0 起沉淀与本轮要点在同一次 CAS 写入里完成（原子，不会丢）。
+// 3) 自动过期：7 天没有活动视为会话结束，读出来直接当空处理（R2 里的数据仍在，
+//    下次写入时自然更新，代码不做后台删除，避免额外写操作）。
+//
+// 存储：v7.20.0 起三层共用 kb/mem3/<chatId>.json 单对象（store.js），
+// /clear 只清 work 段，不再 DELETE 整个对象（L2/L3 必须保留）。
 
-import { mapSetBounded, mapGetBounded, singleFlight } from '../utils.js';
-import { storeGet, storePutChecked, storeDelete } from '../store/r2.js';
+import { memSnapshot, memMutate } from './store.js';
+import { applyArchiveRecords } from './archive.js';
 import {
-  wmKey, WM_MAX_ITEMS, WM_PIN_MAX, WM_TTL_MS, memLimits, memCacheTtl,
+  WM_MAX_ITEMS, WM_PIN_MAX, WM_TTL_MS, memLimits,
   extractTopic, extractGist, jaccard, clipText
 } from './layers.js';
-import { arPush } from './archive.js';
-
-const wmCache = new Map();
-const wmExp = new Map();
-const WM_CACHE_MAX = 500;
-// 单飞：同一轮里 loop.js 与工具层并发要同一份 L1 时只读一次 R2
-const wmLoads = new Map();
-// 上次成功落盘的 JSON：内容没变就不再 PUT（/pin 重复、命令无实际改动等场景）
-const wmPersisted = new Map();
 
 function emptyWm(chatId) {
   return { v: 1, chatId: String(chatId == null ? '' : chatId), updatedAt: 0, items: [], pins: [] };
@@ -65,48 +60,18 @@ function normalizeWm(raw, chatId, maxItems) {
   return out;
 }
 
-function cloneWm(w) {
-  return {
-    v: w.v, chatId: w.chatId, updatedAt: w.updatedAt,
-    items: w.items.map(x => ({ t: x.t, g: x.g, ts: x.ts })),
-    pins: w.pins.map(x => ({ text: x.text, ts: x.ts }))
-  };
+// 写回 draft 的 work 段（统一对象里不存 v/chatId，投影时再补）
+function setWork(draft, wm) {
+  draft.work = { updatedAt: wm.updatedAt, items: wm.items, pins: wm.pins };
 }
 
-async function wmPut(env, chatId, obj) {
-  // 先更新内存缓存：即使 R2 写失败，本 isolate 内的后续轮次也能看到最新脉络
-  mapSetBounded(wmCache, chatId, cloneWm(obj), WM_CACHE_MAX, wmExp, memCacheTtl(env));
-  if (!env || !env.R2) return false;
-  const json = JSON.stringify(obj);
-  // 内容与上次落盘完全一致 → 省掉一次 PUT（R2 写入是 A 类操作，且是用户可见延迟）
-  if (wmPersisted.get(chatId) === json) return true;
-  const ok = await storePutChecked(env, wmKey(chatId), json);
-  if (ok) {
-    if (wmPersisted.size >= WM_CACHE_MAX) wmPersisted.clear();
-    wmPersisted.set(chatId, json);
-  }
-  return ok;
-}
-
-// 真正加载：命中 isolate 缓存直接返回（缓存里存的是快照，调用方各自 clone）
-async function wmLoad(env, chatId) {
-  const cached = mapGetBounded(wmCache, chatId, env && env.R2 ? wmExp : null);
-  if (cached) return cached;
-  let obj = emptyWm(chatId);
-  if (env && env.R2) {
-    const raw = await storeGet(env, wmKey(chatId));
-    if (raw) {
-      try { obj = normalizeWm(JSON.parse(raw), chatId, memLimits(env).l1); } catch (e) { obj = emptyWm(chatId); }
-      wmPersisted.set(chatId, JSON.stringify(obj));
-    }
-  }
-  mapSetBounded(wmCache, chatId, cloneWm(obj), WM_CACHE_MAX, wmExp, memCacheTtl(env));
-  return obj;
+function persistedOk(env, res) {
+  return !!(env && env.R2) && res.ok && (res.persisted || res.unchanged);
 }
 
 export async function wmGet(env, chatId) {
-  const obj = await singleFlight('wm', chatId, () => wmLoad(env, chatId), WM_CACHE_MAX);
-  return cloneWm(obj);
+  const snap = await memSnapshot(env, chatId);
+  return normalizeWm(snap.work, chatId, memLimits(env).l1);
 }
 
 // 记录一轮问答。返回 { added, merged, spilled, persisted }，供调用方判断是否真的写进去了。
@@ -115,35 +80,38 @@ export async function wmRecordTurn(env, chatId, userText, assistantText) {
   if (!topic) return { added: false, merged: false, spilled: 0, persisted: false };
   const gist = extractGist(assistantText);
   const ts = Date.now();
-  const wm = await wmGet(env, chatId);
-
-  // 同话题合并：从后往前找，命中就替换并挪到末尾（最新话题永远在最后）
   let merged = false;
-  for (let i = wm.items.length - 1; i >= 0; i--) {
-    if (jaccard(wm.items[i].t, topic) >= 0.6) {
-      wm.items.splice(i, 1);
-      merged = true;
-      break;
+  let spilled = [];
+
+  const res = await memMutate(env, chatId, draft => {
+    // normalizeWm 顺带做 TTL 过期与容量裁剪；mutator 可重跑（CAS 冲突时在新快照上重算）
+    const wm = normalizeWm(draft.work, chatId, memLimits(env).l1);
+    merged = false;
+    for (let i = wm.items.length - 1; i >= 0; i--) {
+      if (jaccard(wm.items[i].t, topic) >= 0.6) {
+        wm.items.splice(i, 1);
+        merged = true;
+        break;
+      }
     }
-  }
-  wm.items.push({ t: topic, g: gist, ts });
+    wm.items.push({ t: topic, g: gist, ts });
 
-  // 溢出沉淀：最旧的几条推进 L3，绝不静默丢弃
-  const cap = memLimits(env).l1;
-  const spilled = [];
-  while (wm.items.length > cap) spilled.push(wm.items.shift());
-  wm.updatedAt = ts;
+    // 溢出沉淀：最旧的几条推进 L3，与本轮要点同一次写入，绝不静默丢弃
+    const cap = memLimits(env).l1;
+    spilled = [];
+    while (wm.items.length > cap) spilled.push(wm.items.shift());
+    wm.updatedAt = ts;
+    setWork(draft, wm);
+    if (spilled.length) {
+      draft.archive.items = applyArchiveRecords(draft.archive.items, spilled.map(x => ({
+        type: 'session',
+        text: clipText(x.t + (x.g ? ' → ' + x.g : ''), 200),
+        ts: x.ts
+      })), memLimits(env).l3);
+    }
+  });
 
-  const persisted = await wmPut(env, chatId, wm);
-
-  if (spilled.length) {
-    await arPush(env, chatId, spilled.map(x => ({
-      type: 'session',
-      text: clipText(x.t + (x.g ? ' → ' + x.g : ''), 200),
-      ts: x.ts
-    })));
-  }
-  return { added: true, merged, spilled: spilled.length, persisted };
+  return { added: true, merged, spilled: spilled.length, persisted: persistedOk(env, res) };
 }
 
 // 固定本会话的约束/事实（"这次都用英文回答""本次只讨论 A 方案"）。
@@ -151,38 +119,51 @@ export async function wmRecordTurn(env, chatId, userText, assistantText) {
 export async function wmPin(env, chatId, text) {
   const t = clipText(String(text == null ? '' : text).replace(/\s+/g, ' ').trim(), 160);
   if (!t) return { ok: false, reason: '内容为空' };
-  const wm = await wmGet(env, chatId);
-  if (wm.pins.some(p => p.text === t)) {
-    return { ok: true, duplicate: true, count: wm.pins.length };
-  }
-  wm.pins.push({ text: t, ts: Date.now() });
+  let duplicate = false;
+  let count = 0;
   let evicted = 0;
-  while (wm.pins.length > WM_PIN_MAX) { wm.pins.shift(); evicted += 1; }
-  wm.updatedAt = Date.now();
-  const ok = await wmPut(env, chatId, wm);
-  return { ok, count: wm.pins.length, evicted, persisted: ok };
+  const res = await memMutate(env, chatId, draft => {
+    const wm = normalizeWm(draft.work, chatId, memLimits(env).l1);
+    if (wm.pins.some(p => p.text === t)) {
+      duplicate = true;
+      count = wm.pins.length;
+      return false;
+    }
+    wm.pins.push({ text: t, ts: Date.now() });
+    evicted = 0;
+    while (wm.pins.length > WM_PIN_MAX) { wm.pins.shift(); evicted += 1; }
+    wm.updatedAt = Date.now();
+    count = wm.pins.length;
+    setWork(draft, wm);
+  });
+  if (duplicate) return { ok: true, duplicate: true, count };
+  const ok = persistedOk(env, res);
+  return { ok, count, evicted, persisted: ok };
 }
 
 export async function wmUnpin(env, chatId, keyword) {
   const kw = String(keyword == null ? '' : keyword).trim();
   if (!kw) return { removed: 0 };
-  const wm = await wmGet(env, chatId);
-  const kept = wm.pins.filter(p => p.text.indexOf(kw) === -1);
-  const removed = wm.pins.length - kept.length;
+  let removed = 0;
+  const res = await memMutate(env, chatId, draft => {
+    const wm = normalizeWm(draft.work, chatId, memLimits(env).l1);
+    const kept = wm.pins.filter(p => p.text.indexOf(kw) === -1);
+    removed = wm.pins.length - kept.length;
+    if (!removed) return false;
+    wm.pins = kept;
+    wm.updatedAt = Date.now();
+    setWork(draft, wm);
+  });
   if (!removed) return { removed: 0 };
-  wm.pins = kept;
-  wm.updatedAt = Date.now();
-  const ok = await wmPut(env, chatId, wm);
-  return { removed, persisted: ok };
+  return { removed, persisted: persistedOk(env, res) };
 }
 
+// /clear：只清 work 段。统一对象里 L2/L3 与 work 同住，绝不能 DELETE 整个键。
 export async function wmClear(env, chatId) {
-  wmCache.delete(chatId);
-  wmExp.delete(chatId);
-  wmPersisted.delete(chatId);
-  if (env && env.R2) {
-    try { await storeDelete(env, wmKey(chatId)); } catch (e) {}
-  }
+  await memMutate(env, chatId, draft => {
+    if (!draft.work.items.length && !draft.work.pins.length && !draft.work.updatedAt) return false;
+    draft.work = { updatedAt: 0, items: [], pins: [] };
+  });
 }
 
 // 生成提示词里用的 L1 文本块（不含标题，标题由 index.js 统一加）

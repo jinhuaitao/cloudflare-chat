@@ -241,9 +241,7 @@ async function doSaveDoc(env, chatId, args) {
   // （A 类操作，几十到上百毫秒），只为防"整表读-改-写"覆盖别的实例刚写的条目。
   // 现在由 kbMutateRegistry 的条件写（etag CAS）承担同一职责：冲突就重读重算，
   // 保存路径少一次 list，延迟直接降一个往返。
-  // deferHealWrite：索引缺失需要重建时先别写——本次保存结尾本来就要写注册表，
-  // 让重建自己再写一次等于白付一个 RTT。
-  const cur = await kbGetRegistryEx(env, { fresh: true, deferHealWrite: true });
+  const cur = await kbGetRegistryEx(env, { fresh: true });
   const reg = cur.reg;
   const prevEntry = reg.find(e => e.file === file);
   const existed = !!prevEntry;
@@ -359,9 +357,7 @@ async function toolListDocs(env, opts) {
   if (!env.R2) return 'R2 未绑定，无法读取知识库文档';
   // /kb 这类用户主动查看的入口传 verify:true —— 顺便把索引和实际文件核对一遍，
   // 免得「文档明明存进去了却不在列表里」。Agent 每轮的 list_docs 走缓存，不额外花 R2 操作。
-  let reg = await kbGetRegistry(env, { verify: !!(opts && opts.verify) });
-  // 空库时核对一次：注册表可能被旧版本写成空数组，而文件其实还在
-  if (!reg.length) reg = await kbGetRegistry(env, { verify: true });
+  const reg = await kbGetRegistry(env, { verify: !!(opts && opts.verify) });
   const repaired = kbTakeRepairCount();
   const repairNote = repaired > 0
     ? '\n\n🔧 索引与实际文件不一致，已按文件自动修复，补回 ' + repaired + ' 篇此前未列出的文档。'

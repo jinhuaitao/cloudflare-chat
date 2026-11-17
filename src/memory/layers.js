@@ -91,6 +91,9 @@ const MEM_PREFIX = 'kb/mem3/';
 export function memSafeId(chatId) {
   return String(chatId == null ? '' : chatId).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
 }
+// v7.20.0：三层合并为单对象（每轮冷读 3 次 GET → 1 次，L1 写入与溢出沉淀原子化）。
+// 下面三个分层键只用于旧数据迁移探测，迁移后保留不删（回滚副本）。
+export function memKey(chatId) { return MEM_PREFIX + memSafeId(chatId) + '.json'; }
 export function wmKey(chatId) { return MEM_PREFIX + 'work/' + memSafeId(chatId) + '.json'; }
 export function ltKey(chatId) { return MEM_PREFIX + 'long/' + memSafeId(chatId) + '.json'; }
 export function arKey(chatId) { return MEM_PREFIX + 'archive/' + memSafeId(chatId) + '.json'; }
