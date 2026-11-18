@@ -2,6 +2,25 @@
 
 import { parseCommaSeparated } from './utils.js';
 
+// 文生图尺寸规范化：
+// 多数兼容 /v1/images/generations 的上游要求 size 为 "WxH"（如 1024x1024），
+// 传 "auto" 会被 400 拒绝（报错：size format should be WxH）。
+// 这里把常见写法（1024*1024 / 1024×1024 / 1024,1024 / 带空格）统一成 "宽x高"，
+// 越界或非法值回落到安全默认值，避免用户配错后再次触发上游 400。
+const DEFAULT_IMAGE_SIZE = '1024x1024';
+function normalizeImageSize(raw) {
+  const s = String(raw == null ? '' : raw).trim().toLowerCase()
+    .replace(/\s+/g, '')
+    .replace(/[×x*,:：]/g, 'x');
+  const m = /^(\d{2,4})x(\d{2,4})$/.exec(s);
+  if (m) {
+    const w = Number(m[1]);
+    const h = Number(m[2]);
+    if (w >= 64 && w <= 4096 && h >= 64 && h <= 4096) return `${w}x${h}`;
+  }
+  return DEFAULT_IMAGE_SIZE;
+}
+
 let cachedConfig = null;
 const keyRoundRobinIdx = new Map();
 
@@ -188,7 +207,9 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
       model: upstreamModel,
       prompt: lastPrompt,
       n: 1,
-      size: "auto",
+      // 上游要求 WxH 格式（如 1024x1024）；写死 "auto" 会触发 400: size format should be WxH。
+      // 可用 IMAGE_SIZE 环境变量覆盖，如 "1536x1024"，非法值自动回落到 1024x1024。
+      size: normalizeImageSize(env.IMAGE_SIZE),
       output_format: "png",
       response_format: "url"
     };
