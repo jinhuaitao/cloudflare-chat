@@ -11,8 +11,7 @@ import { handleKbList } from './src/kb/api.js';
 import { handleTgWebhook } from './src/telegram/handler.js';
 import { handleWxWebhook, handleWxApi, handleWxScheduled, maybeWakeWxDaemon } from './src/wechat/handler.js';
 import { ICON_B64, getIconBytes } from './src/pwa/icons.js';
-import { findImageUrl, extractImageMarkdown } from './src/utils.js';
-import { pollModelScopeTask } from './src/image-task.js';
+import { runImageRequest } from './src/image-task.js';
 import { MANIFEST_JSON } from './src/pwa/manifest.js';
 import { SW_JS } from './src/pwa/service-worker.js';
 import { getPwaVersion } from './src/pwa/version.js';
@@ -108,73 +107,43 @@ async function routeRequest(request, env, ctx) {
           return await handleWebAgent(env, body, ctx);
         }
 
-        const requestHeaders = {
-          'Authorization': `Bearer ${currentApiKey}`,
-          'Content-Type': 'application/json',
-        };
-        // ModelScope 生图必须声明异步模式，POST 才会返回 task_id
-        if (isImageAPI && isModelScope) requestHeaders['X-ModelScope-Async-Mode'] = 'true';
-
-        const upstreamResponse = await fetch(apiUrl, {
-          method: 'POST',
-          headers: requestHeaders,
-          body: JSON.stringify(payload)
-        });
-
-        if (!upstreamResponse.ok) {
-          // v6.8.7：错误正文限长读取 —— 上游偶发返回超大 HTML 错误页时不再整段读入
-          const errText = await readErrorBody(upstreamResponse, 2048);
-          return new Response(JSON.stringify({ error: `API 报错 (${upstreamResponse.status}):${errText}` }), {
-            status: upstreamResponse.status,
-            headers: CORS_HEADERS,
-          });
-        }
-
         if (!isImageAPI) {
-          return new Response(upstreamResponse.body, { headers: SSE_HEADERS });
-        } else {
-          const responseData = await upstreamResponse.json();
-
-          // ModelScope 异步任务：POST 只返回 task_id，需轮询拿到真正的图片链接。
-          let modelScopeResult = null;
-          if (isModelScope && responseData && responseData.task_id) {
-            const maxWaitMs = parseInt(env.IMAGE_TASK_MAX_WAIT_MS || '', 10) > 0
-              ? parseInt(env.IMAGE_TASK_MAX_WAIT_MS, 10) : undefined;
-            modelScopeResult = await pollModelScopeTask({
-              apiUrl, apiKey: currentApiKey, taskId: responseData.task_id,
-              maxWaitMs, outputImages: responseData.output_images,
+          const upstreamResponse = await fetch(apiUrl, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${currentApiKey}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(payload)
+          });
+          if (!upstreamResponse.ok) {
+            // v6.8.7：错误正文限长读取 —— 上游偶发返回超大 HTML 错误页时不再整段读入
+            const errText = await readErrorBody(upstreamResponse, 2048);
+            return new Response(JSON.stringify({ error: `API 报错 (${upstreamResponse.status}):${errText}` }), {
+              status: upstreamResponse.status,
+              headers: CORS_HEADERS,
             });
           }
-
-          // 兼容多种文生图返回结构（OpenAI data[]、Gemini inlineData、通义 output.results、
-          // 中转网关塞进 choices[].message.content 的图片）；解析不出时把字段列出来便于定位。
-          let imageUrlOrText;
-          if (modelScopeResult) {
-            imageUrlOrText = modelScopeResult.url
-              ? `![生成结果](${modelScopeResult.url})`
-              : `图片生成失败：${modelScopeResult.error}`;
-          } else {
-            imageUrlOrText = extractImageMarkdown(responseData);
-          }
-          if (!imageUrlOrText) {
-            const shape = responseData && typeof responseData === 'object'
-              ? Object.keys(responseData).join(', ')
-              : typeof responseData;
-            imageUrlOrText = `图片生成失败或未返回格式（上游响应字段：${shape || '空对象'}）。请检查文生图通道的返回结构。`;
-          }
-
-          const encoder = new TextEncoder();
-          const stream = new ReadableStream({
-            start(controller) {
-              const fakeChunk = JSON.stringify({ choices: [{ delta: { content: imageUrlOrText + "\n\n" } }] });
-              controller.enqueue(encoder.encode(`data: ${fakeChunk}\n\n`));
-              controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-              controller.close();
-            }
-          });
-
-          return new Response(stream, { headers: SSE_HEADERS });
+          return new Response(upstreamResponse.body, { headers: SSE_HEADERS });
         }
+
+        // 生图通道：统一走 runImageRequest（提交 + ModelScope 异步轮询 + 多结构解析）
+        const imageResult = await runImageRequest({ cfg: aiConfig, env });
+        const imageUrlOrText = imageResult.url
+          ? `![生成结果](${imageResult.url})`
+          : (imageResult.text || `图片生成失败：${imageResult.error || '未知原因'}`);
+
+        const encoder = new TextEncoder();
+        const stream = new ReadableStream({
+          start(controller) {
+            const fakeChunk = JSON.stringify({ choices: [{ delta: { content: imageUrlOrText + "\n\n" } }] });
+            controller.enqueue(encoder.encode(`data: ${fakeChunk}\n\n`));
+            controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+            controller.close();
+          }
+        });
+
+        return new Response(stream, { headers: SSE_HEADERS });
       } catch (error) {
         return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: CORS_HEADERS });
       }
