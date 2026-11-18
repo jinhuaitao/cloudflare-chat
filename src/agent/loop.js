@@ -33,6 +33,7 @@
 // 7) 进度文案带步数与耗时，长任务可感知。
 
 import { buildAIRequest } from '../channel.js';
+import { runImageRequest } from '../image-task.js';
 import { parseDSMLToolCalls, stripDSMLBlocks } from './dsml.js';
 import { truncateToolResult, readErrorBody, parseToolArguments, toolCallSignature,
   trimAgentMessages, trimAgentMessagesEx } from './stability.js';
@@ -165,6 +166,26 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
   }
   const query = lastUserText(safeHistory);
   const kbReadOnly = !!(opts && opts.kbReadOnly);
+
+  // 生图模型直通：文生图通道（含 ModelScope 异步任务）不应进 ReAct 循环当对话用，
+  // 否则 POST 只返回 task_id / data[]，被解析成空内容 → 「连续两次没有返回有效内容」。
+  // 这里在加载记忆/知识库之前就探测并短路，走统一的生图请求分支。
+  const imageProbe = buildAIRequest(env, targetModelId, [{ role: 'user', content: query }], false);
+  if (imageProbe && !imageProbe.error && imageProbe.isImageAPI) {
+    try {
+      if (typeof onProgress === 'function') {
+        Promise.resolve(onProgress('🎨 正在生成图片，请稍候…', true)).catch(() => {});
+      }
+      const imageResult = await runImageRequest({ cfg: imageProbe, env });
+      const text = imageResult.url
+        ? '[🖼️ 点击查看生成的图片](' + imageResult.url + ')'
+        : (imageResult.text || ('⚠️ ' + (imageResult.error || '图片生成失败')));
+      return { text, usedTools: false, isImage: true };
+    } catch (e) {
+      return { text: '⚠️ 生图异常：' + (e && e.message ? e.message : String(e)), usedTools: false, isImage: true };
+    }
+  }
+
   // 并发加载三层记忆、知识库文档注册表与人格选择（各带兜底超时：R2 抖动不该拖住首字）。
   // v7.10.0：原来是"一次读长期记忆 + 一次读注册表"，现在 L1/L2/L3 三层在 memoryLoad
   // 内部并行读取，外层仍然只占一个等待位——多读两层不等于多等两轮。
