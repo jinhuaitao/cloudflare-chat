@@ -1,6 +1,8 @@
 // 上游流式读取：把 SSE 还原成与非流式相同的 message 形状
 // （v7.1.0 流式实时拦截 DSML 工具调用标记；v7.6.0 读取链路降耗）
 
+import { findImageUrl } from '../utils.js';
+
 // ==================== 上游流式读取（Agent 真流式） ====================
 // 把上游的 SSE 流还原成与「非流式」完全相同的 message 形状：
 //   { content, reasoning, toolCalls, forwarded, imageUrl, finishReason }
@@ -112,8 +114,10 @@ async function readUpstreamMessage(resp, onDelta) {
   if (!sawSSE) {
     try {
       const j = JSON.parse(raw);
-      if (j && j.data && j.data[0] && (j.data[0].url || j.data[0].b64_json)) {
-        return { imageUrl: j.data[0].url || ('data:image/png;base64,' + j.data[0].b64_json), content: '', reasoning: '', toolCalls: [], forwarded: false, finishReason: '' };
+      // 生图通道：兼容 OpenAI data[]、Gemini inlineData、通义 output.results 等多种返回结构
+      const imgUrl = findImageUrl(j);
+      if (imgUrl) {
+        return { imageUrl: imgUrl, content: '', reasoning: '', toolCalls: [], forwarded: false, finishReason: '' };
       }
       const ch = j && j.choices && j.choices[0];
       const m = ch && (ch.message || ch.delta);
