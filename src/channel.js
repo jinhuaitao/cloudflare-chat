@@ -185,6 +185,9 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
 
   const apiUrl = channel.url;
   const isImageAPI = apiUrl.includes('images/generations');
+  // ModelScope 魔搭生图是异步任务式接口：POST 只返回 task_id，需再轮询 /v1/tasks/{id}。
+  // 用请求域名识别，兼容 api-inference.modelscope.cn / .ai（国际站）。
+  const isModelScope = /api-inference\.modelscope\.(cn|ai)/i.test(apiUrl);
 
   let maxTokens = parseInt(env.MAX_TOKENS || '4096', 10);
   if (!(maxTokens > 0)) maxTokens = 16384;
@@ -216,6 +219,24 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
     if (upstreamModel.includes('sensenova')) {
       payload.watermark = false;
     }
+    if (isModelScope) {
+      // ModelScope 只认 size，n / response_format 等字段不生效；去掉可避免个别模型报参数错误。
+      delete payload.n;
+      delete payload.response_format;
+      delete payload.output_format;
+      // 图片编辑（image_url）场景：前端若在 messages 里带了图片 URL，透传过去。
+      const imgUrls = [];
+      for (const m of messagesArray) {
+        const c = m && m.content;
+        if (Array.isArray(c)) {
+          for (const seg of c) {
+            const u = seg && seg.image_url && (seg.image_url.url || seg.image_url);
+            if (typeof u === 'string' && /^(https?:|data:)/i.test(u)) imgUrls.push(u);
+          }
+        }
+      }
+      if (imgUrls.length) payload.image_url = imgUrls;
+    }
   } else {
     payload = {
       model: upstreamModel,
@@ -240,7 +261,7 @@ function buildAIRequest(env, requestedModel, messagesArray, isStream, tools) {
     }
   }
 
-  return { apiUrl, currentApiKey, channelKeys: keys, payload, isImageAPI };
+  return { apiUrl, currentApiKey, channelKeys: keys, payload, isImageAPI, isModelScope };
 }
 
 export {
