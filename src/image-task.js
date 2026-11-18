@@ -6,8 +6,13 @@
 //   3) 下载 output_images[0]（本模块只返回 URL，下载/渲染交给上层）
 // 其它文生图通道（同步返回 data[] 的）不走这里。
 
-const DEFAULT_INTERVAL_MS = 3000;   // 轮询间隔
-const DEFAULT_MAX_WAIT_MS = 180000; // 总等待上限（3 分钟），避免 Worker 无限挂起
+// ⚠️ Cloudflare Workers 子请求上限：免费版 50/请求、付费版 1000/请求。
+// 每次轮询算 1 个子请求，故 间隔×次数 必须留余量。默认 8 秒 × 约 37 次（5 分钟）适合免费版；
+// 付费版可用 IMAGE_TASK_INTERVAL_MS / IMAGE_TASK_MAX_WAIT_MS 自行放宽。
+const DEFAULT_INTERVAL_MS = 8000;
+const DEFAULT_MAX_WAIT_MS = 300000; // 5 分钟：约 37 次轮询，免费版 50 次上限内留余量。
+                                     // Qwen-Image 冷启动多为 1~3 分钟；仍不够时用 IMAGE_TASK_MAX_WAIT_MS 调大
+                                     // （付费版可调到 600000，免费版需同步调大间隔以免超子请求数）。
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -36,7 +41,9 @@ export async function pollModelScopeTask(opts) {
     intervalMs = DEFAULT_INTERVAL_MS,
     maxWaitMs = DEFAULT_MAX_WAIT_MS,
     outputImages,
+    fetchImpl,
   } = opts || {};
+  const doFetch = fetchImpl || fetch;
 
   // 少数情况下提交响应可能直接带图（同步兜底），省去轮询
   if (Array.isArray(outputImages) && outputImages.length && typeof outputImages[0] === 'string') {
@@ -55,7 +62,7 @@ export async function pollModelScopeTask(opts) {
   while (Date.now() < deadline) {
     let data;
     try {
-      const resp = await fetch(queryUrl, { headers });
+      const resp = await doFetch(queryUrl, { headers });
       if (!resp.ok) {
         const text = await resp.text().catch(() => '');
         return { error: `查询生成任务失败 (${resp.status}): ${String(text).slice(0, 300)}` };
@@ -81,5 +88,82 @@ export async function pollModelScopeTask(opts) {
     await sleep(Math.max(200, intervalMs));
   }
 
-  return { error: `图片生成超时（最后状态：${lastStatus || '未知'}）` };
+  return { error: `图片生成超时（最后状态：${lastStatus || '未知'}，已等待 ${Math.round(maxWaitMs / 1000)} 秒。可用 IMAGE_TASK_MAX_WAIT_MS 调大）` };
+}
+
+// 统一的图片响应解析（供三端复用，避免各自维护一套结构判断）
+function pickImageUrl(data) {
+  if (!data || typeof data !== 'object') return '';
+  // OpenAI data[] / images[]
+  for (const key of ['data', 'images', 'output_images']) {
+    const arr = data[key];
+    if (Array.isArray(arr)) {
+      for (const it of arr) {
+        if (typeof it === 'string' && /^(https?:\/\/|data:image\/)/i.test(it)) return it;
+        if (it && typeof it === 'object') {
+          const u = it.url || it.image_url || it.image;
+          if (typeof u === 'string' && /^(https?:\/\/|data:image\/)/i.test(u)) return u;
+          if (it.b64_json) return 'data:image/png;base64,' + it.b64_json;
+        }
+      }
+    }
+  }
+  if (typeof data.url === 'string' && /^(https?:\/\/|data:image\/)/i.test(data.url)) return data.url;
+  return '';
+}
+
+/**
+ * 提交生图请求并（按需）轮询，返回 { url } 或 { error }。Web / 微信 / Agent 三端共用。
+ * @param {object} opts
+ *   cfg      —— buildAIRequest 的返回值（含 apiUrl/currentApiKey/payload/isImageAPI/isModelScope）
+ *   env      —— 环境变量（读取 IMAGE_TASK_MAX_WAIT_MS）
+ *   fetchImpl—— 可选 fetch 实现（便于测试注入）
+ */
+export async function runImageRequest(opts) {
+  const { cfg, env, fetchImpl } = opts || {};
+  const doFetch = fetchImpl || fetch;
+  const headers = {
+    'Authorization': `Bearer ${cfg.currentApiKey}`,
+    'Content-Type': 'application/json',
+  };
+  if (cfg.isModelScope) headers['X-ModelScope-Async-Mode'] = 'true';
+
+  let resp;
+  try {
+    resp = await doFetch(cfg.apiUrl, { method: 'POST', headers, body: JSON.stringify(cfg.payload) });
+  } catch (e) {
+    return { error: `生图请求失败：${e && e.message ? e.message : String(e)}` };
+  }
+  if (!resp.ok) {
+    let detail = '';
+    try { detail = String(await resp.text()).slice(0, 300); } catch (e) {}
+    return { error: `生图接口报错 (${resp.status})：${detail}`, status: resp.status };
+  }
+
+  let data;
+  try { data = await resp.json(); }
+  catch (e) { return { error: '生图接口未返回有效 JSON' }; }
+
+  // ModelScope 异步任务：先拿 task_id，再轮询
+  if (cfg.isModelScope && data && data.task_id) {
+    const configured = parseInt((env && env.IMAGE_TASK_MAX_WAIT_MS) || '', 10);
+    const configuredInterval = parseInt((env && env.IMAGE_TASK_INTERVAL_MS) || '', 10);
+    return await pollModelScopeTask({
+      apiUrl: cfg.apiUrl,
+      apiKey: cfg.currentApiKey,
+      taskId: data.task_id,
+      maxWaitMs: configured > 0 ? configured : undefined,
+      intervalMs: configuredInterval > 0 ? configuredInterval : undefined,
+      outputImages: data.output_images,
+      fetchImpl: doFetch,
+    });
+  }
+
+  const url = pickImageUrl(data);
+  if (url) return { url };
+  // 部分中转网关把图片塞进 choices[].message.content
+  const ch = data && data.choices && data.choices[0];
+  const content = ch && (ch.message || ch.delta) && (ch.message || ch.delta).content;
+  if (typeof content === 'string' && content) return { text: content };
+  return { error: '图片生成失败或未返回格式' };
 }
