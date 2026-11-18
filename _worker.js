@@ -11,6 +11,7 @@ import { handleKbList } from './src/kb/api.js';
 import { handleTgWebhook } from './src/telegram/handler.js';
 import { handleWxWebhook, handleWxApi, handleWxScheduled, maybeWakeWxDaemon } from './src/wechat/handler.js';
 import { ICON_B64, getIconBytes } from './src/pwa/icons.js';
+import { findImageUrl, extractImageMarkdown } from './src/utils.js';
 import { MANIFEST_JSON } from './src/pwa/manifest.js';
 import { SW_JS } from './src/pwa/service-worker.js';
 import { getPwaVersion } from './src/pwa/version.js';
@@ -128,14 +129,14 @@ async function routeRequest(request, env, ctx) {
           return new Response(upstreamResponse.body, { headers: SSE_HEADERS });
         } else {
           const responseData = await upstreamResponse.json();
-          let imageUrlOrText = "图片生成失败或未返回格式";
-          
-          if (responseData.data && responseData.data[0]?.url) {
-            imageUrlOrText = `![生成结果](${responseData.data[0].url})`;
-          } else if (responseData.data && responseData.data[0]?.b64_json) {
-            imageUrlOrText = `![生成结果](data:image/png;base64,${responseData.data[0].b64_json})`;
-          } else if (responseData.choices && responseData.choices[0]?.message) {
-            imageUrlOrText = responseData.choices[0]?.message.content;
+          // 兼容多种文生图返回结构（OpenAI data[]、Gemini inlineData、通义 output.results、
+          // 中转网关塞进 choices[].message.content 的图片）；解析不出时把字段列出来便于定位。
+          let imageUrlOrText = extractImageMarkdown(responseData);
+          if (!imageUrlOrText) {
+            const shape = responseData && typeof responseData === 'object'
+              ? Object.keys(responseData).join(', ')
+              : typeof responseData;
+            imageUrlOrText = `图片生成失败或未返回格式（上游响应字段：${shape || '空对象'}）。请检查文生图通道的返回结构。`;
           }
 
           const encoder = new TextEncoder();
