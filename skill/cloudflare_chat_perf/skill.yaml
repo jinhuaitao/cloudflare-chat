@@ -1,0 +1,5 @@
+name: "cloudflare_chat_perf"
+title: "Cloudflare Chat Performance"
+description: "Improve latency, token cost, and R2 usage for the cloudflare-chat Workers project while protecting its Agent, memory, and knowledge base invariants."
+category: "Work and knowledge"
+include_in_prompt: false
