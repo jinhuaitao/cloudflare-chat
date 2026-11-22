@@ -9,12 +9,30 @@
 // 调研类要多跑几步多读几篇，写作类给多了只会增加发散风险，预算跟着任务形态走。
 // chain 可选：人格接力时预算取链上角色的最大值，步数额外 +2——
 // 阶段切换本身要消耗一步，不能让第二阶段刚开始就撞上限。
+//
+// v7.37.0：返回里多一个 explicit，逐项标明该值是不是管理员显式配的——
+// 「显式」= 环境变量存在且解析出一个 >0 的数（之后再夹取不影响判定：
+// 写了 1ms 也是显式配过，只是被夹到下限 1000ms；写错/写 0/写负数/没写
+// 都不算显式，走人格或默认值）。evolveLimits 靠它判断 overlay 该不该
+// 叠加：显式配过的项，已应用的限流提案也不再覆盖——「显式配置优先」
+// 从此对人格预算与全局工具限流都成立（之前只对前者成立，见 overlay.js）。
 function agentLimits(env, persona, chain) {
   env = env || {};
   const chainList = Array.isArray(chain) && chain.length > 1 ? chain : null;
+  const explicit = {
+    maxSteps: false,
+    timeoutMs: false,
+    toolTimeoutMs: false,
+    toolConcurrency: false,
+    ctxBudget: false,
+    wrapReserveMs: false,
+  };
+  const envInt = (key) => parseInt(env[key], 10);
 
-  let maxSteps = parseInt(env.AGENT_MAX_STEPS, 10);
-  if (!(maxSteps > 0)) {
+  let maxSteps = envInt('AGENT_MAX_STEPS');
+  if (maxSteps > 0) {
+    explicit.maxSteps = true;
+  } else {
     if (chainList) {
       maxSteps = 0;
       for (const p of chainList) {
@@ -29,24 +47,38 @@ function agentLimits(env, persona, chain) {
   }
   if (maxSteps > 12) maxSteps = 12;
 
-  let timeoutMs = parseInt(env.AGENT_TIMEOUT_MS || '240000', 10);
-  if (!(timeoutMs > 0)) timeoutMs = 240000;
+  let timeoutMs = envInt('AGENT_TIMEOUT_MS');
+  if (timeoutMs > 0) {
+    explicit.timeoutMs = true;
+  } else {
+    timeoutMs = 240000;
+  }
   if (timeoutMs > 600000) timeoutMs = 600000;
 
   // 单个工具单次执行上限（毫秒）：真正生效值还会被「本轮剩余预算」进一步压缩
-  let toolTimeoutMs = parseInt(env.AGENT_TOOL_TIMEOUT_MS || '30000', 10);
-  if (!(toolTimeoutMs > 0)) toolTimeoutMs = 30000;
+  let toolTimeoutMs = envInt('AGENT_TOOL_TIMEOUT_MS');
+  if (toolTimeoutMs > 0) {
+    explicit.toolTimeoutMs = true;
+  } else {
+    toolTimeoutMs = 30000;
+  }
   if (toolTimeoutMs < 1000) toolTimeoutMs = 1000;
   if (toolTimeoutMs > 120000) toolTimeoutMs = 120000;
 
   // 单步内并行执行工具的最大并发数：防止模型一次吐 8 个调用时同时打出 8 个外部请求
-  let toolConcurrency = parseInt(env.AGENT_TOOL_CONCURRENCY || '4', 10);
-  if (!(toolConcurrency > 0)) toolConcurrency = 4;
+  let toolConcurrency = envInt('AGENT_TOOL_CONCURRENCY');
+  if (toolConcurrency > 0) {
+    explicit.toolConcurrency = true;
+  } else {
+    toolConcurrency = 4;
+  }
   if (toolConcurrency > 8) toolConcurrency = 8;
 
   // 单轮上下文字符预算：超出后自动折叠早期工具输出并压缩更早的历史轮次
-  let ctxBudget = parseInt(env.AGENT_CONTEXT_BUDGET, 10);
-  if (!(ctxBudget > 0)) {
+  let ctxBudget = envInt('AGENT_CONTEXT_BUDGET');
+  if (ctxBudget > 0) {
+    explicit.ctxBudget = true;
+  } else {
     if (chainList) {
       ctxBudget = 0;
       for (const p of chainList) {
@@ -62,11 +94,15 @@ function agentLimits(env, persona, chain) {
   if (ctxBudget > 200000) ctxBudget = 200000;
 
   // 收尾预留：剩余预算低于这个值时不再发起新工具调用，直接汇总作答
-  let wrapReserveMs = parseInt(env.AGENT_WRAP_RESERVE_MS || '8000', 10);
-  if (!(wrapReserveMs > 0)) wrapReserveMs = 8000;
+  let wrapReserveMs = envInt('AGENT_WRAP_RESERVE_MS');
+  if (wrapReserveMs > 0) {
+    explicit.wrapReserveMs = true;
+  } else {
+    wrapReserveMs = 8000;
+  }
   if (wrapReserveMs > 30000) wrapReserveMs = 30000;
 
-  return { maxSteps, timeoutMs, toolTimeoutMs, toolConcurrency, ctxBudget, wrapReserveMs };
+  return { maxSteps, timeoutMs, toolTimeoutMs, toolConcurrency, ctxBudget, wrapReserveMs, explicit };
 }
 
 // 工具调用的人类可读描述，用于进度提示与 Web 端工具调用轨迹胶囊

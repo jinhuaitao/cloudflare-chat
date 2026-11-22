@@ -643,8 +643,11 @@ test('拿到 ctx 时记忆写入挂 waitUntil，不在返回前串行等待', as
       [{ role: 'user', content: '你好' }], true, null,
       { maxRuntimeMs: 30000, ctx, workingMemory: true });
     assert.ok(r.text.includes('好的'));
-    assert.equal(waited.length, 1, '记忆写入应被托管给运行时（waitUntil），而不是阻塞返回');
-    await waited[0]; // 收尾，避免悬挂 promise
+    // v7.22.0：记忆写入仍挂 waitUntil；自我进化的指标落盘（攒够 10 轮时）
+    // 也可能再挂一个 waitUntil，所以只断言「至少有一次托管、且不阻塞返回」，
+    // 不再断言恰好 1 次。
+    assert.ok(waited.length >= 1, '记忆写入应被托管给运行时（waitUntil），而不是阻塞返回');
+    await Promise.all(waited.map(p => Promise.resolve(p).catch(() => {}))); // 收尾，避免悬挂 promise
     // 不传 ctx 时保持串行语义（老调用方与单测依赖这个行为）
     const r2 = await tgAgentChat(ENV, noopTgApi, 'p_chat8', 'mock-model',
       [{ role: 'user', content: '你好' }], true, null, { maxRuntimeMs: 30000, workingMemory: true });

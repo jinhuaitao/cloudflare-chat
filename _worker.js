@@ -10,6 +10,7 @@ import { handleWebAgent } from './src/web-agent.js';
 import { handleKbList } from './src/kb/api.js';
 import { handleTgWebhook } from './src/telegram/handler.js';
 import { handleWxWebhook, handleWxApi, handleWxScheduled, maybeWakeWxDaemon } from './src/wechat/handler.js';
+import { evolveStatusText, runEvolveScheduled } from './src/evolve/index.js';
 import { ICON_B64, getIconBytes } from './src/pwa/icons.js';
 import { runImageRequest } from './src/image-task.js';
 import { MANIFEST_JSON } from './src/pwa/manifest.js';
@@ -71,6 +72,16 @@ async function routeRequest(request, env, ctx) {
     // 只读：写入入口仍只在 Telegram / 微信 ClawBot，这里不提供任何写操作。
     if (request.method === 'GET' && url.pathname === '/api/kb/list') {
       return await handleKbList(request, env);
+    }
+
+    // v7.22.0 自我进化只读状态：聚合计数 + 提案清单，不含用户原文与密钥。
+    // 与 /api/chat 同一套口令策略：配了 ACCESS_PASSWORD 就要带 X-Access-Token。
+    // 审批/回滚只在 Telegram 管理员命令里做，网页端不提供写入口。
+    if (request.method === 'GET' && url.pathname === '/api/evolve/status') {
+      const denied = denyUnauthorized(env, request);
+      if (denied) return denied;
+      const text = await evolveStatusText(env);
+      return new Response(JSON.stringify({ ok: true, status: text }), { headers: CORS_HEADERS });
     }
 
     if (request.method === 'POST' && url.pathname === '/api/chat') {
@@ -208,8 +219,11 @@ export default {
     return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h });
   },
 
-  // Cloudflare Cron Triggers：后台自动长轮询微信 ClawBot (iLink) 新消息并回复
+  // Cloudflare Cron Triggers：后台自动长轮询微信 ClawBot (iLink) 新消息并回复；
+  // v7.22.0 再加每天一次的自我进化周期（runEvolveScheduled 内部按 UTC 日期去重，
+  // 其余分钟直接跳过；失败绝不影响微信轮询）。
   async scheduled(event, env, ctx) {
     await handleWxScheduled(event, env, ctx);
+    try { await runEvolveScheduled(env, ctx); } catch (e) {}
   },
 };

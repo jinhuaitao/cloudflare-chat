@@ -22,6 +22,7 @@ import { tgAgentChat, tgAgentResume } from '../agent/loop.js';
 import { readErrorBody } from '../agent/stability.js';
 import { toolListDocs, toolSaveDoc, toolReadDoc, toolDeleteDoc } from '../kb/doc-tools.js';
 import { autoOrganizeAndSaveKbDoc, deriveFileDocTitle } from '../kb/organize.js';
+import { isEvolveAdmin, handleEvolveCommand, evolveKbDoc } from '../evolve/index.js';
 import {
   DEFAULT_ILINK_BASE_URL,
   DEFAULT_ILINK_CDN_URL,
@@ -606,6 +607,9 @@ export async function handleTgWebhook(request, env, ctx) {
                 + "/savekb [标题] —— 把最近这段对话自动整理成结构化文档入库\n"
                 + "/readdoc 标题关键词 —— 精读某篇知识库文档\n"
                 + "/deldoc 标题关键词 —— 删除某篇知识库文档\n"
+                + "/evolve —— 自我进化状态（仅管理员，见 /evolve 说明）\n"
+                + "/evolve kb <主题> —— 为缺失主题从最近对话整理建档\n"
+                + "/evolve kb-draft <id> —— 确认 KB 草稿并从最近对话建档（草稿见 /evolve list）\n"
                 + "/wxlogin、/wxstatus、/wxunbind ——（私聊专属）安全扫码绑定/查看/解绑微信 ClawBot\n"
                 + "任务太长被暂停时，发送「继续」（群聊可 @我 继续 或直接回复我「继续」）可接着做\n\n"
                 + "👥 群聊用法：在群里直接 `@机器人 你的问题`，或直接「回复（Reply）」机器人的上一条消息即可连续对话（传图/传文件同理）。\n"
@@ -640,6 +644,61 @@ export async function handleTgWebhook(request, env, ctx) {
               + '• 直接上传 .md/.txt/.csv/.json 文件并附言「存进知识库」即全文入库；说「把…存成知识库文档」也可以';
             for (let s = 0; s < text.length; s += 4000) {
               await tgApi('sendMessage', { chat_id: chatId, text: text.slice(s, s + 4000), ...replyExtra });
+            }
+            return;
+          }
+
+          // v7.22.0 自我进化管理：仅 EVO_ADMIN_CHAT_ID 配置的管理员可用。
+          // 命令处理收敛在 src/evolve/index.js 的 handleEvolveCommand，
+          // 与微信端共用同一份逻辑；群聊里非管理员只会看到一句提示，
+          // 不会泄露提案细节。
+          if (cmd && cmd.cmd === '/evolve') {
+            if (!isEvolveAdmin(env, chatId)) {
+              await tgApi('sendMessage', { chat_id: chatId, text: '🔒 自我进化管理仅限管理员使用。请先在 Worker 环境变量里配置 EVO_ADMIN_CHAT_ID（你的 Telegram user_id），再发 /evolve。', ...replyExtra });
+              return;
+            }
+            const args = String(cmd.rest || '').trim().split(/\s+/).filter(Boolean);
+            let outText = '';
+            try {
+              // v7.25.0 /evolve kb <主题>：KB 缺失主题一键建档。
+              // 需要最近对话记录，所以只在 Telegram 分支做（共享的
+              // handleEvolveCommand 拿不到 history）。
+              if ((args[0] || '').toLowerCase() === 'kb') {
+                const topic = args.slice(1).join(' ').trim();
+                if (!topic) {
+                  outText = '用法：/evolve kb <主题>\n例如：/evolve kb 失传秘籍\n（从最近 12 轮对话整理成文档入库）';
+                } else {
+                  const hist = await tgGetHistory(env, chatId);
+                  let kbModelId = mapGetBounded(tgUserModels, chatId, env && env.R2 ? tgUserModelsExp : null);
+                  if (!kbModelId) kbModelId = (await storeGet(env, `tg_user_${chatId}`)) || '';
+                  await tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
+                  const kbRes = await evolveKbDoc(env, chatId, kbModelId, topic, hist);
+                  outText = kbRes.ok
+                    ? '📚 已为「' + topic + '」建档：《' + (kbRes.title || topic) + '》\n'
+                      + '────────────\n' + (kbRes.organizedSummary || '（无摘要）') + '\n────────────\n✅ ' + (kbRes.saveResult || '')
+                    : '⚠️ 建档失败：' + (kbRes.error || kbRes.saveResult || '未知原因');
+                }
+              } else if ((args[0] || '').toLowerCase() === 'kb-draft') {
+                // v7.31.0 /evolve kb-draft <id>：确认 KB 草稿并建档。
+                // 同样需要最近对话记录：先在这里取 history 与模型，
+                // 再交给共用的 handleEvolveCommand（确认逻辑在里面）。
+                if (!args[1]) {
+                  outText = '用法：/evolve kb-draft <草稿 id>\n（草稿见 /evolve list，从最近 12 轮对话整理成文档入库）';
+                } else {
+                  const hist = await tgGetHistory(env, chatId);
+                  let kbModelId = mapGetBounded(tgUserModels, chatId, env && env.R2 ? tgUserModelsExp : null);
+                  if (!kbModelId) kbModelId = (await storeGet(env, `tg_user_${chatId}`)) || '';
+                  await tgApi('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
+                  outText = await handleEvolveCommand(env, args, 'tg:' + chatId, { history: hist, modelId: kbModelId, chatId });
+                }
+              } else {
+                outText = await handleEvolveCommand(env, args, 'tg:' + chatId);
+              }
+            } catch (e) {
+              outText = '⚠️ 自我进化操作失败：' + (e && e.message ? e.message : String(e));
+            }
+            for (let s = 0; s < outText.length; s += 4000) {
+              await tgApi('sendMessage', { chat_id: chatId, text: outText.slice(s, s + 4000), ...replyExtra });
             }
             return;
           }
@@ -873,7 +932,7 @@ export async function handleTgWebhook(request, env, ctx) {
           let webhookBudgetMs = parseInt(env.TG_WEBHOOK_BUDGET_MS || '55000', 10);
           if (!(webhookBudgetMs >= 10000)) webhookBudgetMs = 55000;
           if (webhookBudgetMs > 240000) webhookBudgetMs = 240000;
-          const agentOpts = { maxRuntimeMs: webhookBudgetMs, resumeKey: tgAgentResumeKey(chatId), origUserText: historyUserText, ctx: ctx || null };
+          const agentOpts = { maxRuntimeMs: webhookBudgetMs, resumeKey: tgAgentResumeKey(chatId), origUserText: historyUserText, ctx: ctx || null, channel: 'tg' };
 
           if (useAgent) {
             let lastProgressEdit = 0;

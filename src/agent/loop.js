@@ -48,7 +48,14 @@ import { mapLimit } from '../utils.js';
 import { r2StatsLine } from '../store/r2.js';
 import { sanitizeHistory, lastUserText } from './history.js';
 import { agentGetPersona } from './mode.js';
-import { resolvePersona, personaById, personaAllowsTool, formatPersonaBadge, formatChainBadge, formatRouteHit, formatPersonaTrace, personaRouteDetail, DEFAULT_PERSONA_ID } from './personas.js';
+import { resolvePersona, personaById, personaAllowsTool, formatPersonaBadge, formatChainBadge, formatRouteHit, formatPersonaTrace, personaRouteDetail, DEFAULT_PERSONA_ID, PERSONAS } from './personas.js';
+import { loadEvolveConfig } from '../evolve/store.js';
+import { buildEvolveOverlay, evolveProposalRolloutGroups } from '../evolve/proposals.js';
+import { evolveCohort } from '../evolve/metrics.js';
+import { evolveRolloutPercent } from '../evolve/overlay.js';
+import { evolvePersonas, evolvePersona, evolveLimits } from '../evolve/overlay.js';
+import { recordEvolveRound } from '../evolve/index.js';
+import { extractCandidateTokens, isCorrectionText, isRepeatText, evolveDayKey } from '../evolve/metrics.js';
 
 const WRITE_TOOLS_SET = new Set(['remember', 'forget_memory', 'save_doc', 'delete_doc']);
 
@@ -191,18 +198,35 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
   // 内部并行读取，外层仍然只占一个等待位——多读两层不等于多等两轮。
   // v7.13.0：人格也走同一个等待位，命中 L1 缓存时零成本，冷缓存时与另外两读重叠。
   const r2BudgetMs = Math.max(500, Math.min(3000, (opts && opts.r2BudgetMs) || 1500));
-  const [memoryBundle, kbDocs, savedPersona] = await Promise.all([
+  // v7.22.0 自我进化：overlay 与记忆/注册表/人格并行加载，180 秒缓存，
+  // 抖动时回落为「无 overlay」（行为与旧版一致），绝不拖住首字。
+  const [memoryBundle, kbDocs, savedPersona, evolveConfig] = await Promise.all([
     withTimeout(memoryLoad(env, chatId, query, { readOnly: kbReadOnly }), r2BudgetMs, null),
     withTimeout(kbGetRegistry(env), r2BudgetMs, null),
     // 显式人格沿用 truthy 语义：既然不会用存档，就不发起可能阻塞的 R2 读取。
     (opts && opts.persona) ? Promise.resolve(opts.persona)
-      : withTimeout(agentGetPersona(env, chatId), r2BudgetMs, 'auto')
+      : withTimeout(agentGetPersona(env, chatId), r2BudgetMs, 'auto'),
+    withTimeout(loadEvolveConfig(env), r2BudgetMs, null),
   ]);
+  // v7.23.0 灰度：按 chatId 稳定分组，evolve 组走 overlay，control 组
+  // 走原配置；两组都记观测，周期报告才能对比 overlay 的真实效果。
+  // v7.41.0 按提案灰度：overlay 不再直接取全局折叠结果，而是按会话
+  // 逐提案折叠——灰度中的提案只在该会话落入其灰度时生效（同一会话
+  // 对同一提案永远同一组，不同提案分组独立）；全局对照组下所有提案
+  // 都不生效。evolveProposalGroups 记本轮各灰度提案的在/不在，
+  // 随观测事件落盘，状态里按提案对比两组暂停率。
+  const evolveCohortGroup = evolveCohort(chatId, evolveRolloutPercent(env));
+  const evolveOverlay = (evolveCohortGroup === 'evolve' && evolveConfig)
+    ? buildEvolveOverlay(evolveConfig.proposals, chatId) : null;
+  const evolveProposalGroups = evolveConfig
+    ? evolveProposalRolloutGroups(evolveConfig.proposals, chatId, evolveCohortGroup === 'evolve')
+    : { in: [], out: [] };
+  const evolvePersonasList = evolvePersonas(PERSONAS, evolveOverlay);
   const hasKbDocs = Array.isArray(kbDocs) ? kbDocs.length > 0 : undefined;
   // 显式指定（本次调用参数）优先，其次是用户固定的人格，最后按提问自动路由。
   // 传入 safeHistory：短追问在当前句信号不足时可承接上一轮专家，无需额外存储或模型调用。
   // 一句话里出现显式有序阶段（先…然后…）时组成接力链：首位角色主导，链上角色依次接力。
-  const route = resolvePersona((opts && opts.persona) || savedPersona, query, safeHistory);
+  const route = resolvePersona((opts && opts.persona) || savedPersona, query, safeHistory, evolvePersonasList);
   const persona = route.persona;
   const chain = Array.isArray(route.chain) && route.chain.length > 1 ? route.chain : null;
   // 路由「为什么」：自动选中非通用角色时，首步进度里带一句「命中：xx、xx」/「接力：A → B」，让用户看得见依据
@@ -215,11 +239,13 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
   for (const m of safeHistory) messages.push(m);
 
   const deadline = tgAgentDeadline(env, opts);
+  const loopStartedAt = Date.now();
   const origUserText = (opts && opts.origUserText) !== undefined ? opts.origUserText : query;
+  const evolveOut = {};
   const result = await tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline,
     (opts && opts.resumeKey) || null, false, undefined,
     (opts && opts.onDelta) || null, (opts && opts.onReset) || null, kbReadOnly, origUserText,
-    hasKbDocs, persona, chain, routeWhy);
+    hasKbDocs, persona, chain, routeWhy, evolveOverlay, evolveOut);
   // 回传本次实际使用的人格与路由依据：TG/微信据此显示徽标，
   // Web 端把 personaTrace 挂到消息卡片上，避免「进度条一收起就再也看不出是谁答的」。
   if (result && typeof result === 'object') {
@@ -232,6 +258,44 @@ async function tgAgentChat(env, tgApi, chatId, targetModelId, history, allowTool
     if (trace) result.personaDetail = personaRouteDetail(route, query);
     if (chain) result.personaChain = chain.map(p => p.id);
   }
+  // v7.22.0 自我进化观测：只记结果数字，不记原文；失败也不影响本轮返回。
+  // 续做（resume）不重复记——原轮已记过暂停，续做是同一任务的延续。
+  try {
+    const st = (evolveOut && evolveOut.stats) || {};
+    // 上一轮用户原话：倒序找当前句之前最近的一条 user 消息（不是 assistant）。
+    let prevUser = '';
+    for (let i = safeHistory.length - 2; i >= 0; i--) {
+      const m = safeHistory[i];
+      if (m && m.role === 'user') { prevUser = extractMsgPlainText(m.content || ''); break; }
+    }
+    const outcome = result && result.error ? 'error'
+      : result && result.fallback ? 'fallback'
+      : result && result.paused ? 'paused' : 'ok';
+    const nearMiss = route && route.nearMiss ? route.nearMiss : null;
+    await recordEvolveRound(env, {
+      date: evolveDayKey(new Date()),
+      channel: (opts && opts.channel) || 'web',
+      group: evolveCohortGroup,
+      proposalRollout: evolveProposalGroups,
+      personaId: persona.id,
+      routeSource: route.source,
+      routeReason: route.reason,
+      outcome,
+      steps: st.steps || 0,
+      tools: st.tools || 0,
+      fails: st.fails || 0,
+      ms: st.ms || Math.max(0, Date.now() - loopStartedAt),
+      truncated: !!st.truncated,
+      toolCalls: Array.isArray(st.toolCalls) ? st.toolCalls : [],
+      kbMissTopics: Array.isArray(st.kbMissTopics) ? st.kbMissTopics : [],
+      query,
+      nearMissPersonaId: nearMiss ? nearMiss.personaId : '',
+      nearMissTokens: nearMiss ? extractCandidateTokens(query, 5) : [],
+      correction: isCorrectionText(query),
+      repeat: isRepeatText(query) || (prevUser && prevUser.trim() === query.trim()),
+      continue: false,
+    }, opts && opts.ctx);
+  } catch (e) {}
   await recordWorkingMemory(env, chatId, origUserText, result, opts);
   return result;
 }
@@ -270,10 +334,16 @@ async function tgAgentResume(env, tgApi, chatId, saved, onProgress, opts) {
   const kbReadOnly = !!saved.kbReadOnly;
   // 人格跟着存档走：恢复后不能因为自动路由换了个角色，导致工具集与提示词口径不一致。
   // 旧存档没有 personaId，回落通用人格（与旧版行为一致）。
-  const persona = personaById(saved.personaId);
+  const evolveConfigResume = await loadEvolveConfig(env).catch(() => null);
+  // v7.23.0：续做也走同一灰度分组，对照组不叠加 overlay。
+  // v7.41.0：续做同样按会话逐提案折叠（与主入口同一口径），
+  // 避免同一会话在续做时突然换组。
+  const evolveOverlayResume = (evolveCohort(chatId, evolveRolloutPercent(env)) === 'evolve'
+    && evolveConfigResume) ? buildEvolveOverlay(evolveConfigResume.proposals, chatId) : null;
+  const persona = evolvePersona(personaById(saved.personaId), evolveOverlayResume);
   // 接力链也随存档恢复：链上工具白名单是并集，少了链会让第二阶段的工具凭空消失
   const chain = Array.isArray(saved.chainIds) && saved.chainIds.length > 1
-    ? saved.chainIds.map(id => personaById(id)).filter(p => p && p.id !== DEFAULT_PERSONA_ID)
+    ? saved.chainIds.map(id => evolvePersona(personaById(id), evolveOverlayResume)).filter(p => p && p.id !== DEFAULT_PERSONA_ID)
     : null;
   const chainOk = Array.isArray(chain) && chain.length > 1 ? chain : null;
   const tools = allowTools ? getAgentTools(kbReadOnly, { hasKbDocs: saved.hasKbDocs, persona, chain: chainOk }) : null;
@@ -282,18 +352,22 @@ async function tgAgentResume(env, tgApi, chatId, saved, onProgress, opts) {
   const result = await tgAgentRunLoop(env, tgApi, chatId, saved.targetModelId, saved.messages, tools, allowTools, onProgress, deadline,
     (opts && opts.resumeKey) || null, true, baseLoopStartIdx,
     (opts && opts.onDelta) || null, (opts && opts.onReset) || null, kbReadOnly, saved.origUserText || '',
-    saved.hasKbDocs, persona, chainOk, '');
+    saved.hasKbDocs, persona, chainOk, '', evolveOverlayResume, null);
   await recordWorkingMemory(env, chatId, saved.origUserText || '', result, opts);
   return result;
 }
 
-async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume, baseLoopStartIdx, onDelta, onReset, kbReadOnly, origUserText, hasKbDocs, persona, chain, routeWhy) {
+async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools, allowTools, onProgress, deadline, resumeKey, isResume, baseLoopStartIdx, onDelta, onReset, kbReadOnly, origUserText, hasKbDocs, persona, chain, routeWhy, evolveOverlay, evolveOut) {
   // 不原地修改调用方数组：断点存档的 messages 被 push 后就被污染了，
   // 同一份存档再跑一次（如 fallback 重试）会带着上一轮的 assistant/tool 消息，序列直接错乱
   messages = Array.isArray(messages) ? messages.slice() : [];
   persona = persona || personaById(DEFAULT_PERSONA_ID);
   chain = Array.isArray(chain) && chain.length > 1 ? chain : null;
-  const limits = agentLimits(env, persona, chain);
+  // v7.22.0：人格预算已随克隆人格带入（env 显式配置仍优先）；全局工具限流再叠加 overlay。
+  // v7.37.0：显式配置优先对限流也成立——agentLimits 带回 explicit，
+  // evolveLimits 只对未显式配置的项叠加 overlay（被压住的项列在返回的
+  // overriddenByEnv 里，见 overlay.js）。
+  const limits = evolveLimits(agentLimits(env, persona, chain), evolveOverlay);
   const maxSteps = limits.maxSteps;
   const ctxBudget = limits.ctxBudget;
   const useUpstreamStream = env.AGENT_STREAM_UPSTREAM !== '0';
@@ -389,6 +463,18 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
   // 性能埋点：只在 AGENT_DEBUG_STATS=1 时输出，方便用 wrangler tail 量化每一步的真实开销
   const debugStats = env.AGENT_DEBUG_STATS === '1';
   const stats = { steps: 0, tools: 0, fails: 0, ctxChars: 0, ctxMsgs: 0 };
+  // v7.22.0 自我进化观测：工具分项 + 是否截断，随 finally 写回 evolveOut，
+  // 早退（return）也会经过 finally，所以任何出口都有统计。
+  const toolBreakdown = new Map();
+  // v7.36.0 逐次耗时上报：每次真实执行工具调用后把单次耗时（ms）
+  // 记进这个数组，finally 里按工具分进 evolveOut.stats.toolCalls[i].samples。
+  // 只记数字（工具名 + 毫秒整数），不记调用参数与结果文本；白名单拦截 /
+  // 参数解析失败 / 记忆化短路 / 剩余时间不足都没真正执行（ms 为 0），
+  // 不进样本——p95 只看真实执行的耗时。单轮样本上限定 200 条（正常一轮
+  // 只有个位数到几十次调用），超了丢最旧的；日聚合层面仍只留最近 50 条。
+  const toolLatencySamples = [];
+  const kbMissTopics = [];
+  let evolveTruncated = false;
   const toolsChars = debugStats && tools ? JSON.stringify(tools).length : 0;
   const emitStats = () => {
     if (!debugStats) return;
@@ -540,6 +626,7 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
       };
     }
 
+    if (msg.finishReason === 'length') evolveTruncated = true;
     let toolCalls = msg.toolCalls || [];
     let assistantText = msg.content || '';
     if (!toolCalls.length && assistantText.indexOf('DSML') !== -1) {
@@ -707,6 +794,37 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
     let stepFailed = 0;
     stats.tools += toolResults.length;
     for (const tr of toolResults) {
+      const nm = (tr.tc && tr.tc.function && tr.tc.function.name) || 'unknown';
+      const slot = toolBreakdown.get(nm) || { calls: 0, fails: 0, ms: 0, timeouts: 0 };
+      slot.calls += 1;
+      if (tr.failed) slot.fails += 1;
+      slot.ms += Math.max(0, tr.ms || 0);
+      if (typeof tr.result === 'string' && (tr.result.includes('执行超时') || tr.result.includes('剩余时间不足'))) slot.timeouts += 1;
+      toolBreakdown.set(nm, slot);
+      // v7.36.0：单次真实耗时进样本（tr.ms > 0 才算真正执行过；
+      // execAgentTool 返回的 ms 恒 ≥1，短路路径一律是 0）。
+      // 记录失败静默跳过，绝不能影响本轮回复。
+      try {
+        if (tr && typeof tr.ms === 'number' && tr.ms > 0) {
+          if (toolLatencySamples.length >= 200) toolLatencySamples.shift();
+          toolLatencySamples.push({ name: nm, ms: Math.round(tr.ms) });
+        }
+      } catch (e) {}
+      // v7.24.0：read_doc 没读到东西时记下要找的主题（只记主题词）。
+      // 信号看结果文案，不改失败判定：知识库为空时 read_doc 本身不算失败，
+      // 但主题确实是缺的。
+      if (nm === 'read_doc' && typeof tr.result === 'string') {
+        const r = tr.result;
+        if (r.startsWith('文档读取失败') || r.startsWith('未找到') || r.startsWith('未在已检索的') || r.startsWith('知识库文档为空')) {
+          try {
+            const args = JSON.parse((tr.tc && tr.tc.function && tr.tc.function.arguments) || '{}');
+            const topic = String(args.query || '').trim();
+            if (topic.length >= 2 && topic.length <= 30) kbMissTopics.push(topic);
+          } catch (e) {}
+        }
+      }
+    }
+    for (const tr of toolResults) {
       const fn = (tr.tc && tr.tc.function) || {};
       messages.push({
         role: 'tool',
@@ -737,6 +855,25 @@ async function tgAgentRunLoop(env, tgApi, chatId, targetModelId, messages, tools
   } finally {
     clearInterval(heartbeat);
     emitStats();
+    if (evolveOut && typeof evolveOut === 'object') {
+      try {
+        evolveOut.stats = {
+          steps: stats.steps,
+          tools: stats.tools,
+          fails: stats.fails,
+          ms: Math.max(0, Date.now() - loopStartedAt),
+          truncated: evolveTruncated,
+          // v7.36.0：每工具多一个 samples——本轮该工具每次真实执行的
+          // 单次耗时（毫秒整数，按调用顺序）；没有真实执行时为空数组。
+          // 聚合字段（calls/fails/ms 总和）照旧保留，老事件读得懂。
+          toolCalls: [...toolBreakdown.entries()].map(([name, v]) => ({
+            name, calls: v.calls, fails: v.fails, ms: v.ms, timeouts: v.timeouts || 0,
+            samples: toolLatencySamples.filter(s => s.name === name).map(s => s.ms),
+          })),
+          kbMissTopics: kbMissTopics.slice(),
+        };
+      } catch (e) {}
+    }
   }
 
   const wrapUp = await agentWrapUp(env, targetModelId, messages, loopStartIdx, ctxBudget, deadline, onDelta, wrapReserveMs);

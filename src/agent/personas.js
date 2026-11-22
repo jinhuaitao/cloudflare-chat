@@ -428,9 +428,12 @@ function scorePersona(persona, text) {
 }
 
 // 全部非通用人格一次性打分并降序排列；提问只转一次小写（旧版每个角色转一次）
-function rankPersonas(text) {
+// personaList 可选：自我进化 overlay 传克隆后的人格表（带新增关键词），
+// 不传则用注册表原表——旧调用与单测行为不变。
+function rankPersonas(text, personaList) {
   const t = String(text || '').toLowerCase();
-  return PERSONAS
+  const list = Array.isArray(personaList) ? personaList : PERSONAS;
+  return list
     .filter(p => p.id !== DEFAULT_PERSONA_ID)
     .map(p => ({ persona: p, ...scorePersonaLower(p, t) }))
     .sort((a, b) => b.score - a.score);
@@ -441,7 +444,12 @@ function decideRoute(ranked) {
   const top = ranked[0];
   const second = ranked[1];
   if (!top || top.score < MIN_SCORE) {
-    return { persona: PERSONA_MAP.get(DEFAULT_PERSONA_ID), source: 'auto', score: top ? top.score : 0, matched: [], reason: 'low' };
+    // v7.22.0 自我进化：回落时保留「差点命中的人格」，供近 miss 关键词提案用；
+    // 命中为 0 时没有近 miss，记 null 而不是瞎猜一个人格。
+    const nearMiss = top && top.score > 0
+      ? { personaId: top.persona.id, score: top.score, matched: top.matched.slice(0, 3) }
+      : null;
+    return { persona: PERSONA_MAP.get(DEFAULT_PERSONA_ID), source: 'auto', score: top ? top.score : 0, matched: [], reason: 'low', nearMiss };
   }
   // 「XX 的原理是什么」这类问法容易被教学词吃满，但主语是具体语言/框架/中间件时，
   // 用户要的是工程级解释（版本、源码、坑），不是入门课。此时让 coder 压过 tutor。
@@ -460,14 +468,17 @@ function decideRoute(ranked) {
     }
   }
   if (second && second.score === top.score) {
-    return { persona: PERSONA_MAP.get(DEFAULT_PERSONA_ID), source: 'auto', score: top.score, matched: [], reason: 'ambiguous' };
+    const nearMiss = top && top.score > 0
+      ? { personaId: top.persona.id, score: top.score, matched: top.matched.slice(0, 3) }
+      : null;
+    return { persona: PERSONA_MAP.get(DEFAULT_PERSONA_ID), source: 'auto', score: top.score, matched: [], reason: 'ambiguous', nearMiss };
   }
   return { persona: top.persona, source: 'auto', score: top.score, matched: top.matched, reason: 'matched' };
 }
 
 // 自动路由：命中不足或前两名同分（意图不明确）时回落通用人格
-function routePersona(text) {
-  return decideRoute(rankPersonas(text));
+function routePersona(text, personaList) {
+  return decideRoute(rankPersonas(text, personaList));
 }
 
 // 短追问识别：只有明显的承接语气或指代词才允许沿用上一轮角色。
@@ -496,7 +507,7 @@ function userMessageText(m) {
 }
 
 // 从最近三条更早的用户提问中找专业上下文；不读 R2、不存额外状态
-function routeFromHistory(history) {
+function routeFromHistory(history, personaList) {
   if (!Array.isArray(history)) return null;
   let skippedCurrent = false;
   let checked = 0;
@@ -507,7 +518,7 @@ function routeFromHistory(history) {
     const previous = userMessageText(m).trim();
     if (!previous) continue;
     checked += 1;
-    const r = routePersona(previous);
+    const r = routePersona(previous, personaList);
     if (r.persona.id !== DEFAULT_PERSONA_ID && (r.reason === 'matched' || r.reason === 'tech')) return r;
     if (checked >= 3) break;
   }
@@ -553,13 +564,14 @@ function splitChainSegments(text) {
 // 后续阶段放宽到「任意领域信号」（≥1 分）——上下文已被首段锚定，
 // 「然后排个期」这类短句天然只有弱词，但在接力语境下指向是明确的。
 // 返回 null 表示这不是多阶段任务，走常规单人格路由。
-function routeChain(text) {
+function routeChain(text, personaList) {
   const segs = splitChainSegments(text);
   if (!segs) return null;
-  const rankedList = segs.map(seg => rankPersonas(seg));
+  const rankedList = segs.map(seg => rankPersonas(seg, personaList));
+  const list = Array.isArray(personaList) ? personaList : PERSONAS;
+  const general = list.find(p => p.id === DEFAULT_PERSONA_ID) || PERSONA_MAP.get(DEFAULT_PERSONA_ID);
   const first = rankedList[0][0];
   if (!first || first.score < MIN_SCORE) return null;
-  const general = PERSONA_MAP.get(DEFAULT_PERSONA_ID);
   const chain = [first.persona];
   const detail = [{ segment: segs[0], persona: first.persona, score: first.score, matched: first.matched }];
   for (let i = 1; i < segs.length; i++) {
@@ -583,13 +595,15 @@ function routeChain(text) {
 // 统一入口：显式指定（manual）优先，'auto'/空值走路由。
 // history 可选：当前问题信号不足且明显是短追问时，承接最近的专业角色。
 // 路由顺序：手动固定 > 多阶段接力 > 当前句单人格 > 短追问承接。
-function resolvePersona(explicitId, text, history) {
+function resolvePersona(explicitId, text, history, personaList) {
   const raw = String(explicitId || '').trim().toLowerCase();
   if (raw && raw !== 'auto' && raw !== '自动') {
-    const p = getPersona(raw);
+    const p = Array.isArray(personaList)
+      ? personaList.find(x => x && x.id === normalizePersonaId(raw))
+      : getPersona(raw);
     if (p) return { persona: p, source: 'manual', score: 0, matched: [], reason: 'manual' };
   }
-  const chained = routeChain(text);
+  const chained = routeChain(text, personaList);
   if (chained) {
     return {
       persona: chained.chain[0],
@@ -602,9 +616,9 @@ function resolvePersona(explicitId, text, history) {
       chainDetail: chained.detail,
     };
   }
-  const direct = routePersona(text);
+  const direct = routePersona(text, personaList);
   if ((direct.reason === 'low' || direct.reason === 'ambiguous') && isFollowUpText(text)) {
-    const previous = routeFromHistory(history);
+    const previous = routeFromHistory(history, personaList);
     if (previous) {
       return {
         persona: previous.persona,
@@ -837,6 +851,7 @@ export {
   scorePersona,
   routePersona,
   resolvePersona,
+  rankPersonas,
   explainRoute,
   splitChainSegments,
   routeChain,

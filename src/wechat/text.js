@@ -113,6 +113,46 @@ function parseWxCommand(text) {
   if (/^(状态|连接状态|运行状态|系统状态)$/.test(s)) {
     return { cmd: '/status', rest: '' };
   }
+  // 自我进化（v7.23.0）：微信端与 Telegram /evolve 共用同一套处理，
+  // 门禁靠通道本身的 owner 锁（只有绑定的机主能发消息）。
+  if (/^(进化状态|自我进化|进化)$/.test(s)) {
+    return { cmd: '/evolve', rest: '' };
+  }
+  if (/^(进化列表|待审批提案)$/.test(s)) {
+    return { cmd: '/evolve', rest: 'list' };
+  }
+  if (/^(进化运行|跑一次进化)$/.test(s)) {
+    return { cmd: '/evolve', rest: 'run' };
+  }
+  const evoApprove = /^(?:应用提案|批准提案)[:：\s]+(.+)$/.exec(s);
+  if (evoApprove && evoApprove[1].trim()) {
+    return { cmd: '/evolve', rest: 'approve ' + evoApprove[1].trim() };
+  }
+  // v7.34.0：批量应用低风险提案（与 Telegram /evolve approve-low 共用）。
+  if (/^(应用低风险提案|批量应用低风险提案)$/.test(s)) {
+    return { cmd: '/evolve', rest: 'approve-low' };
+  }
+  // v7.39.0：批量审批 dry-run 预览（与 Telegram /evolve approve-low preview 共用）。
+  if (/^(预览低风险提案|批量审批预览)$/.test(s)) {
+    return { cmd: '/evolve', rest: 'approve-low preview' };
+  }
+  const evoReject = /^(?:否决提案|拒绝提案)[:：\s]+(.+)$/.exec(s);
+  if (evoReject && evoReject[1].trim()) {
+    return { cmd: '/evolve', rest: 'reject ' + evoReject[1].trim() };
+  }
+  const evoRollback = /^(?:回滚提案|撤回提案)[:：\s]+(.+)$/.exec(s);
+  if (evoRollback && evoRollback[1].trim()) {
+    return { cmd: '/evolve', rest: 'rollback ' + evoRollback[1].trim() };
+  }
+  const evoReview = /^(?:复核提案|评审提案)[:：\s]+(.+)$/.exec(s);
+  if (evoReview && evoReview[1].trim()) {
+    return { cmd: '/evolve', rest: 'review ' + evoReview[1].trim() };
+  }
+  // v7.31.0：确认 KB 草稿并建档（与 Telegram /evolve kb-draft <id> 共用）。
+  const evoKbDraft = /^(?:确认草稿)[:：\s]+(.+)$/.exec(s);
+  if (evoKbDraft && evoKbDraft[1].trim()) {
+    return { cmd: '/evolve', rest: 'kb-draft ' + evoKbDraft[1].trim() };
+  }
   const drawMatch = /^(?:画一张|画一幅|画个|画|生成图片|生图)[:：\s]+([\s\S]+)$/.exec(s);
   if (drawMatch && drawMatch[1].trim()) {
     return { cmd: '/draw', rest: drawMatch[1].trim() };

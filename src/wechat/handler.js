@@ -57,6 +57,7 @@ import {
   extractWechatMessageContent,
 } from './ilink.js';
 import { splitWechatText, parseWxCommand } from './text.js';
+import { handleEvolveCommand } from '../evolve/index.js';
 
 // ================= R2 键名与 L1 内存缓存 =================
 const WX_CREDS_KEY = 'wx_clawbot_creds';
@@ -888,6 +889,7 @@ async function processWechatMessage(env, creds, rawMsg, ctx) {
         + `• 「读取文档 标题」或 /readdoc 标题 —— 精读某篇文档全文\n`
         + `• 「删除文档 标题」或 /deldoc 标题 —— 删除某篇文档\n`
         + `• 「状态」或 /status —— 查看通道健康度与会话统计\n`
+        + `• 「进化状态」或 /evolve —— 查看自我进化状态；「进化列表」「应用提案 <id>」「应用低风险提案」「预览低风险提案」「回滚提案 <id>」管理提案；「确认草稿 <id>」确认 KB 草稿并建档\n`
         + `• 「继续」—— 当长任务暂停时接着完成推理\n\n`
         + `▎二、多模态能力\n`
         + `• 🎙️ 发语音：自动语音转文字并回答\n`
@@ -896,6 +898,30 @@ async function processWechatMessage(env, creds, rawMsg, ctx) {
         + `   附言「把《标题》存进知识库」可自定义文档标题`,
         true
       );
+      return { processed: true };
+    }
+
+    // v7.23.0 自我进化管理：与 Telegram /evolve 共用 handleEvolveCommand。
+    // 门禁靠微信通道本身的 owner 锁（只有绑定的机主能走到这里），
+    // 所以这里不再另校验 EVO_ADMIN_CHAT_ID（那是 Telegram user_id）。
+    // v7.31.0：kb-draft 确认建档需要最近对话记录，按 /savekb 的取法
+    // 拿 history 与当前模型，随 opts 一起传给 handleEvolveCommand。
+    if (cmd && cmd.cmd === '/evolve') {
+      const args = String(cmd.rest || '').trim().split(/\s+/).filter(Boolean);
+      let outText = '';
+      try {
+        if ((args[0] || '').toLowerCase() === 'kb-draft') {
+          const hist = await tgGetHistory(env, chatId);
+          outText = await handleEvolveCommand(env, args, 'wx:' + chatId, { history: hist, modelId: activeModelId, chatId });
+        } else {
+          outText = await handleEvolveCommand(env, args, 'wx:' + chatId);
+        }
+      } catch (e) {
+        outText = '⚠️ 自我进化操作失败：' + (e && e.message ? e.message : String(e));
+      }
+      for (let s = 0; s < outText.length; s += 1800) {
+        await sendReply(outText.slice(s, s + 1800), true);
+      }
       return { processed: true };
     }
 
@@ -1206,6 +1232,7 @@ async function processWechatMessage(env, creds, rawMsg, ctx) {
         resumeKey: tgAgentResumeKey(chatId),
         origUserText: historyUserText,
         ctx: ctx || null,
+        channel: 'wx',
       };
       const runAgentTurn = (allowTools) => {
         if (resumeState) {

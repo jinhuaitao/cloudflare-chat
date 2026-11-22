@@ -66,6 +66,7 @@ async function handleWebAgent(env, body, ctx) {
         maxRuntimeMs: webBudgetMs,
         persona: personaId,
         ctx: ctx || null,
+        channel: 'web',
         // v6.9.3：Web 端对知识库只读——写入（remember / save_doc / delete_doc）
         // 仅 Telegram / 微信端开放，Web 访客无法污染全局知识库
         kbReadOnly: true,
