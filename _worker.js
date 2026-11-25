@@ -8,6 +8,7 @@ import { getChannelConfig, buildAIRequest } from './src/channel.js';
 import { readErrorBody } from './src/agent/stability.js';
 import { handleWebAgent } from './src/web-agent.js';
 import { handleKbList } from './src/kb/api.js';
+import { handleWebSessions } from './src/web-sessions.js';
 import { handleTgWebhook } from './src/telegram/handler.js';
 import { handleWxWebhook, handleWxApi, handleWxScheduled, maybeWakeWxDaemon } from './src/wechat/handler.js';
 import { evolveStatusText, runEvolveScheduled } from './src/evolve/index.js';
@@ -72,6 +73,18 @@ async function routeRequest(request, env, ctx) {
     // 只读：写入入口仍只在 Telegram / 微信 ClawBot，这里不提供任何写操作。
     if (request.method === 'GET' && url.pathname === '/api/kb/list') {
       return await handleKbList(request, env);
+    }
+
+    // Web 端对话 R2 同步（GET / PUT / DELETE /api/sessions）：会话原本只存浏览器
+    // localStorage，同步到 R2 后换设备也能继续。只在配了 ACCESS_PASSWORD 时启用，
+    // 写操作复用 /api/chat 的限流；细节见 src/web-sessions.js。
+    if (url.pathname === '/api/sessions') {
+      if ((request.method === 'PUT' || request.method === 'DELETE') && hitRateLimit(request, env)) {
+        return new Response(JSON.stringify({ error: "请求过于频繁，请稍后再试", code: "RATE_LIMITED" }), {
+          status: 429, headers: CORS_HEADERS,
+        });
+      }
+      return await handleWebSessions(request, env, url);
     }
 
     // v7.22.0 自我进化只读状态：聚合计数 + 提案清单，不含用户原文与密钥。

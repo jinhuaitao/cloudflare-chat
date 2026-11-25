@@ -150,6 +150,8 @@ export default `  // ===== 通用弹窗：替掉浏览器原生 confirm() / aler
       abortActiveStream();
     }
     sessions = sessions.filter(s => s.id !== id);
+    // 记墓碑再保存：没有墓碑，别的设备下一次同步会把这个会话又合并回来
+    noteSessionDeleted(id);
     saveSessions();
     if (sessions.length === 0) createNewSession();
     else if (currentSessionId === id) switchSession(sessions[0].id);
