@@ -32,141 +32,6 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
   const ACCESS_TOKEN_KEY = 'access_token';
   let accessToken = localStorage.getItem(ACCESS_TOKEN_KEY) || '';
 
-  // ===== Web 对话 R2 同步（/api/sessions）=====
-  // localStorage 继续做本地缓存与离线兜底；服务端配了 ACCESS_PASSWORD 时，
-  // 再把整份会话同步到 R2。存储键在服务端由口令哈希派生，所以换设备只要
-  // 填同一个口令，拉到的就是同一份对话。同步不可用时静默降级为纯本地，
-  // 行为与从前一致。
-  const SYNC_DELETED_KEY = 'cfchat_deleted_sessions';
-  function dedupeSyncDeleted(list) {
-    const byId = {};
-    const out = [];
-    (list || []).forEach(function (d) {
-      if (!d || typeof d.id !== 'string' || !Number.isFinite(d.at) || d.at <= 0) return;
-      if (!byId[d.id] || byId[d.id] < d.at) byId[d.id] = d.at;
-    });
-    Object.keys(byId).forEach(function (id) { out.push({ id: id, at: byId[id] }); });
-    out.sort(function (a, b) { return b.at - a.at; });
-    return out.slice(0, 200);
-  }
-  function loadSyncDeleted() {
-    try {
-      const arr = JSON.parse(localStorage.getItem(SYNC_DELETED_KEY) || '[]');
-      return Array.isArray(arr) ? dedupeSyncDeleted(arr) : [];
-    } catch (e) { return []; }
-  }
-  let syncDeleted = loadSyncDeleted();
-  function saveSyncDeleted() {
-    try { localStorage.setItem(SYNC_DELETED_KEY, JSON.stringify(syncDeleted)); } catch (e) {}
-  }
-  function noteSessionDeleted(id) {
-    syncDeleted = dedupeSyncDeleted(syncDeleted.concat([{ id: id, at: Date.now() }]));
-    saveSyncDeleted();
-    scheduleSyncPush();
-  }
-  const syncState = { enabled: false, etag: '', timer: null, pushing: false, dirty: false, applying: false };
-  function syncReqHeaders() {
-    const h = { 'Content-Type': 'application/json' };
-    if (accessToken) h['X-Access-Token'] = accessToken;
-    return h;
-  }
-  function sessionSyncStamp(s) { return Number.isFinite(s && s.updatedAt) ? s.updatedAt : 0; }
-  function mergeSyncSessionsLocal(localList, remoteList, deletedList) {
-    const tomb = {};
-    (deletedList || []).forEach(function (d) { if (!tomb[d.id] || tomb[d.id] < d.at) tomb[d.id] = d.at; });
-    const byId = {};
-    function consider(s, isLocal) {
-      if (!s || typeof s.id !== 'string' || !Array.isArray(s.messages)) return;
-      if (s.messages.length === 0) {
-        // 空会话只在本机保留，不跨设备同步：新开的空白页签不该出现在另一台设备上
-        if (isLocal && !byId[s.id]) byId[s.id] = s;
-        return;
-      }
-      const prev = byId[s.id];
-      if (!prev) { byId[s.id] = s; return; }
-      const sAt = sessionSyncStamp(s);
-      const pAt = sessionSyncStamp(prev);
-      const newer = sAt !== pAt ? sAt > pAt : (s.messages.length !== prev.messages.length ? s.messages.length > prev.messages.length : isLocal);
-      if (newer) byId[s.id] = s;
-    }
-    (remoteList || []).forEach(function (s) { consider(s, false); });
-    (localList || []).forEach(function (s) { consider(s, true); });
-    const out = [];
-    Object.keys(byId).forEach(function (id) {
-      const s = byId[id];
-      const at = tomb[id];
-      if (at && at >= sessionSyncStamp(s)) return;
-      out.push(s);
-    });
-    out.sort(function (a, b) { return sessionSyncStamp(b) - sessionSyncStamp(a); });
-    return out.slice(0, MAX_SESSIONS);
-  }
-  function scheduleSyncPush() {
-    if (!syncState.enabled || syncState.applying) return;
-    syncState.dirty = true;
-    if (syncState.timer) clearTimeout(syncState.timer);
-    syncState.timer = setTimeout(function () { pushSyncSessions(false); }, 1500);
-  }
-  function applyRemoteSync(remoteSessions, remoteDeleted, etag) {
-    syncDeleted = dedupeSyncDeleted(syncDeleted.concat(remoteDeleted || []));
-    saveSyncDeleted();
-    if (typeof etag === 'string') syncState.etag = etag;
-    const merged = mergeSyncSessionsLocal(sessions, remoteSessions || [], syncDeleted);
-    if (JSON.stringify(merged) === JSON.stringify(sessions)) return false;
-    syncState.applying = true;
-    sessions = merged;
-    saveSessions();
-    syncState.applying = false;
-    renderSessionList();
-    if (sessions.length === 0) { createNewSession(); return true; }
-    if (!sessions.some(function (s) { return s.id === currentSessionId; })) switchSession(sessions[0].id);
-    else renderMessages();
-    return true;
-  }
-  async function pushSyncSessions(isRetry) {
-    if (!syncState.enabled || syncState.pushing) return;
-    syncState.pushing = true;
-    try {
-      const payloadSessions = sessions.filter(function (s) { return Array.isArray(s.messages) && s.messages.length > 0; });
-      const res = await fetch('/api/sessions', {
-        method: 'PUT',
-        headers: syncReqHeaders(),
-        body: JSON.stringify({ baseEtag: syncState.etag, sessions: payloadSessions, deleted: syncDeleted })
-      });
-      if (res.status === 409) {
-        const data = await res.json().catch(function () { return null; });
-        syncState.pushing = false;
-        if (data && !isRetry) {
-          applyRemoteSync(data.sessions || [], data.deleted || [], data.etag || '');
-          await pushSyncSessions(true);
-        }
-        return;
-      }
-      if (!res.ok) { syncState.enabled = false; return; }
-      const data = await res.json().catch(function () { return null; });
-      if (data && typeof data.etag === 'string') syncState.etag = data.etag;
-      syncState.dirty = false;
-    } catch (e) {
-      // 离线或服务不可达：数据留在本地，下一次保存时再试
-    } finally {
-      syncState.pushing = false;
-    }
-  }
-  async function pullSyncSessions() {
-    try {
-      const res = await fetch('/api/sessions', { headers: syncReqHeaders() });
-      if (!res.ok) { syncState.enabled = false; return; }
-      const data = await res.json().catch(function () { return null; });
-      if (!data || data.enabled !== true) { syncState.enabled = false; return; }
-      syncState.enabled = true;
-      applyRemoteSync(data.sessions || [], data.deleted || [], data.etag || '');
-      const localPayload = sessions.filter(function (s) { return Array.isArray(s.messages) && s.messages.length > 0; });
-      if (JSON.stringify(localPayload) !== JSON.stringify(data.sessions || [])) scheduleSyncPush();
-    } catch (e) {
-      syncState.enabled = false;
-    }
-  }
-
   const messagesDiv = document.getElementById('messages');
   const emptyState = document.getElementById('emptyState');
   const scrollArea = document.getElementById('scrollArea');
@@ -227,18 +92,10 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
     if (sessions.length === 0) createNewSession();
     else switchSession(sessions[0].id);
     renderSessionList();
-    // 启动后异步拉一次 R2 同步：本地先照常渲染，远端到了再合并，不阻塞首屏
-    pullSyncSessions();
   }
 
   function saveSessions() {
     try {
-      // 同步合并时（applying）不盖时间戳：那是远端数据的原样落盘，
-      // 盖上本机时间会让它在下一次合并里假装比别的设备更新
-      if (!syncState.applying) {
-        var cur = sessions.find(function (s) { return s.id === currentSessionId; });
-        if (cur) cur.updatedAt = Date.now();
-      }
       for (var i = 0; i < sessions.length; i++) {
         var msgs = sessions[i].messages;
         if (msgs && msgs.length > MAX_STORE_MSGS) {
@@ -247,7 +104,6 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
       }
       localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions));
     } catch (e) {}
-    if (!syncState.applying) scheduleSyncPush();
   }
 
   function setSidebarOpen(open) {
@@ -310,7 +166,7 @@ export default `  // 会话本地存储：v6.1 起改用 cfchat_sessions；旧 k
     const fallbackModel = modelSelect.options.length > 0 ? modelSelect.options[0].value : "";
     const targetModel = savedDefaultModel || fallbackModel;
 
-    sessions.unshift({ id: newId, title: '新对话', messages: [], model: targetModel, updatedAt: Date.now() });
+    sessions.unshift({ id: newId, title: '新对话', messages: [], model: targetModel });
     if (sessions.length > MAX_SESSIONS) sessions.length = MAX_SESSIONS;
     saveSessions();
     switchSession(newId);

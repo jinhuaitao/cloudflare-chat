@@ -94,21 +94,14 @@ export default `  // ================= PWA =================
     if (installBtn) installBtn.hidden = true;
   }
 
-  function startApp() {
-    init();
+  init();
 
-    // 4) 支持 manifest 快捷方式 /?new=1 —— 直接开一个新会话
-    try {
-      if (new URLSearchParams(location.search).get('new') === '1' && sessions.length > 0) {
-        createNewSession();
-      }
-    } catch (e) {}
-  }
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', startApp, { once: true });
-  } else {
-    startApp();
-  }
+  // 4) 支持 manifest 快捷方式 /?new=1 —— 直接开一个新会话
+  try {
+    if (new URLSearchParams(location.search).get('new') === '1' && sessions.length > 0) {
+      createNewSession();
+    }
+  } catch (e) {}
 
 </script>
 </body>

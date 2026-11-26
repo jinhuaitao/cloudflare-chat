@@ -32,8 +32,6 @@ export default `  const settingsModal = document.getElementById('settingsModal')
       accessToken = accessTokenSetting.value.trim();
       if (accessToken) localStorage.setItem(ACCESS_TOKEN_KEY, accessToken);
       else localStorage.removeItem(ACCESS_TOKEN_KEY);
-      // 口令刚填好 / 改过：立刻试一次 R2 同步拉取，不用等刷新页面
-      if (accessToken && typeof pullSyncSessions === 'function') pullSyncSessions();
     }
     manageModalFocus(settingsModal);
     setTimeout(() => { if (!settingsModal.classList.contains('active')) settingsModal.style.display = 'none'; }, 300);

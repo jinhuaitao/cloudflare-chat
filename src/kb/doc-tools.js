@@ -8,7 +8,7 @@
 // 5) 注册表新增 chars（字符数）与准确的 size（字节数），列表按更新时间限流展示。
 
 import { mapSetBounded, mapGetBounded, mapLimit } from '../utils.js';
-import { storeGet, storeGetRange, storePutChecked, storeList, storeDelete } from '../store/r2.js';
+import { storeGet, storePutChecked, storeList, storeDelete } from '../store/r2.js';
 import { kbSafeChatId } from '../store/kb.js';
 import { KB_DOCS_PREFIX, kbDocSlug, kbNormSource, kbDocTitleOf, kbGetRegistry,
   kbGetRegistryEx, kbMutateRegistry, kbSaveRegistry, kbFindRegEntry, kbRegistryVersion,
@@ -149,7 +149,6 @@ function docSearchTokens(s) {
 //   3) 内容指纹去重——同一篇资料换个标题重复入库会被挡住；
 //   4) 保存动作串行化——注册表是「读-改-写」，并发保存会互相覆盖丢条目。
 const KB_SAVE_MAX_CHARS = 200000;
-const KB_SEEK_STRIDE = 4096;
 const KB_VERSION_DIR = 'kb/versions/';
 const KB_VERSION_KEEP = 3;
 const SAVE_MODES = ['auto', 'create', 'overwrite', 'append', 'prepend'];
@@ -184,46 +183,6 @@ function contentFingerprint(s) {
   const n = Math.min(t.length, 4000);
   for (let i = 0; i < n; i++) h = ((h << 5) + h + t.charCodeAt(i)) >>> 0;
   return t.length.toString(36) + '-' + h.toString(36);
-}
-
-// 长文档分页索引：每约 4096 个 UTF-16 字符记录一次 UTF-8 字节偏移。
-// read_doc 的 offset 仍是旧版 JavaScript 字符偏移；R2 Range 则按字节，因此存一个稀疏映射。
-function kbBuildSeekIndex(content) {
-  const text = String(content || '');
-  const points = [[0, 0]];
-  let chars = 0;
-  let bytes = 0;
-  let next = KB_SEEK_STRIDE;
-  while (chars < text.length) {
-    const cp = text.codePointAt(chars);
-    const units = cp > 0xffff ? 2 : 1;
-    bytes += cp <= 0x7f ? 1 : (cp <= 0x7ff ? 2 : (cp <= 0xffff ? 3 : 4));
-    chars += units;
-    if (chars >= next) {
-      points.push([chars, bytes]);
-      next += KB_SEEK_STRIDE;
-    }
-  }
-  const last = points[points.length - 1];
-  if (last[0] !== chars) points.push([chars, bytes]);
-  return points;
-}
-function kbEncodeSeekIndex(points) {
-  return points.map(([chars, bytes]) => chars + ':' + bytes).join(',');
-}
-function kbValidSeekIndex(entry) {
-  const points = entry && entry.seek;
-  if (!Array.isArray(points) || !points.length || !Array.isArray(points[0])
-    || points[0][0] !== 0 || points[0][1] !== 0) return false;
-  if (!Number.isSafeInteger(entry.bodyOffsetChars) || entry.bodyOffsetChars < 0
-    || !Number.isSafeInteger(entry.bodyOffsetBytes) || entry.bodyOffsetBytes < 0) return false;
-  for (let i = 0; i < points.length; i++) {
-    const p = points[i];
-    if (!Array.isArray(p) || p.length !== 2 || !Number.isSafeInteger(p[0]) || p[0] < 0
-      || !Number.isSafeInteger(p[1]) || p[1] < 0) return false;
-    if (i && (p[0] <= points[i - 1][0] || p[1] <= points[i - 1][1])) return false;
-  }
-  return points[points.length - 1][0] + entry.bodyOffsetChars === entry.chars;
 }
 
 // 错误页识别：只对短内容生效。长文档里引用一句 "404 Not Found" 是正常的，
@@ -366,14 +325,12 @@ async function doSaveDoc(env, chatId, args) {
 
   const nowIso = new Date().toISOString();
   const nextVersion = (Number(prevEntry && prevEntry.version) || 0) + 1;
-  const seek = finalContent.length > KB_SEEK_STRIDE ? kbBuildSeekIndex(finalContent) : null;
   // v7.11.1：fp / version 也写进 frontmatter。注册表丢了可以按文件重建，
   // 但重建时只能读到 frontmatter —— 不写进去，重建后就再也挡不住重复入库了。
   const head = '---\ntitle: "' + title.replace(/"/g, '') + '"\nsaved_at: ' + nowIso
     + '\nchat_id: "' + kbSafeChatId(chatId) + '"'
     + (cleanSource ? '\nsource: ' + cleanSource : '')
     + (tags.length ? '\ntags: ' + tags.join(', ') : '')
-    + (seek ? '\nseek: ' + kbEncodeSeekIndex(seek) : '')
     + '\nfp: ' + fp
     + '\nversion: ' + nextVersion
     + '\n---\n\n';
@@ -398,11 +355,6 @@ async function doSaveDoc(env, chatId, args) {
     // size 统一为字节数；chars 供 read_doc 在不下载正文的情况下判断 offset 是否越界
     size: new TextEncoder().encode(body).byteLength,
     chars: body.length,
-    ...(seek ? {
-      seek: seek,
-      bodyOffsetChars: head.length,
-      bodyOffsetBytes: new TextEncoder().encode(head).byteLength,
-    } : {}),
     fp: fp,
     version: nextVersion,
     // 已保留的快照份数：够了就不再 list 目录清理（见 snapshotVersion）
@@ -484,50 +436,13 @@ async function toolReadDoc(env, args, maxChars) {
     if (typeof hit.chars === 'number' && hit.chars >= 0 && offset >= hit.chars) {
       return '文档读取失败：偏移量 offset=' + offset + ' 已超出文档总长度（' + hit.chars + ' 字符），请改用更小的 offset；或传 offset=0 从头读。';
     }
-    const key = KB_DOCS_PREFIX + hit.file;
-    const cached = kbCacheHit(env, key, hit.updated_at);
-    let fullText = cached ? cached.text : null;
-    let totalLen = Number.isSafeInteger(hit.chars) && hit.chars >= 0 ? hit.chars : null;
-    let slice;
-    if (fullText !== null) {
-      totalLen = fullText.length;
-      slice = fullText.slice(offset, offset + MAX);
-    } else if (kbValidSeekIndex(hit)) {
-      const bodyChars = hit.bodyOffsetChars;
-      let rangeOffset = 0;
-      let skipChars = offset;
-      if (offset >= bodyChars) {
-        const bodyOffset = offset - bodyChars;
-        let point = hit.seek[0];
-        for (const candidate of hit.seek) {
-          if (candidate[0] > bodyOffset) break;
-          point = candidate;
-        }
-        rangeOffset = hit.bodyOffsetBytes + point[1];
-        skipChars = bodyOffset - point[0];
-      }
-      if (totalLen === null) totalLen = bodyChars + hit.seek[hit.seek.length - 1][0];
-      const expectedChars = Math.min(MAX, totalLen - offset);
-      const rangeLength = Math.max(1, (skipChars + expectedChars) * 4 + 4);
-      const excerpt = await storeGetRange(env, key, rangeOffset, rangeLength);
-      slice = excerpt === null ? null : excerpt.slice(skipChars, skipChars + MAX);
-      // 旧索引/损坏内容或不完整范围读时回退到原有整篇读取，优先保证结果正确。
-      if (slice === null || slice.length < expectedChars) {
-        fullText = await kbReadDocTextCached(env, key, hit.updated_at);
-        if (fullText === null) return '文档读取失败：' + (hit.title || hit.file);
-        totalLen = fullText.length;
-        slice = fullText.slice(offset, offset + MAX);
-      }
-    } else {
-      fullText = await kbReadDocTextCached(env, key, hit.updated_at);
-      if (fullText === null) return '文档读取失败：' + (hit.title || hit.file);
-      totalLen = fullText.length;
-      slice = fullText.slice(offset, offset + MAX);
-    }
-    if (totalLen === null) return '文档读取失败：' + (hit.title || hit.file);
+    const fullText = await kbReadDocTextCached(env, KB_DOCS_PREFIX + hit.file, hit.updated_at);
+    if (fullText === null) return '文档读取失败：' + (hit.title || hit.file);
+    const totalLen = fullText.length;
     if (offset >= totalLen) {
       return '文档读取失败：偏移量 offset=' + offset + ' 已超出文档总长度（' + totalLen + ' 字符），请改用更小的 offset；或传 offset=0 从头读。';
     }
+    const slice = fullText.slice(offset, offset + MAX);
     const nextOffset = offset + slice.length;
     let note = '';
     if (nextOffset < totalLen) {

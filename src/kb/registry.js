@@ -14,7 +14,6 @@ import { mapLimit } from '../utils.js';
 const KB_DOCS_PREFIX = KB_PREFIX + 'docs/';
 const KB_REGISTRY_KEY = KB_DOCS_PREFIX + 'registry.json';
 const KB_REG_CACHE_TTL_MS = 30 * 1000;
-const utf8Encoder = new TextEncoder();
 
 let cachedRegistry = null;
 let cachedRegistryBucket = null;
@@ -63,13 +62,7 @@ function kbDocTitleOf(key) {
 // 解析 save_doc 生成的 frontmatter 头（---\nkey: value\n---）
 function kbParseFrontmatter(head) {
   const out = {};
-  const text = String(head || '');
-  const bodyStart = text.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n\r?\n/);
-  if (bodyStart) {
-    out.bodyChars = bodyStart[0].length;
-    out.bodyBytes = utf8Encoder.encode(bodyStart[0]).byteLength;
-  }
-  const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  const m = String(head || '').match(/^---\r?\n([\s\S]*?)\r?\n---/);
   if (!m) return out;
   for (const line of m[1].split('\n')) {
     const i = line.indexOf(':');
@@ -77,22 +70,6 @@ function kbParseFrontmatter(head) {
     let v = line.slice(i + 1).trim();
     if (v.length >= 2 && v.startsWith('"') && v.endsWith('"')) v = v.slice(1, -1);
     out[line.slice(0, i).trim()] = v;
-  }
-  if (out.seek) {
-    const points = [];
-    for (const item of String(out.seek).split(',')) {
-      const pair = item.split(':');
-      if (pair.length !== 2) continue;
-      const chars = Number(pair[0]);
-      const bytes = Number(pair[1]);
-      if (Number.isSafeInteger(chars) && chars >= 0 && Number.isSafeInteger(bytes) && bytes >= 0) {
-        points.push([chars, bytes]);
-      }
-    }
-    const valid = points.length > 0 && points[0][0] === 0 && points[0][1] === 0
-      && points.every((p, i) => i === 0 || (p[0] > points[i - 1][0] && p[1] > points[i - 1][1]));
-    if (valid) out.seek = points;
-    else delete out.seek;
   }
   return out;
 }
@@ -161,12 +138,6 @@ async function kbRebuildRegistry(env, objs) {
     };
     if (fm.fp) entry.fp = fm.fp;
     if (ver > 0) entry.version = ver;
-    if (Array.isArray(fm.seek) && fm.seek.length && Number.isFinite(fm.bodyChars) && Number.isFinite(fm.bodyBytes)) {
-      entry.seek = fm.seek;
-      entry.bodyOffsetChars = fm.bodyChars;
-      entry.bodyOffsetBytes = fm.bodyBytes;
-      entry.chars = fm.bodyChars + fm.seek[fm.seek.length - 1][0];
-    }
     return entry;
   });
   const ok = await kbSaveRegistry(env, reg, { verified: true });
