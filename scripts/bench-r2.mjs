@@ -12,6 +12,7 @@
 //
 // 说明：这里用内存桶 + 固定 sleep 模拟 R2，测的是**调用编排**（并行度、操作数），
 // 不是 R2 真实吞吐。操作数一比一可信；时间只用于横向对比同一台机器上的两次运行。
+// 冷读用 setup 桶的对象快照创建新桶，避免 setup 的写后读污染 L1 缓存；同时记录模拟字节数。
 
 import { setTimeout as sleep } from 'node:timers/promises';
 
@@ -31,7 +32,7 @@ const AS_JSON = process.argv.includes('--json');
 function makeBucket() {
   const data = new Map();
   const etags = new Map();
-  const stats = { get: 0, put: 0, list: 0, del: 0 };
+  const stats = { get: 0, put: 0, list: 0, del: 0, range: 0, bytesRead: 0 };
   let seq = 0;
   const enc = new TextEncoder();
   const bytesOf = (s) => enc.encode(String(s)).byteLength;
@@ -64,11 +65,16 @@ function makeBucket() {
       let text = full;
       let size = bytesOf(full);
       if (opts && opts.range) {
+        stats.range += 1;
         const buf = enc.encode(full);
         const off = Math.max(0, opts.range.offset || 0);
         const len = opts.range.length == null ? buf.length - off : opts.range.length;
-        text = new TextDecoder().decode(buf.subarray(off, Math.min(buf.length, off + len)));
+        const end = Math.min(buf.length, off + len);
+        text = new TextDecoder().decode(buf.subarray(off, end));
+        stats.bytesRead += Math.max(0, end - off);
         size = buf.length;
+      } else {
+        stats.bytesRead += bytesOf(full);
       }
       return { key, size, etag, text: async () => text, arrayBuffer: async () => enc.encode(text).buffer };
     },
@@ -102,12 +108,24 @@ function makeBucket() {
 
 const results = [];
 
+function cloneBucket(source) {
+  const clone = makeBucket();
+  for (const [key, value] of source.data) clone.data.set(key, value);
+  return clone;
+}
+function resetBucketStats(bucket) {
+  for (const key of Object.keys(bucket.stats)) bucket.stats[key] = 0;
+}
+
 // 一个场景 = 新桶 + 新 chatId（模块内缓存按 chatId / 桶隔离，避免互相污染）
 // setup 阶段的耗时与操作数不计入结果：只量被测的那段路径。
-async function scenario(name, setup, run) {
-  const r2 = makeBucket();
+async function scenario(name, setup, run, options) {
+  const source = makeBucket();
+  const setupEnv = { R2: source };
+  if (setup) await setup(setupEnv, source);
+  const r2 = options && options.coldClone ? cloneBucket(source) : source;
   const env = { R2: r2 };
-  if (setup) await setup(env, r2);
+  resetBucketStats(r2);
   r2ResetStats();
   r2.busy.total = 0;
   const t0 = performance.now();
@@ -123,6 +141,8 @@ async function scenario(name, setup, run) {
     del: s.del,
     wall: Math.round(wall),
     busy: Math.round(busy),
+    range: r2.stats.range,
+    bytesRead: r2.stats.bytesRead,
     // R2 关键路径：忙碌时长 / 单次往返。1.0 = 完全并行，数字越大串行越严重
     rtts: RTT_MS > 0 ? +(busy / RTT_MS).toFixed(1) : null,
     note: extra.note || '',
@@ -221,10 +241,18 @@ async function main() {
     (env) => toolSaveDoc(env, 'bench', { title: '基准文档', content: bigDoc(3000) }),
     (env) => toolSaveDoc(env, 'bench', { title: '基准文档', content: bigDoc(3200) }));
 
-  // 7) 大文档翻页（offset 靠后，理想情况只读窗口）
-  await scenario('大文档翻页（20万字，offset=100000）',
-    (env) => toolSaveDoc(env, 'bench', { title: '长文档', content: bigDoc(200000) }),
-    (env) => toolReadDoc(env, 'bench', { title: '长文档', offset: 100000 }));
+  // 7) 大文档冷读 A/B：同一份 setup 文档克隆成独立新桶，避免保存时 L1 穿透缓存污染。
+  const setupLongDoc = (env) => toolSaveDoc(env, 'bench', { title: '长文档', content: bigDoc(200000) });
+  await scenario('大文档冷翻页（整篇回退，无 seek）', async (env, r2) => {
+    await setupLongDoc(env);
+    const reg = JSON.parse(r2.data.get('kb/docs/registry.json'));
+    delete reg[0].seek;
+    delete reg[0].bodyOffsetChars;
+    delete reg[0].bodyOffsetBytes;
+    r2.data.set('kb/docs/registry.json', JSON.stringify(reg));
+  }, (env) => toolReadDoc(env, { query: '长文档', offset: 100000 }), { coldClone: true });
+  await scenario('大文档冷翻页（UTF-8 检查点 Range）', setupLongDoc,
+    (env) => toolReadDoc(env, { query: '长文档', offset: 100000 }), { coldClone: true });
 
   // 8) 全库检索
   let regForSearch = [];
@@ -235,7 +263,7 @@ async function main() {
       }
       regForSearch = await kbGetRegistry(env, { fresh: true });
     },
-    (env) => kbSearchDocBody(env, regForSearch, '性能测试段落'));
+    (env) => kbSearchDocBody(env, regForSearch, '性能测试段落'), { coldClone: true });
 
   // 9) 回合收尾写 L1
   const l1Chat = newChat();
@@ -255,15 +283,16 @@ function print() {
   const lpad = (s, n) => String(s).padStart(n);
   console.log('');
   console.log('R2 路径基准（模拟 RTT = ' + RTT_MS + 'ms）');
-  console.log('─'.repeat(86));
-  console.log(pad('场景', 40) + lpad('操作', 5) + lpad('读', 4) + lpad('写', 4)
-    + lpad('R2忙碌', 8) + lpad('RTT', 6) + lpad('墙钟', 8));
-  console.log('─'.repeat(86));
+  console.log('─'.repeat(108));
+  console.log(pad('场景', 44) + lpad('操作', 5) + lpad('读', 4) + lpad('写', 4) + lpad('Range', 7)
+    + lpad('读字节', 10) + lpad('R2忙碌', 8) + lpad('RTT', 6) + lpad('墙钟', 8));
+  console.log('─'.repeat(108));
   for (const r of results) {
-    console.log(pad(r.name, 40) + lpad(r.ops, 5) + lpad(r.get, 4) + lpad(r.put, 4)
+    console.log(pad(r.name, 44) + lpad(r.ops, 5) + lpad(r.get, 4) + lpad(r.put, 4) + lpad(r.range, 7)
+      + lpad((r.bytesRead / 1024).toFixed(1) + 'KB', 10)
       + lpad(r.busy + 'ms', 8) + lpad(r.rtts == null ? '-' : r.rtts, 6) + lpad(r.wall + 'ms', 8));
   }
-  console.log('─'.repeat(86));
+  console.log('─'.repeat(108));
   console.log('「RTT」= R2 忙碌时长 / 单次往返：1.0 表示完全并行（理想），越大说明串行越严重。');
   console.log('「R2忙碌」只统计"至少一个 R2 请求在飞"的时间，所以把等待藏进网络往返里的预取能被看出来。');
   console.log('');

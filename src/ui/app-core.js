@@ -27,7 +27,8 @@ export default `<script>
     return tmp.textContent || '';
   }
 
-  if (window.marked && window.marked.Renderer) {
+  function configureMarkdown() {
+    if (!(window.marked && window.marked.Renderer)) return;
     const renderer = new marked.Renderer();
     renderer.code = function(code, language) {
       const displayLang = language || 'text';
@@ -59,6 +60,13 @@ export default `<script>
     };
 
     marked.setOptions({ breaks: true, renderer: renderer });
+  }
+  // CDN 脚本以 defer 加载：在 DOMContentLoaded（defer 脚本已按序执行后）配置，
+  // 并由 app-pwa 在本监听器之后初始化首屏，避免首条历史消息误走纯文本降级。
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', configureMarkdown, { once: true });
+  } else {
+    configureMarkdown();
   }
 
   // v6.9.5：复用 copyText，兼容非安全上下文并提供异常保护

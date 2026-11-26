@@ -1,6 +1,6 @@
 {
   "name": "cloudflare-chat",
-  "version": "7.45.0",
+  "version": "7.46.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -12,6 +12,7 @@
     "check": "node scripts/check-consistency.mjs",
     "verify": "node scripts/check-consistency.mjs && node --test \"test/**/*.test.mjs\"",
     "build:tts-demo": "node scripts/build-tts-demo.mjs",
+    "bench:homepage": "node scripts/bench-homepage.mjs",
     "deploy": "wrangler deploy"
   },
   "devDependencies": {

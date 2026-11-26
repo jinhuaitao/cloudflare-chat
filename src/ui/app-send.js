@@ -55,6 +55,11 @@ export default `  async function sendMessage() {
 
     let aiContent = '';
     let reasoningContent = '';
+    // 流式期间只追加纯文本节点，避免每 60ms 对完整累计 Markdown 重新解析并替换整棵 DOM。
+    // 最终收到 [DONE] 后仍会完整执行一次 safeHtml（Markdown + DOMPurify）。
+    let streamTextNode = null;
+    let streamCursorNode = null;
+    let streamRenderedLength = 0;
     const rWrap = bubble.querySelector('.reasoning');
 
     try {
@@ -109,8 +114,26 @@ export default `  async function sendMessage() {
 
       let isRenderPending = false;
       let lastRenderTime = 0;
-      const cursorHtml = '<span style="display:inline-block; width:6px; height:18px; background:var(--brand-color); animation:typing 1s infinite; vertical-align:middle; margin-left:4px; border-radius:2px;"></span>';
       const typingHtml = '<div class="typing-indicator"><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div>';
+
+      function appendStreamText() {
+        if (!streamTextNode || streamTextNode.parentNode !== tBox) {
+          tBox.replaceChildren();
+          streamTextNode = document.createTextNode('');
+          streamCursorNode = document.createElement('span');
+          streamCursorNode.style.cssText = 'display:inline-block;width:6px;height:18px;background:var(--brand-color);animation:typing 1s infinite;vertical-align:middle;margin-left:4px;border-radius:2px;';
+          tBox.append(streamTextNode, streamCursorNode);
+          streamRenderedLength = 0;
+          tBox.style.whiteSpace = 'pre-wrap';
+        }
+        if (aiContent.length >= streamRenderedLength) {
+          streamTextNode.appendData(aiContent.slice(streamRenderedLength));
+        } else {
+          // 仅重试/重置路径会缩短累计文本；常规 SSE 路径始终只追加。
+          streamTextNode.data = aiContent;
+        }
+        streamRenderedLength = aiContent.length;
+      }
 
       function scheduleUpdateUI(force = false) {
         const now = Date.now();
@@ -135,7 +158,7 @@ export default `  async function sendMessage() {
           // 旧版在这里塞了一句蓝色「深度思考中」占位，与新思考胶囊的标题重复，且位置落在
           // 工具轨迹下方，读起来像回答结束又冒出一句状态。
           if (aiContent) {
-            tBox.innerHTML = safeHtml(aiContent) + (isCurrentlyStreaming ? cursorHtml : '');
+            appendStreamText();
           } else if (isCurrentlyStreaming && !tBox.querySelector('.typing-indicator')) {
             tBox.innerHTML = typingHtml;
           }
@@ -250,7 +273,11 @@ export default `  async function sendMessage() {
         aiContent = '';
         reasoningContent = '';
         resetReasoning();
+        streamTextNode = null;
+        streamCursorNode = null;
+        streamRenderedLength = 0;
         tBox.innerHTML = typingHtml;
+        tBox.style.whiteSpace = '';
         if (agentProgressEl) showAgentProgress(agentProgressBase || '🤖 Agent 正在继续…');
       }
 
@@ -283,7 +310,11 @@ export default `  async function sendMessage() {
         agentPersonaDetail = null;
         clearAgentProgress();
         resetReasoning();
+        streamTextNode = null;
+        streamCursorNode = null;
+        streamRenderedLength = 0;
         tBox.innerHTML = typingHtml;
+        tBox.style.whiteSpace = '';
       }
 
       // 单次流式请求。收到 [DONE] 返回 true；网络/鉴权等错误直接 throw。
@@ -441,11 +472,16 @@ export default `  async function sendMessage() {
       clearAgentProgress();
 
       if (aiContent) {
+        tBox.style.whiteSpace = '';
         tBox.innerHTML = safeHtml(aiContent);
       } else {
+        tBox.style.whiteSpace = '';
         // 只有思考、没有正文：给一句明确交代，避免 finally 把打字点误判成「连接中断」
         tBox.innerHTML = '<span style="color: var(--muted); font-size: 13px;">（本轮模型只输出了思考过程，没有给出答复，可以补充信息后重问）</span>';
       }
+      streamTextNode = null;
+      streamCursorNode = null;
+      streamRenderedLength = 0;
       bubble.__rawText = aiContent;   // 供「复制」取原始 Markdown
       if (isCurrentActiveSession() && isNearBottom) scrollArea.scrollTop = scrollArea.scrollHeight;
 
@@ -476,6 +512,10 @@ export default `  async function sendMessage() {
       finishReasoning();
       clearAgentProgress();
       const tBox = bubble.querySelector('.message-text');
+      tBox.style.whiteSpace = '';
+      streamTextNode = null;
+      streamCursorNode = null;
+      streamRenderedLength = 0;
 
       if (error.name === 'AgentError') {
         tBox.innerHTML = '<span style="color: #ef4444; font-size: 14px; font-weight: 600;">' + escapeHtml(error.message) + '</span>';

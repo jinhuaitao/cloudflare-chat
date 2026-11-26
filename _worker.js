@@ -17,7 +17,7 @@ import { runImageRequest } from './src/image-task.js';
 import { MANIFEST_JSON } from './src/pwa/manifest.js';
 import { SW_JS } from './src/pwa/service-worker.js';
 import { getPwaVersion } from './src/pwa/version.js';
-import { HTML_CONTENT } from './src/ui/index.js';
+import { getHomePageHtml } from './src/home-page.js';
 
 // CORS_ORIGIN 跨域白名单：配置为完整域名列表（多个域名用逗号分隔）后，
 // Access-Control-Allow-Origin 只回显名单内的 Origin，
@@ -194,7 +194,7 @@ async function routeRequest(request, env, ctx) {
         optionsHtml = '<option value="" disabled selected>未配置模型，请检查环境变量</option>';
       }
 
-      const html = HTML_CONTENT.replaceAll('{{MODEL_OPTIONS}}', optionsHtml).replaceAll('{{APP_VERSION}}', APP_VERSION);
+      const html = getHomePageHtml(optionsHtml, APP_VERSION);
       return new Response(html, { headers: HTML_HEADERS });
     }
 
